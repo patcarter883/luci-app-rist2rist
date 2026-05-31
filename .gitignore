@@ -1,0 +1,8 @@
+/*
+# Allow the configuration files
+!.gitignore
+!.gitattributes
+
+# Allow a specific folder structure (must match directories first)
+!package/luci-app-rist2rist/
+!package/luci-app-rist2rist/**
