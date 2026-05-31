@@ -4,5 +4,7 @@
 !.gitattributes
 
 # Allow a specific folder structure (must match directories first)
+!package/
+package/*
 !package/luci-app-rist2rist/
 !package/luci-app-rist2rist/**

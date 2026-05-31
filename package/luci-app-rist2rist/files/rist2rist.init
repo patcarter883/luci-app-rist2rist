@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+OUTPUT_ARGS=""
+
+append_output_flag() {
+    local cfg="$1"
+    local address interface
+    config_get address "$cfg" 'address'
+    config_get interface "$cfg" 'interface'
+    
+    if [ -n "$address" ]; then
+        if [ -n "$interface" ]; then
+            OUTPUT_ARGS="$OUTPUT_ARGS -o rist://${address}?miface=${interface}"
+        else
+            OUTPUT_ARGS="$OUTPUT_ARGS -o rist://${address}"
+        fi
+    fi
+}
+
+start_service() {
+    config_load 'rist2rist'
+    local enabled listen_url
+    config_get_bool enabled 'main' 'enabled' 0
+    config_get listen_url 'main' 'listen_url'
+    
+    [ "$enabled" -eq 0 ] && return
+    
+    OUTPUT_ARGS=""
+    config_foreach append_output_flag 'destination'
+    [ -z "$OUTPUT_ARGS" ] && return
+    
+    procd_open_instance "main"
+    # Execute with your telemetry modifications running cleanly inside the dynamic binary
+    procd_set_param command /usr/bin/rist2rist -i "$listen_url" $OUTPUT_ARGS
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger "rist2rist"
+}
