@@ -14,7 +14,11 @@ include $(INCLUDE_DIR)/meson.mk
 # - default_library=static: link librist.a directly into rist2rist (no .so dep)
 # - test=false:             skip the test subdir
 # - built_tools=true:       (default) keep tools subdir so tools/rist2rist exists
-MESON_ARGS+=-Ddefault_library=static -Dtest=false -Dbuilt_tools=true
+# - builtin_mbedtls=true:   force the bundled mbedtls. Without this, contrib/mbedtls/meson.build
+#                           runs `dependency('MbedTLS', method: 'cmake', ...)` which finds the
+#                           *host* mbedtls (if installed) and bleeds -I/usr/include into every
+#                           compile, breaking the cross build.
+MESON_ARGS+=-Ddefault_library=static -Dtest=false -Dbuilt_tools=true -Dbuiltin_mbedtls=true
 
 define Package/luci-app-rist2rist
   SECTION:=luci
