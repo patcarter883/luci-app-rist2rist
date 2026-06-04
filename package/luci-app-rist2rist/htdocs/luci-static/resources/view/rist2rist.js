@@ -133,6 +133,39 @@ return view.extend({
 		o.default = '2';
 		o.rmempty = false;
 
+		// -------- Recovery tuning for the receive (encoder-facing) leg --------
+		o = s.option(form.Value, 'buffer_min', _('Recovery Buffer Min (ms)'),
+			_('Floor for the retransmission buffer. Must be several times the link ' +
+			  'RTT so lost packets can be re-requested and re-sent before playout. ' +
+			  'Too small starves retransmission. Adds end-to-end latency.'));
+		o.placeholder = '1000';
+		o.datatype = 'uinteger';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'buffer_max', _('Recovery Buffer Max (ms)'),
+			_('Ceiling the buffer can grow to as measured RTT rises.'));
+		o.placeholder = '5000';
+		o.datatype = 'uinteger';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'reorder_buffer', _('Reorder Hold-off (ms)'),
+			_('How long to wait for out-of-order packets before requesting a ' +
+			  'retransmit. Keep SMALL (tens of ms) and well below Buffer Min — a ' +
+			  'large value eats the recovery window and disables retransmission.'));
+		o.placeholder = '30';
+		o.datatype = 'uinteger';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'rtt_min', _('Recovery RTT Min (ms)'));
+		o.placeholder = '40';
+		o.datatype = 'uinteger';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'rtt_max', _('Recovery RTT Max (ms)'));
+		o.placeholder = '500';
+		o.datatype = 'uinteger';
+		o.rmempty = true;
+
 		o = s.option(form.Flag, 'verbose_log', _('Verbose Logging'),
 			_('Enable info-level logging to /tmp/rist2rist.log. Leave off in normal operation to reduce log volume.'));
 		o.default = o.disabled;
@@ -176,6 +209,14 @@ return view.extend({
 		o.placeholder = 'wwan0';
 		o.datatype = 'string';
 		o.rmempty = false;
+
+		o = s.option(form.Value, 'weight', _('Path Weight'),
+			_('librist load-balancing weight for this path. 0 = duplicate the full ' +
+			  'stream to this path (SMPTE 2022-7 redundancy); >0 = load-balance, ' +
+			  'splitting traffic across paths in proportion to their weights.'));
+		o.placeholder = '5';
+		o.datatype = 'uinteger';
+		o.rmempty = true;
 
 		return m.render().then(function(node) {
 			node.insertBefore(renderStatusSection(status, log), node.firstChild);

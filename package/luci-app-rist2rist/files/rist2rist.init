@@ -7,24 +7,39 @@ OUTPUT_URLS=""
 
 append_output_url() {
     local cfg="$1"
-    local address interface url
+    local address interface weight url query
     config_get address "$cfg" 'address'
     config_get interface "$cfg" 'interface'
+    config_get weight "$cfg" 'weight'
 
-    if [ -n "$address" ]; then
-        # Prepend rist:// only if the user didn't supply a full URL
-        case "$address" in
-            *://*) url="$address" ;;
-            *)     url="rist://${address}" ;;
+    [ -z "$address" ] && return
+
+    # Prepend rist:// only if the user didn't supply a full URL
+    case "$address" in
+        *://*) url="$address" ;;
+        *)     url="rist://${address}" ;;
+    esac
+
+    # Assemble librist query params (miface=interface binding, weight=load-
+    # balancing weight). Appended with the right separator whether or not the
+    # operator already put a query string in the address.
+    query=""
+    [ -n "$interface" ] && query="${query:+${query}&}miface=${interface}"
+    [ -n "$weight" ]    && query="${query:+${query}&}weight=${weight}"
+    if [ -n "$query" ]; then
+        case "$url" in
+            *\?*) url="${url}&${query}" ;;
+            *)    url="${url}?${query}" ;;
         esac
-        [ -n "$interface" ] && url="${url}?miface=${interface}"
-        OUTPUT_URLS="${OUTPUT_URLS:+${OUTPUT_URLS},}${url}"
     fi
+
+    OUTPUT_URLS="${OUTPUT_URLS:+${OUTPUT_URLS},}${url}"
 }
 
 start_service() {
     config_load 'rist2rist'
     local enabled listen_url verbose_log loglevel profile out_profile
+    local buffer_min buffer_max rtt_min rtt_max reorder_buffer rq
     config_get_bool enabled 'main' 'enabled' 0
     config_get listen_url 'main' 'listen_url'
     config_get_bool verbose_log 'main' 'verbose_log' 0
@@ -35,8 +50,23 @@ start_service() {
     # Output (downstream) profile, independent of the receive profile. Default to
     # advanced to match an advanced-profile downstream receiver.
     config_get out_profile 'main' 'out_profile' 2
+    # Recovery tuning for the receive (encoder-facing) leg, applied as query
+    # params on the listen URL. reorder must stay well below buffer-min or the
+    # retransmission window is starved (no NACKs -> unrecovered loss).
+    config_get buffer_min 'main' 'buffer_min' 1000
+    config_get buffer_max 'main' 'buffer_max' 5000
+    config_get rtt_min 'main' 'rtt_min' 40
+    config_get rtt_max 'main' 'rtt_max' 500
+    config_get reorder_buffer 'main' 'reorder_buffer' 30
 
     [ "$enabled" -eq 0 ] && return
+
+    # Append recovery params to the listen URL (handles an existing '?').
+    rq="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}"
+    case "$listen_url" in
+        *\?*) listen_url="${listen_url}&${rq}" ;;
+        *)    listen_url="${listen_url}?${rq}" ;;
+    esac
 
     OUTPUT_URLS=""
     config_foreach append_output_url 'destination'
