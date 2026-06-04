@@ -3,41 +3,57 @@
 START=99
 USE_PROCD=1
 
-OUTPUT_ARGS=""
+OUTPUT_URLS=""
 
-append_output_flag() {
+append_output_url() {
     local cfg="$1"
-    local address interface
+    local address interface url
     config_get address "$cfg" 'address'
     config_get interface "$cfg" 'interface'
-    
+
     if [ -n "$address" ]; then
-        if [ -n "$interface" ]; then
-            OUTPUT_ARGS="$OUTPUT_ARGS -o rist://${address}?miface=${interface}"
-        else
-            OUTPUT_ARGS="$OUTPUT_ARGS -o rist://${address}"
-        fi
+        # Prepend rist:// only if the user didn't supply a full URL
+        case "$address" in
+            *://*) url="$address" ;;
+            *)     url="rist://${address}" ;;
+        esac
+        [ -n "$interface" ] && url="${url}?miface=${interface}"
+        OUTPUT_URLS="${OUTPUT_URLS:+${OUTPUT_URLS},}${url}"
     fi
 }
 
 start_service() {
     config_load 'rist2rist'
-    local enabled listen_url
+    local enabled listen_url verbose_log loglevel profile out_profile
     config_get_bool enabled 'main' 'enabled' 0
     config_get listen_url 'main' 'listen_url'
-    
+    config_get_bool verbose_log 'main' 'verbose_log' 0
+    # RIST receive profile: 0=simple, 1=main, 2=advanced. Default to advanced —
+    # the encoder sends RIST_PROFILE_ADVANCED and the OOB telemetry channel only
+    # exists in main/advanced, so a simple-profile listener never authenticates.
+    config_get profile 'main' 'profile' 2
+    # Output (downstream) profile, independent of the receive profile. Default to
+    # advanced to match an advanced-profile downstream receiver.
+    config_get out_profile 'main' 'out_profile' 2
+
     [ "$enabled" -eq 0 ] && return
-    
-    OUTPUT_ARGS=""
-    config_foreach append_output_flag 'destination'
-    [ -z "$OUTPUT_ARGS" ] && return
-    
+
+    OUTPUT_URLS=""
+    config_foreach append_output_url 'destination'
+    [ -z "$OUTPUT_URLS" ] && return
+
+    [ "$verbose_log" -eq 1 ] && loglevel=6 || loglevel=4
+
     procd_open_instance "main"
-    # Execute with your telemetry modifications running cleanly inside the dynamic binary
-    procd_set_param command /usr/bin/rist2rist -i "$listen_url" $OUTPUT_ARGS
-    procd_set_param respawn
+    procd_set_param command /usr/bin/rist2rist
+    procd_append_param command -i "$listen_url"
+    procd_append_param command -o "$OUTPUT_URLS"
+    procd_append_param command -p "$profile"
+    procd_append_param command -P "$out_profile"
+    procd_append_param command -v "$loglevel"
     procd_set_param stdout 1
     procd_set_param stderr 1
+    procd_set_param respawn
     procd_close_instance
 }
 

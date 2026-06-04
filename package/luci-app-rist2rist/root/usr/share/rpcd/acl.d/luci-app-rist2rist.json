@@ -1,11 +1,17 @@
 {
 	"luci-app-rist2rist": {
-		"description": "Grant UCI access for rist2rist",
+		"description": "Grant UCI, ubus, and file access for rist2rist",
 		"read": {
-			"uci": ["rist2rist"]
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"uci": [ "rist2rist" ],
+			"file": {
+				"/sbin/logread": [ "exec" ]
+			}
 		},
 		"write": {
-			"uci": ["rist2rist"]
+			"uci": [ "rist2rist" ]
 		}
 	}
 }
