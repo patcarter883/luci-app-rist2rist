@@ -171,16 +171,19 @@ return view.extend({
 		o.default = o.disabled;
 		o.rmempty = false;
 
-		o = s.option(form.Flag, 'telemetry_enabled', _('Enable LAN OOB Backpressure'),
-			_('Instructs the proxy receiver to intercept cellular WAN metrics and push state updates backward to the encoder.'));
-		o.default = o.enabled;
+		o = s.option(form.Flag, 'telemetry_enabled', _('Enable WAN Stats Telemetry'),
+			_('Push the WAN-leg (output) RIST sender statistics — quality, RTT and ' +
+			  'retransmits — to the encoder\'s adaptive-bitrate listener via ' +
+			  'remote-logging UDP (1 Hz). Replaces the legacy RIST OOB feedback, ' +
+			  'which cannot cross the proxy\'s two independent sessions. Forces ' +
+			  'info-level logging while enabled.'));
+		o.default = o.disabled;
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'rtt_hysteresis', _('RTT Change Hysteresis (ms)'),
-			_('Filters out high-frequency cellular jitter. Telemetry updates are only fired if the round-trip latency shifts by more than this value.'));
-		o.placeholder = '15';
-		o.datatype = 'uinteger';
-		o.default = '15';
+		o = s.option(form.Value, 'telemetry_target', _('Telemetry Target (IP:PORT)'),
+			_('Address of the stats consumer — the encoder host and its proxy-stats ' +
+			  'UDP listen port, e.g. 192.168.1.10:9999. Required when telemetry is enabled.'));
+		o.placeholder = '192.168.1.10:9999';
 		o.depends('telemetry_enabled', '1');
 
 		// -------------------------------------------------------------
