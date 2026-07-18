@@ -3,6 +3,10 @@
 !.gitignore
 !.gitattributes
 
+# Allow CI workflows
+!.github/
+!.github/**
+
 # Allow a specific folder structure (must match directories first)
 !package/
 package/*
