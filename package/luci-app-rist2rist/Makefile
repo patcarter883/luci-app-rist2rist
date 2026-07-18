@@ -4,6 +4,11 @@ PKG_NAME:=luci-app-rist2rist
 PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 
+# LuCI app (JS/init/config/packaging) is AGPL-3.0-or-later; the rist2rist
+# tool patch built from librist tools/ remains BSD-2-Clause (upstreamable).
+PKG_LICENSE:=AGPL-3.0-or-later AND BSD-2-Clause
+PKG_LICENSE_FILES:=LICENSE
+
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 include $(INCLUDE_DIR)/package.mk
