@@ -3,6 +3,15 @@
 !.gitignore
 !.gitattributes
 
+# Allow CI workflows
+!.github/
+!.github/**
+
+# Allow licensing and project docs
+!LICENSE
+!README.md
+!CONTRIBUTING.md
+
 # Allow a specific folder structure (must match directories first)
 !package/
 package/*
