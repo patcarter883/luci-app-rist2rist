@@ -30,7 +30,7 @@ define Package/luci-app-rist2rist
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=LuCI support for Custom Reactive RIST Proxy
-  DEPENDS:=+libopenssl +libcjson +luci-base
+  DEPENDS:=+libopenssl +libcjson +luci-base +umdns
 endef
 
 # Step 1: Copy your local development src folder straight into the compilation workspace

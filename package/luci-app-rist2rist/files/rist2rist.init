@@ -6,6 +6,43 @@ START=99
 USE_PROCD=1
 
 OUTPUT_ARGS=""
+MDNS_SERVICE_FILE="/etc/umdns/rist2rist.json"
+
+# Extract the listen port from a rist://@host:port[?query] URL.
+listen_port() {
+    local url="${1%%\?*}"    # drop any ?query
+    local port="${url##*:}"  # segment after the last colon
+    case "$port" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    echo "$port"
+}
+
+# Advertise the bridge over mDNS (_obr-rist._udp) via OpenWrt's umdns so
+# encoders on the LAN can auto-discover it instead of being told the router
+# address by hand. Idempotent: rewrites the umdns service file and reloads.
+write_mdns_service() {
+    local port="$1" host
+    host="$(cat /proc/sys/kernel/hostname 2>/dev/null)"
+    [ -n "$host" ] || host="rist2rist"
+    mkdir -p /etc/umdns
+    cat > "$MDNS_SERVICE_FILE" <<EOF
+{
+    "$host": {
+        "service": "_obr-rist._udp",
+        "port": $port,
+        "txt": [ "role=bridge", "v=1" ]
+    }
+}
+EOF
+    [ -x /etc/init.d/umdns ] && /etc/init.d/umdns reload 2>/dev/null
+}
+
+remove_mdns_service() {
+    [ -f "$MDNS_SERVICE_FILE" ] || return 0
+    rm -f "$MDNS_SERVICE_FILE"
+    [ -x /etc/init.d/umdns ] && /etc/init.d/umdns reload 2>/dev/null
+}
 
 append_output_flag() {
     local cfg="$1"
@@ -27,13 +64,19 @@ start_service() {
     local enabled listen_url
     config_get_bool enabled 'main' 'enabled' 0
     config_get listen_url 'main' 'listen_url'
-    
-    [ "$enabled" -eq 0 ] && return
-    
+
+    [ "$enabled" -eq 0 ] && { remove_mdns_service; return; }
+
     OUTPUT_ARGS=""
     config_foreach append_output_flag 'destination'
-    [ -z "$OUTPUT_ARGS" ] && return
-    
+    [ -z "$OUTPUT_ARGS" ] && { remove_mdns_service; return; }
+
+    # Publish the bridge for encoder auto-discovery once we know it will run.
+    local port
+    if port="$(listen_port "$listen_url")"; then
+        write_mdns_service "$port"
+    fi
+
     procd_open_instance "main"
     # Execute with your telemetry modifications running cleanly inside the dynamic binary
     procd_set_param command /usr/bin/rist2rist -i "$listen_url" $OUTPUT_ARGS
@@ -41,6 +84,11 @@ start_service() {
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
+}
+
+stop_service() {
+    # Withdraw the mDNS advertisement when the bridge stops.
+    remove_mdns_service
 }
 
 service_triggers() {
