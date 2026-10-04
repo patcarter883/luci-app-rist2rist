@@ -24,6 +24,9 @@ config_get_bool() {
 config_foreach() {
 	local cb="$1" type="$2"
 	[ "$type" = "destination" ] || return 0
+	# STUB_DESTINATIONS=0 models a VIRGIN bridge (no outputs configured), which is
+	# the only state in which a claim is accepted.
+	[ "${STUB_DESTINATIONS:-1}" = "0" ] && return 0
 	eval "$cb dst_au"
 	eval "$cb dst_eu"
 }
@@ -31,6 +34,8 @@ config_foreach() {
 # --- main ---
 STUB_main_enabled=1
 STUB_main_managed="${STUB_MAIN_MANAGED:-0}"
+# STUB_MAIN_TOKEN_HASH = sha256 of a claimed bridge's token. Empty = unclaimed.
+STUB_main_pair_token_hash="${STUB_MAIN_TOKEN_HASH:-}"
 STUB_main_listen_url="rist://0.0.0.0:5000"
 STUB_main_profile="advanced"
 STUB_main_out_profile="advanced"

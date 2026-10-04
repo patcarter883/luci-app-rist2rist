@@ -2,29 +2,35 @@
 ##########################################################################
 # rpcd exec plugin -- read and configure the rist2rist bridge.
 #
-# Read:
-#   rist2rist.status      running state, pid and the REAL effective argv
-#   rist2rist.get_config  the UCI configuration as structured JSON
-# Write (ONLY when rist2rist.main.managed=1 on this router):
-#   rist2rist.set_config  apply a whitelisted config object, then commit
-#   rist2rist.reconcile   apply listen_url + outputs only (the "adopt" action)
-#   rist2rist.reload      restart the procd instance to activate the new config
+#   rist2rist.claim       (NO token) mint a pair token; only on a virgin bridge
+#   rist2rist.release     (token)    return the bridge to unclaimed
+#   rist2rist.status      (token)    running state, pid and the REAL effective argv
+#   rist2rist.get_config  (token)    the UCI configuration as structured JSON
+#   rist2rist.set_config  (token)    apply a whitelisted config object, then commit
+#   rist2rist.reconcile   (token)    apply listen_url + outputs only (the "adopt" action)
+#   rist2rist.reload      (token)    restart the procd instance to activate the config
 #
-# THE MANAGED GATE IS THE SAFETY RULE. A bridge configured by hand on the LAN is
-# never overwritten by a paired encoder or the portal: writes are refused until
-# someone sets managed=1 *on this router*. Adoption is an explicit local act,
-# never an implicit overwrite.
+# AUTHENTICATION HAPPENS IN THIS PLUGIN, not by an rpcd session login. rpcd's exec
+# interface does not tell the plugin which session called it, so rather than
+# provision a system user we verify the bridge's PAIR TOKEN here. That is also what
+# lets the ACL expose these methods to the `unauthenticated` group without opening
+# them up: every method except `claim` demands the token, and `claim` is refused
+# unless the bridge has never been claimed and is not already relaying.
 #
-# Two further rules are enforced here rather than trusted to callers:
-#   * a field whitelist -- an unknown key is REJECTED, never silently ignored, so
-#     a caller cannot believe it applied something the bridge dropped;
+# THE CLAIM IS THE SAFETY RULE. Claiming is what makes a bridge configurable, so an
+# operator never has to touch the router: a bridge provisioned with a token at
+# imaging (registered to the account at fulfilment) is already claimed, and one that
+# ships unclaimed is claimed once, from the LAN, by the account's encoder.
+#
+# Two rules are enforced here rather than trusted to callers:
+#   * a field whitelist -- an unknown key is REJECTED, never silently ignored, so a
+#     caller cannot believe it applied something the bridge dropped;
 #   * no URL value may carry a secret parameter (secret=/aes-type=/psk=/token=).
 #     URLs are loggable by definition (H2), and a config report is exactly where
 #     a link key would otherwise leak.
 #
-# Access is governed by /usr/share/rpcd/acl.d/luci-app-rist2rist.json. The
-# encoder reaches this as JSON-RPC over HTTP at the router's /ubus endpoint,
-# with an rpcd session whose login holds that ACL (see /etc/config/rpcd).
+# Access is governed by /usr/share/rpcd/acl.d/luci-app-rist2rist.json. A LAN client
+# reaches this as JSON-RPC over HTTP at the router's /ubus endpoint.
 ##########################################################################
 
 # Test hook: lets the package's own test harness stub /lib/functions.sh.
@@ -63,10 +69,10 @@ emit_output() {
 }
 
 method_get_config() {
-	local listen_url profile out_profile managed
+	local listen_url profile out_profile managed claimed
 	local enabled verbose_log loglevel
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
-	local telemetry_enabled telemetry_target outputs
+	local telemetry_enabled telemetry_target outputs token_hash
 
 	config_load "$CONFIG"
 
@@ -84,10 +90,16 @@ method_get_config() {
 	config_get      reorder_buffer    main reorder_buffer
 	config_get_bool telemetry_enabled main telemetry_enabled 0
 	config_get      telemetry_target  main telemetry_target
+	config_get      token_hash        main pair_token_hash
+
+	# Claimed is derived from the token existing, not tracked separately -- one
+	# definition, so the two can never disagree.
+	[ -n "$token_hash" ] && claimed=1 || claimed=0
 
 	outputs=$(config_foreach emit_output destination)
 
 	printf '{'
+	printf '"claimed":%s,' "$([ "$claimed" = "1" ] && echo true || echo false)"
 	printf '"managed":%s,' "$([ "$managed" = "1" ] && echo true || echo false)"
 	printf '"enabled":%s,' "$([ "$enabled" = "1" ] && echo true || echo false)"
 	printf '"listen_url":"%s",' "$(json_str "$listen_url")"
@@ -130,7 +142,7 @@ method_status() {
 }
 
 # ======================================================================
-# write
+# the pair token
 # ======================================================================
 
 # The request body arrives on stdin and is read exactly once.
@@ -139,6 +151,87 @@ REQ_BODY=""
 jget() { # jget <jsonfilter-expression>
 	printf '%s' "$REQ_BODY" | jsonfilter -e "$1" 2>/dev/null
 }
+
+token_hash_of() { # token_hash_of <token> -> hex sha256
+	printf '%s' "$1" | sha256sum | cut -d' ' -f1
+}
+
+# Only its hash is ever stored, so the bridge cannot re-reveal a token it issued.
+require_token() {
+	local want have
+	config_load "$CONFIG"
+	config_get want main pair_token_hash
+	if [ -z "$want" ]; then
+		err unclaimed "this bridge has not been claimed; call claim first"
+		return 1
+	fi
+	have=$(jget '@.token')
+	if [ -z "$have" ]; then
+		err token_required "a token is required"
+		return 1
+	fi
+	if [ "$(token_hash_of "$have")" != "$want" ]; then
+		err bad_token "the token is not valid for this bridge"
+		return 1
+	fi
+	return 0
+}
+
+# Drop the token from the body before it reaches the config applier, so it can never
+# be written into a config field and the field whitelist stays meaningful.
+strip_token() {
+	printf '%s' "$REQ_BODY" | sed \
+		-e 's/"token"[[:space:]]*:[[:space:]]*"[^"]*"[[:space:]]*,//' \
+		-e 's/,[[:space:]]*"token"[[:space:]]*:[[:space:]]*"[^"]*"//'
+}
+
+method_claim() {
+	config_load "$CONFIG"
+	local existing outputs token
+	config_get existing main pair_token_hash
+	if [ -n "$existing" ]; then
+		err already_claimed "this bridge has already been claimed"
+		return 0
+	fi
+
+	# Only a VIRGIN bridge may be claimed. One that is already relaying should not be
+	# takeable by whoever happens to be on the LAN, and a bridge provisioned with a
+	# token at imaging never reaches this path at all.
+	outputs=$(config_foreach emit_output destination)
+	if [ -n "$outputs" ]; then
+		err not_virgin "this bridge is already configured; clear its outputs before claiming"
+		return 0
+	fi
+
+	token=$(head -c 64 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | cut -c1-32)
+	if [ -z "$token" ]; then
+		err rng_failed "could not generate a token"
+		return 0
+	fi
+
+	uci set "$CONFIG.main.pair_token_hash=$(token_hash_of "$token")" || { err commit_failed "uci set failed"; return 0; }
+	uci set "$CONFIG.main.claimed_by=$(jget '@.device_uid')"
+	uci set "$CONFIG.main.claimed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	# Claiming is what makes a bridge configurable, so nobody has to set this by hand.
+	uci set "$CONFIG.main.managed=1"
+	uci commit "$CONFIG" || { err commit_failed "uci commit failed"; return 0; }
+
+	# The plaintext token is returned EXACTLY ONCE.
+	printf '{"ok":true,"token":"%s","managed":true}\n' "$token"
+}
+
+method_release() {
+	uci set "$CONFIG.main.pair_token_hash="
+	uci set "$CONFIG.main.claimed_by="
+	uci set "$CONFIG.main.claimed_at="
+	uci set "$CONFIG.main.managed=0"
+	uci commit "$CONFIG" || { err commit_failed "uci commit failed"; return 0; }
+	printf '{"ok":true,"released":true,"managed":false}\n'
+}
+
+# ======================================================================
+# write
+# ======================================================================
 
 require_managed() {
 	config_load "$CONFIG"
@@ -163,7 +256,7 @@ url_ok() { # url_ok <url> <field>
 
 # Reject a body that mentions secret-bearing keys at all.
 body_has_secret_key() {
-	printf '%s' "$REQ_BODY" | grep -qiE '"(secret|psk|password|passphrase|token|aes-type|aes_type)"[[:space:]]*:'
+	printf '%s' "$REQ_BODY" | grep -qiE '"(secret|psk|password|passphrase|aes-type|aes_type)"[[:space:]]*:'
 }
 
 # Enforce the field whitelist. This is a text-level scan (jsonfilter cannot
@@ -256,22 +349,7 @@ apply_config() {
 	printf '{"ok":true,"saved":true,"reloaded":false}\n'
 }
 
-method_set_config() {
-	require_managed || return 0
-	REQ_BODY=$(cat)
-	apply_config "listen_url profile out_profile enabled recovery telemetry target buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address interface weight"
-}
-
-method_reconcile() {
-	require_managed || return 0
-	REQ_BODY=$(cat)
-	# The "adopt" action: narrower than set_config on purpose -- it may only wire
-	# this bridge to the encoder (its listen target) and set the outputs.
-	apply_config "listen_url outputs address interface weight"
-}
-
 method_reload() {
-	require_managed || return 0
 	if [ -x "$RELOAD_CMD" ]; then
 		"$RELOAD_CMD" reload >/dev/null 2>&1
 		printf '{"ok":true,"reloaded":true}\n'
@@ -285,17 +363,25 @@ method_reload() {
 case "$1" in
 	list)
 		# rpcd requires this to enumerate the object's methods.
-		echo '{ "status": {}, "get_config": {}, "set_config": {}, "reconcile": {}, "reload": {} }'
+		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "set_config": {}, "reconcile": {}, "reload": {} }'
 		;;
 	call)
-		case "$2" in
-			status)     method_status ;;
-			get_config) method_get_config ;;
-			set_config) method_set_config ;;
-			reconcile)  method_reconcile ;;
-			reload)     method_reload ;;
-			*)          echo '{}' ;;
-		esac
+		REQ_BODY=$(cat)
+		if [ "$2" = "claim" ]; then
+			# No token: claiming is what establishes one.
+			method_claim
+		elif require_token; then
+			REQ_BODY=$(strip_token)
+			case "$2" in
+				status)     method_status ;;
+				get_config) method_get_config ;;
+				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery telemetry target buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address interface weight" ;;
+				reconcile)  require_managed && apply_config "listen_url outputs address interface weight" ;;
+				reload)     method_reload ;;
+				release)    method_release ;;
+				*)          echo '{}' ;;
+			esac
+		fi
 		;;
 	*)
 		echo '{}'
@@ -303,6 +389,6 @@ case "$1" in
 esac
 
 # An error response is still a successful invocation: the caller reads the JSON.
-# Without this, a refused write (unmanaged / unknown_field / secret_in_url) would
-# exit non-zero and rpcd would report the call itself as failed.
+# Without this, a refused call (unclaimed / bad_token / unmanaged) would exit
+# non-zero and rpcd would report the call itself as failed.
 exit 0
