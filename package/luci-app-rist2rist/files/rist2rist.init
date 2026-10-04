@@ -9,6 +9,106 @@ OUTPUT_URLS=""
 # survives the config_foreach callback boundary without relying on dynamic scope.
 OUTPUT_RECOVERY=""
 
+# The umdns service file this bridge publishes itself under (DT-19 discovery).
+MDNS_SERVICE_FILE="/etc/umdns/rist2rist.json"
+
+# The mDNS instance label, which is also the portal's bridge_uid. Stable across a
+# claim, so an encoder that already holds a token still recognises the same box.
+bridge_uid() {
+    local mac="" iface
+    for iface in br-lan eth0 eth1; do
+        if [ -r "/sys/class/net/${iface}/address" ]; then
+            mac="$(cat "/sys/class/net/${iface}/address" 2>/dev/null)" || mac=""
+        fi
+        if [ -n "$mac" ]; then
+            break
+        fi
+    done
+    if [ -z "$mac" ]; then
+        mac="unknown"
+    fi
+    echo "rist2rist-${mac}"
+}
+
+# The port the encoder reaches rpcd on -- the WEB port, NOT the RIST listen port.
+# The encoder builds its ubus endpoint from the address plus this value.
+web_port() {
+    local port
+    port="$(uci -q get uhttpd.main.listen_http 2>/dev/null | sed 's/.*://')"
+    case "$port" in
+        ''|*[!0-9]*) port=80 ;;
+    esac
+    echo "$port"
+}
+
+# The port from a rist://@host:port[?query] URL.
+listen_port() {
+    local url="${1%%\?*}"
+    local port="${url##*:}"
+    case "$port" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    echo "$port"
+}
+
+# Publish the bridge for encoder discovery over umdns, so an encoder finds it on
+# the LAN instead of being told its address by hand. Idempotent.
+#
+# The TXT record IS the DT-21 contract the encoder reads, and every field earns
+# its place:
+#  - fingerprint ONLY when claimed, derived from the pair-token hash. It therefore
+#    changes on a factory reset (new token, new hash) and not before -- which is how
+#    an encoder holding a token tells "reset, claim again" from "still mine", and how
+#    a token-LESS encoder learns a bridge is already claimed and must not be taken.
+#    The token itself is never published: the advertisement is public.
+#  - claimed/managed let the encoder report real state rather than assume it.
+#  - api_port, because the SRV port is the RIST listen port and NOT where rpcd is.
+write_mdns_service() {
+    local uid port txt hash fingerprint managed
+    uid="$(bridge_uid)"
+    port="$1"
+
+    config_get managed 'main' 'managed' 0
+    config_get hash 'main' 'pair_token_hash' ''
+    txt="\"api=1\""
+    if [ -n "$hash" ]; then
+        # 16 hex chars is plenty to distinguish a box, and is not the token.
+        fingerprint="$(printf '%s' "$hash" | cut -c1-16)"
+        txt="${txt}, \"fingerprint=${fingerprint}\", \"claimed=1\""
+    else
+        txt="${txt}, \"claimed=0\""
+    fi
+    txt="${txt}, \"managed=${managed}\", \"api_port=$(web_port)\""
+
+    if ! mkdir -p "$(dirname "$MDNS_SERVICE_FILE")" 2>/dev/null; then
+        # Advertising is a convenience, never a dependency (DT-19): if we cannot
+        # publish, the bridge must still start and relay.
+        return 0
+    fi
+    cat > "$MDNS_SERVICE_FILE" <<EOF
+{
+    "${uid}": {
+        "service": "_obr-rist._udp",
+        "port": ${port},
+        "txt": [ ${txt} ]
+    }
+}
+EOF
+    if [ -x /etc/init.d/umdns ]; then
+        /etc/init.d/umdns reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+remove_mdns_service() {
+    [ -f "$MDNS_SERVICE_FILE" ] || return 0
+    rm -f "$MDNS_SERVICE_FILE"
+    if [ -x /etc/init.d/umdns ]; then
+        /etc/init.d/umdns reload 2>/dev/null || true
+    fi
+    return 0
+}
+
 append_output_url() {
     local cfg="$1"
     local address interface weight url query
@@ -81,7 +181,19 @@ start_service() {
     config_get_bool telemetry_enabled 'main' 'telemetry_enabled' 0
     config_get telemetry_target 'main' 'telemetry_target' ''
 
-    [ "$enabled" -eq 0 ] && return
+    if [ "$enabled" -eq 0 ]; then
+        # A disabled bridge must stop advertising itself, or encoders keep
+        # discovering a box that will never relay.
+        remove_mdns_service
+        return
+    fi
+
+    # DT-19 discovery. Advertised whenever the bridge is ENABLED -- crucially
+    # including a VIRGIN bridge with no outputs, because that is exactly the state a
+    # LAN auto-claim (DT-21 path C) has to be able to find. Gating this on outputs
+    # would leave a virgin bridge undiscoverable and therefore unclaimable.
+    local mdns_port
+    mdns_port="$(listen_port "$listen_url")" && write_mdns_service "$mdns_port"
 
     # Append recovery params to the listen (-i) URL (handles an existing '?').
     rq="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}&timing-mode=0"
@@ -123,6 +235,12 @@ start_service() {
     procd_set_param stderr 1
     procd_set_param respawn
     procd_close_instance
+}
+
+# procd calls this once the service has stopped, including at shutdown, so the
+# advertisement does not outlive the bridge it describes.
+service_stopped() {
+    remove_mdns_service
 }
 
 service_triggers() {
