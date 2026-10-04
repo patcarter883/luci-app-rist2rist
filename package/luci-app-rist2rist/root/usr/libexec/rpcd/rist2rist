@@ -99,6 +99,7 @@ method_get_config() {
 	outputs=$(config_foreach emit_output destination)
 
 	printf '{'
+	printf '"ok":true,'
 	printf '"claimed":%s,' "$([ "$claimed" = "1" ] && echo true || echo false)"
 	printf '"managed":%s,' "$([ "$managed" = "1" ] && echo true || echo false)"
 	printf '"enabled":%s,' "$([ "$enabled" = "1" ] && echo true || echo false)"
@@ -137,7 +138,7 @@ method_status() {
 		[ -r "/proc/$pid/cmdline" ] && argv=$(tr '\0' ' ' < "/proc/$pid/cmdline")
 	fi
 
-	printf '{"running":%s,"pid":"%s","argv":"%s"}\n' \
+	printf '{"ok":true,"running":%s,"pid":"%s","argv":"%s"}\n' \
 		"$running" "$(json_str "$pid")" "$(json_str "$argv")"
 }
 
