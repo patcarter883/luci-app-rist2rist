@@ -178,12 +178,21 @@ require_token() {
 	return 0
 }
 
-# Drop the token from the body before it reaches the config applier, so it can never
-# be written into a config field and the field whitelist stays meaningful.
-strip_token() {
+# Drop transport metadata from the body before it reaches the config applier:
+#   * the pair token -- so it can never be written into a config field, which also
+#     keeps the field whitelist meaningful;
+#   * rpcd's OWN injected keys. rpcd prepends `ubus_rpc_session` (a hex session id)
+#     to the arguments of every exec call. Left in, the field whitelist rejects
+#     EVERY write with `unknown_field`, and no off-device test can catch that --
+#     there is no rpcd in that path to inject the key. Found on real hardware.
+strip_meta() {
 	printf '%s' "$REQ_BODY" | sed \
 		-e 's/"token"[[:space:]]*:[[:space:]]*"[^"]*"[[:space:]]*,//' \
-		-e 's/,[[:space:]]*"token"[[:space:]]*:[[:space:]]*"[^"]*"//'
+		-e 's/,[[:space:]]*"token"[[:space:]]*:[[:space:]]*"[^"]*"//' \
+		-e 's/"token"[[:space:]]*:[[:space:]]*"[^"]*"//' \
+		-e 's/"ubus_rpc_[a-z_]*"[[:space:]]*:[[:space:]]*"[^"]*"[[:space:]]*,//' \
+		-e 's/,[[:space:]]*"ubus_rpc_[a-z_]*"[[:space:]]*:[[:space:]]*"[^"]*"//' \
+		-e 's/"ubus_rpc_[a-z_]*"[[:space:]]*:[[:space:]]*"[^"]*"//'
 }
 
 method_claim() {
@@ -372,7 +381,7 @@ case "$1" in
 			# No token: claiming is what establishes one.
 			method_claim
 		elif require_token; then
-			REQ_BODY=$(strip_token)
+			REQ_BODY=$(strip_meta)
 			case "$2" in
 				status)     method_status ;;
 				get_config) method_get_config ;;

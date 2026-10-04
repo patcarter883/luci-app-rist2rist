@@ -230,6 +230,23 @@ check_log "reconcile commits" "$tmp/uci" "commit rist2rist"
 # The token must never land in a config field.
 check_no_log "the token is stripped before the applier" "$tmp/uci" "$TOKEN"
 
+# rpcd PREPENDS `ubus_rpc_session` to every exec call's arguments. Left in the
+# body, the field whitelist rejects EVERY write with `unknown_field` -- and no
+# off-device test caught it, because there is no rpcd in this path to inject the
+# key. Found by a real ubus call against a real rpcd on an OpenWrt VM.
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"ubus_rpc_session":"00000000000000000000000000000000","listen_url":"rist://0.0.0.0:7000"}')")
+check "reconcile tolerates rpcd's injected ubus_rpc_session" "$out" "d['ok'] is True"
+check_log "and still applies listen_url" "$tmp/uci" "set rist2rist.main.listen_url=rist://0.0.0.0:7000"
+check_no_log "the injected key never reaches a config field" "$tmp/uci" "ubus_rpc_session"
+
+# The same key FIRST, with the token second -- rpcd's real ordering, which the
+# tb() helper cannot produce because it always puts the token first.
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "{\"ubus_rpc_session\":\"00000000000000000000000000000000\",\"token\":\"$TOKEN\",\"listen_url\":\"rist://0.0.0.0:7001\"}")
+check "reconcile tolerates a leading ubus_rpc_session" "$out" "d['ok'] is True"
+check_log "and applies listen_url in that ordering too" "$tmp/uci" "set rist2rist.main.listen_url=rist://0.0.0.0:7001"
+
 echo
 echo "-- set_config --"
 
