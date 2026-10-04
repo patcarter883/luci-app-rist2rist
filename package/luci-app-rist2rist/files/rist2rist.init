@@ -2,45 +2,248 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Pat Carter
 
+
 START=99
 USE_PROCD=1
 
-OUTPUT_ARGS=""
+OUTPUT_URLS=""
+# Recovery query string for the OUTPUT (WAN) leg. Built in start_service and
+# consumed by append_output_url. A file-level global (like OUTPUT_URLS) so it
+# survives the config_foreach callback boundary without relying on dynamic scope.
+OUTPUT_RECOVERY=""
 
-append_output_flag() {
+# The umdns service file this bridge publishes itself under (DT-19 discovery).
+MDNS_SERVICE_FILE="/etc/umdns/rist2rist.json"
+
+# The mDNS instance label, which is also the portal's bridge_uid. Stable across a
+# claim, so an encoder that already holds a token still recognises the same box.
+bridge_uid() {
+    local mac="" iface
+    for iface in br-lan eth0 eth1; do
+        if [ -r "/sys/class/net/${iface}/address" ]; then
+            mac="$(cat "/sys/class/net/${iface}/address" 2>/dev/null)" || mac=""
+        fi
+        if [ -n "$mac" ]; then
+            break
+        fi
+    done
+    if [ -z "$mac" ]; then
+        mac="unknown"
+    fi
+    echo "rist2rist-${mac}"
+}
+
+# The port the encoder reaches rpcd on -- the WEB port, NOT the RIST listen port.
+# The encoder builds its ubus endpoint from the address plus this value.
+web_port() {
+    local port
+    port="$(uci -q get uhttpd.main.listen_http 2>/dev/null | sed 's/.*://')"
+    case "$port" in
+        ''|*[!0-9]*) port=80 ;;
+    esac
+    echo "$port"
+}
+
+# The port from a rist://@host:port[?query] URL.
+listen_port() {
+    local url="${1%%\?*}"
+    local port="${url##*:}"
+    case "$port" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    echo "$port"
+}
+
+# Publish the bridge for encoder discovery over umdns, so an encoder finds it on
+# the LAN instead of being told its address by hand. Idempotent.
+#
+# The TXT record IS the DT-21 contract the encoder reads, and every field earns
+# its place:
+#  - fingerprint ONLY when claimed, derived from the pair-token hash. It therefore
+#    changes on a factory reset (new token, new hash) and not before -- which is how
+#    an encoder holding a token tells "reset, claim again" from "still mine", and how
+#    a token-LESS encoder learns a bridge is already claimed and must not be taken.
+#    The token itself is never published: the advertisement is public.
+#  - claimed/managed let the encoder report real state rather than assume it.
+#  - api_port, because the SRV port is the RIST listen port and NOT where rpcd is.
+write_mdns_service() {
+    local uid port txt hash fingerprint managed
+    uid="$(bridge_uid)"
+    port="$1"
+
+    config_get managed 'main' 'managed' 0
+    config_get hash 'main' 'pair_token_hash' ''
+    txt="\"api=1\""
+    if [ -n "$hash" ]; then
+        # 16 hex chars is plenty to distinguish a box, and is not the token.
+        fingerprint="$(printf '%s' "$hash" | cut -c1-16)"
+        txt="${txt}, \"fingerprint=${fingerprint}\", \"claimed=1\""
+    else
+        txt="${txt}, \"claimed=0\""
+    fi
+    txt="${txt}, \"managed=${managed}\", \"api_port=$(web_port)\""
+
+    if ! mkdir -p "$(dirname "$MDNS_SERVICE_FILE")" 2>/dev/null; then
+        # Advertising is a convenience, never a dependency (DT-19): if we cannot
+        # publish, the bridge must still start and relay.
+        return 0
+    fi
+    cat > "$MDNS_SERVICE_FILE" <<EOF
+{
+    "${uid}": {
+        "service": "_obr-rist._udp",
+        "port": ${port},
+        "txt": [ ${txt} ]
+    }
+}
+EOF
+    if [ -x /etc/init.d/umdns ]; then
+        /etc/init.d/umdns reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+remove_mdns_service() {
+    [ -f "$MDNS_SERVICE_FILE" ] || return 0
+    rm -f "$MDNS_SERVICE_FILE"
+    if [ -x /etc/init.d/umdns ]; then
+        /etc/init.d/umdns reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+append_output_url() {
     local cfg="$1"
-    local address interface
+    local address interface weight url query
     config_get address "$cfg" 'address'
     config_get interface "$cfg" 'interface'
-    
-    if [ -n "$address" ]; then
-        if [ -n "$interface" ]; then
-            OUTPUT_ARGS="$OUTPUT_ARGS -o rist://${address}?miface=${interface}"
-        else
-            OUTPUT_ARGS="$OUTPUT_ARGS -o rist://${address}"
-        fi
+    config_get weight "$cfg" 'weight'
+
+    [ -z "$address" ] && return
+
+    # Prepend rist:// only if the user didn't supply a full URL
+    case "$address" in
+        *://*) url="$address" ;;
+        *)     url="rist://${address}" ;;
+    esac
+
+    # Assemble librist query params. timing-mode=0 (SOURCE) — the librist default;
+    # every peer in the chain must match. NOT 1 (ARRIVAL): ARRIVAL interpolates the
+    # arrival time of retransmitted packets assuming CBR and asserts ordering, and
+    # the encoder->rist2rist->receiver double hop violates that and SIGABRTs the
+    # receiver. NOT 2 (RTC): drops all packets until an RTCP SR sets time_offset.
+    # SOURCE orders by the monotonic source timestamp (forwarded unchanged here).
+    # OUTPUT_RECOVERY is the WAN-leg buffer/rtt/reorder tuning, mirroring the
+    # encoder-facing (-i) leg and the downstream receiver — without it the output
+    # sender ran on librist defaults (~1 s of retransmit history) while the
+    # receiver waits up to buffer-max for resends, a silent recovery hole on
+    # exactly the lossy WAN leg. miface binds the WAN interface; weight is the
+    # load-balancing weight.
+    query="timing-mode=0"
+    [ -n "$OUTPUT_RECOVERY" ] && query="${query}&${OUTPUT_RECOVERY}"
+    [ -n "$interface" ]       && query="${query}&miface=${interface}"
+    [ -n "$weight" ]          && query="${query}&weight=${weight}"
+    if [ -n "$query" ]; then
+        case "$url" in
+            *\?*) url="${url}&${query}" ;;
+            *)    url="${url}?${query}" ;;
+        esac
     fi
+
+    OUTPUT_URLS="${OUTPUT_URLS:+${OUTPUT_URLS},}${url}"
 }
 
 start_service() {
     config_load 'rist2rist'
-    local enabled listen_url
+    local enabled listen_url verbose_log loglevel profile out_profile
+    local buffer_min buffer_max rtt_min rtt_max reorder_buffer rq
+    local telemetry_enabled telemetry_target
     config_get_bool enabled 'main' 'enabled' 0
     config_get listen_url 'main' 'listen_url'
-    
-    [ "$enabled" -eq 0 ] && return
-    
-    OUTPUT_ARGS=""
-    config_foreach append_output_flag 'destination'
-    [ -z "$OUTPUT_ARGS" ] && return
-    
+    config_get_bool verbose_log 'main' 'verbose_log' 0
+    # RIST receive profile: 0=simple, 1=main, 2=advanced. Default to advanced —
+    # the encoder sends RIST_PROFILE_ADVANCED and the OOB telemetry channel only
+    # exists in main/advanced, so a simple-profile listener never authenticates.
+    config_get profile 'main' 'profile' 2
+    # Output (downstream) profile, independent of the receive profile. Default to
+    # advanced to match an advanced-profile downstream receiver.
+    config_get out_profile 'main' 'out_profile' 2
+    # Recovery tuning, applied to BOTH the receive (encoder-facing) leg and the
+    # output (WAN) leg. reorder must stay well below buffer-min or the
+    # retransmission window is starved (no NACKs -> unrecovered loss).
+    config_get buffer_min 'main' 'buffer_min' 1000
+    config_get buffer_max 'main' 'buffer_max' 5000
+    config_get rtt_min 'main' 'rtt_min' 40
+    config_get rtt_max 'main' 'rtt_max' 500
+    config_get reorder_buffer 'main' 'reorder_buffer' 30
+    # Telemetry: push the OUTPUT (-o, WAN-leg) sender statistics to a stats
+    # consumer (the encoder's adaptive-bitrate listener) via rist2rist
+    # remote-logging (UDP). Replaces the RIST OOB feedback the proxy cannot relay
+    # across its two independent sessions. telemetry_target = "IP:PORT" of the
+    # consumer; configurable, never hardcoded.
+    config_get_bool telemetry_enabled 'main' 'telemetry_enabled' 0
+    config_get telemetry_target 'main' 'telemetry_target' ''
+
+    if [ "$enabled" -eq 0 ]; then
+        # A disabled bridge must stop advertising itself, or encoders keep
+        # discovering a box that will never relay.
+        remove_mdns_service
+        return
+    fi
+
+    # DT-19 discovery. Advertised whenever the bridge is ENABLED -- crucially
+    # including a VIRGIN bridge with no outputs, because that is exactly the state a
+    # LAN auto-claim (DT-21 path C) has to be able to find. Gating this on outputs
+    # would leave a virgin bridge undiscoverable and therefore unclaimable.
+    local mdns_port
+    mdns_port="$(listen_port "$listen_url")" && write_mdns_service "$mdns_port"
+
+    # Append recovery params to the listen (-i) URL (handles an existing '?').
+    rq="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}&timing-mode=0"
+    case "$listen_url" in
+        *\?*) listen_url="${listen_url}&${rq}" ;;
+        *)    listen_url="${listen_url}?${rq}" ;;
+    esac
+
+    # Same recovery params for the OUTPUT (-o) leg, consumed by append_output_url
+    # (it adds timing-mode itself, so it is omitted here).
+    OUTPUT_RECOVERY="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}"
+
+    OUTPUT_URLS=""
+    config_foreach append_output_url 'destination'
+    [ -z "$OUTPUT_URLS" ] && return
+
+    # librist emits the periodic statistics block only at INFO (6), so force
+    # verbose logging whenever telemetry is on. The consumer filters the stream
+    # for the "sender-stats" line and ignores the rest.
+    if [ "$verbose_log" -eq 1 ] || { [ "$telemetry_enabled" -eq 1 ] && [ -n "$telemetry_target" ]; }; then
+        loglevel=6
+    else
+        loglevel=4
+    fi
+
     procd_open_instance "main"
-    # Execute with your telemetry modifications running cleanly inside the dynamic binary
-    procd_set_param command /usr/bin/rist2rist -i "$listen_url" $OUTPUT_ARGS
-    procd_set_param respawn
+    procd_set_param command /usr/bin/rist2rist
+    procd_append_param command -i "$listen_url"
+    procd_append_param command -o "$OUTPUT_URLS"
+    procd_append_param command -p "$profile"
+    procd_append_param command -P "$out_profile"
+    procd_append_param command -v "$loglevel"
+    # Stats push (1 Hz) to the configured telemetry target.
+    if [ "$telemetry_enabled" -eq 1 ] && [ -n "$telemetry_target" ]; then
+        procd_append_param command -S 1000
+        procd_append_param command -r "$telemetry_target"
+    fi
     procd_set_param stdout 1
     procd_set_param stderr 1
+    procd_set_param respawn
     procd_close_instance
+}
+
+# procd calls this once the service has stopped, including at shutdown, so the
+# advertisement does not outlive the bridge it describes.
+service_stopped() {
+    remove_mdns_service
 }
 
 service_triggers() {

@@ -1,0 +1,315 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Pat Carter
+
+# Off-device test for the rist2rist rpcd plugin.
+#
+#   sh tests/rpcd-selftest.sh
+#
+# Stubs /lib/functions.sh, and puts tests/bin (jsonfilter, uci, reload-stub) ahead
+# on PATH so the claim and write paths can be exercised without a router. Needs
+# python3 -- the jsonfilter double is Python and the assertions use it. The plugin
+# itself is POSIX sh.
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+plugin="$here/../root/usr/libexec/rpcd/rist2rist"
+stub="$here/stub-functions.sh"
+fails=0
+
+chmod +x "$here"/bin/* 2>/dev/null || true
+PATH="$here/bin:$PATH"
+export PATH
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# The token a CLAIMED bridge accepts. The stub reports its sha256 as the stored
+# hash, exactly as the plugin does, so the comparison path is the real one.
+TOKEN='test-token-abcdefghijklmnop'
+TOKEN_HASH=$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)
+
+py() { # py <json> <expression-over-d> -> 0 if the assertion holds
+	printf '%s' "$1" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert $2
+" 2>/dev/null
+}
+
+jget_field() { # jget_field <json> <key>
+	printf '%s' "$1" | python3 -c "import json,sys;print(json.load(sys.stdin).get('$2',''))" 2>/dev/null || echo ""
+}
+
+check() { # check <label> <json> <expression>
+	if py "$2" "$3"; then
+		echo "  OK   $1"
+	else
+		echo "  FAIL $1"
+		printf '       got: %s\n' "$2"
+		fails=$((fails + 1))
+	fi
+}
+
+check_log() { # check_log <label> <logfile> <grep-pattern>
+	if grep -q -- "$3" "$2" 2>/dev/null; then
+		echo "  OK   $1"
+	else
+		echo "  FAIL $1"
+		printf '       log: %s\n' "$(cat "$2" 2>/dev/null)"
+		fails=$((fails + 1))
+	fi
+}
+
+check_no_log() { # check_no_log <label> <logfile> <grep-pattern>
+	if grep -q -- "$3" "$2" 2>/dev/null; then
+		echo "  FAIL $1 (unexpected match)"
+		fails=$((fails + 1))
+	else
+		echo "  OK   $1"
+	fi
+}
+
+# --- bridge states -------------------------------------------------------
+claimed()    { export STUB_MAIN_TOKEN_HASH="$TOKEN_HASH"; }
+unclaimed()  { unset STUB_MAIN_TOKEN_HASH 2>/dev/null || true; }
+virgin()     { export STUB_DESTINATIONS=0; }
+configured() { unset STUB_DESTINATIONS 2>/dev/null || true; }
+
+# run <managed 0|1> <method> [body] -- the exported state above is inherited.
+run() {
+	if [ -n "${3:-}" ]; then
+		printf '%s' "$3" | env UCI_STUB_LOG="$tmp/uci" STUB_MAIN_MANAGED="$1" \
+			FUNCTIONS_SH="$stub" RELOAD_CMD="$here/bin/reload-stub" \
+			RELOAD_STUB_LOG="$tmp/reload" sh "$plugin" call "$2" || true
+	else
+		env UCI_STUB_LOG="$tmp/uci" STUB_MAIN_MANAGED="$1" \
+			FUNCTIONS_SH="$stub" RELOAD_CMD="$here/bin/reload-stub" \
+			RELOAD_STUB_LOG="$tmp/reload" sh "$plugin" call "$2" </dev/null || true
+	fi
+}
+
+# tb '<json>' -- the same object with the valid token added, so that a test body
+# only has to express the field under test.
+tb() {
+	case "${1:-}" in
+		''|'{}') printf '{"token":"%s"}' "$TOKEN" ;;
+		*)       printf '{"token":"%s",%s' "$TOKEN" "${1#\{}" ;;
+	esac
+}
+
+echo "== rist2rist rpcd plugin self-test =="
+
+# --- list ---
+out=$(FUNCTIONS_SH="$stub" sh "$plugin" list)
+check "list enumerates the read methods" "$out" "'status' in d and 'get_config' in d"
+check "list enumerates the write methods" "$out" \
+	"'set_config' in d and 'reconcile' in d and 'reload' in d"
+check "list enumerates the claim and release" "$out" "'claim' in d and 'release' in d"
+
+# --- unknown method must not crash (and is refused before auth, like any method) ---
+out=$(FUNCTIONS_SH="$stub" sh "$plugin" call nope)
+check "an unknown method is refused without a token" "$out" "d['ok'] is False"
+configured; claimed
+out=$(run 1 nope "$(tb '{}')")
+check "an unknown method returns {} once authenticated" "$out" "d == {}"
+
+# ======================================================================
+# claim
+# ======================================================================
+
+echo
+echo "-- claim --"
+
+virgin; unclaimed
+rm -f "$tmp"/uci*
+out=$(run 0 claim '{"device_uid":"enc-0001"}')
+check "a virgin, unclaimed bridge can be claimed" "$out" \
+	"d['ok'] is True and d['managed'] is True"
+check "the claim returns a 32-character token" "$out" "len(d['token']) == 32"
+claimed_token=$(jget_field "$out" token)
+check_log "claim stores the managed flag" "$tmp/uci" "set rist2rist.main.managed=1"
+check_log "claim records who claimed it" "$tmp/uci" "set rist2rist.main.claimed_by=enc-0001"
+check_log "claim commits" "$tmp/uci" "commit rist2rist"
+# Only the HASH may be stored: the bridge must never be able to re-reveal a token.
+check_log "claim stores the token hash" "$tmp/uci" "set rist2rist.main.pair_token_hash="
+check_no_log "claim never stores the plaintext token" "$tmp/uci" "$claimed_token"
+
+configured
+rm -f "$tmp"/uci*
+out=$(run 0 claim '{"device_uid":"enc-0002"}')
+check "a configured bridge cannot be claimed" "$out" \
+	"d['ok'] is False and d['error'] == 'not_virgin'"
+
+virgin; claimed
+rm -f "$tmp"/uci*
+out=$(run 0 claim '{"device_uid":"enc-0003"}')
+check "claiming is refused when a token already exists" "$out" \
+	"d['ok'] is False and d['error'] == 'already_claimed'"
+
+# ======================================================================
+# the token gate
+# ======================================================================
+
+echo
+echo "-- the token gate --"
+
+configured; unclaimed
+rm -f "$tmp"/uci*
+out=$(run 1 get_config '{}')
+check "an unclaimed bridge refuses everything" "$out" \
+	"d['ok'] is False and d['error'] == 'unclaimed'"
+
+configured; claimed
+out=$(run 1 get_config '{}')
+check "a claimed bridge refuses a call with no token" "$out" \
+	"d['ok'] is False and d['error'] == 'token_required'"
+
+out=$(run 1 get_config '{"token":"not-the-token"}')
+check "a wrong token is refused" "$out" \
+	"d['ok'] is False and d['error'] == 'bad_token'"
+
+out=$(run 1 get_config "$(tb '{}')")
+check "the right token is accepted" "$out" "d['claimed'] is True"
+# strip_token must have removed it, and nothing may echo it back.
+check "get_config never echoes the token back" "$out" "'token' not in d"
+
+# ======================================================================
+# read, with a token
+# ======================================================================
+
+echo
+echo "-- read --"
+
+configured; claimed
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config: enabled is a JSON bool" "$out" "d['enabled'] is True"
+check "get_config: listen_url carried" "$out" "d['listen_url'] == 'rist://0.0.0.0:5000'"
+check "get_config: recovery block present" "$out" "d['recovery']['reorder_buffer'] == '20'"
+check "get_config: telemetry target carried" "$out" "d['telemetry']['target'] == '192.0.2.10:9999'"
+check "get_config: both destinations emitted" "$out" "len(d['outputs']) == 2"
+check "get_config: destination fields correct" "$out" \
+	"d['outputs'][1]['address'] == '198.51.100.7:5000' and d['outputs'][1]['weight'] == '2'"
+
+# status needs no ubus/jsonfilter off-device, so it must still emit valid JSON.
+out=$(run 1 status "$(tb '{}')")
+check "status: valid JSON with running=false when not running" "$out" \
+	"d['running'] is False and d['pid'] == ''"
+
+# ======================================================================
+# write, with a token
+# ======================================================================
+
+echo
+echo "-- the managed kill-switch --"
+
+configured; claimed
+rm -f "$tmp"/uci*
+out=$(run 0 reconcile "$(tb '{"listen_url":"rist://0.0.0.0:6000"}')")
+check "managed=0 still refuses a token-holding caller" "$out" \
+	"d['ok'] is False and d['error'] == 'unmanaged'"
+if [ -f "$tmp/uci" ]; then
+	echo "  FAIL the kill-switch changed no config"
+	fails=$((fails + 1))
+else
+	echo "  OK   the kill-switch changed no config"
+fi
+
+echo
+echo "-- reconcile --"
+
+configured; claimed
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"listen_url":"rist://0.0.0.0:6000"}')")
+check "reconcile succeeds with a token" "$out" "d['ok'] is True"
+check_log "reconcile sets listen_url" "$tmp/uci" "set rist2rist.main.listen_url=rist://0.0.0.0:6000"
+
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"outputs":[{"address":"203.0.113.9:5000","interface":"wan","weight":"1"}]}')")
+check "reconcile with outputs succeeds" "$out" "d['ok'] is True"
+check_log "reconcile adds a destination section" "$tmp/uci" "add rist2rist destination"
+check_log "reconcile sets the output address" "$tmp/uci" "set rist2rist.cfg1.address=203.0.113.9:5000"
+check_log "reconcile commits" "$tmp/uci" "commit rist2rist"
+# The token must never land in a config field.
+check_no_log "the token is stripped before the applier" "$tmp/uci" "$TOKEN"
+
+# rpcd PREPENDS `ubus_rpc_session` to every exec call's arguments. Left in the
+# body, the field whitelist rejects EVERY write with `unknown_field` -- and no
+# off-device test caught it, because there is no rpcd in this path to inject the
+# key. Found by a real ubus call against a real rpcd on an OpenWrt VM.
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"ubus_rpc_session":"00000000000000000000000000000000","listen_url":"rist://0.0.0.0:7000"}')")
+check "reconcile tolerates rpcd's injected ubus_rpc_session" "$out" "d['ok'] is True"
+check_log "and still applies listen_url" "$tmp/uci" "set rist2rist.main.listen_url=rist://0.0.0.0:7000"
+check_no_log "the injected key never reaches a config field" "$tmp/uci" "ubus_rpc_session"
+
+# The same key FIRST, with the token second -- rpcd's real ordering, which the
+# tb() helper cannot produce because it always puts the token first.
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "{\"ubus_rpc_session\":\"00000000000000000000000000000000\",\"token\":\"$TOKEN\",\"listen_url\":\"rist://0.0.0.0:7001\"}")
+check "reconcile tolerates a leading ubus_rpc_session" "$out" "d['ok'] is True"
+check_log "and applies listen_url in that ordering too" "$tmp/uci" "set rist2rist.main.listen_url=rist://0.0.0.0:7001"
+
+echo
+echo "-- set_config --"
+
+rm -f "$tmp"/uci*
+out=$(run 1 set_config "$(tb '{"recovery":{"buffer_max":"9000"},"enabled":true}')")
+check "set_config applies recovery + enabled" "$out" "d['ok'] is True"
+check_log "set_config sets buffer_max" "$tmp/uci" "set rist2rist.main.buffer_max=9000"
+check_log "set_config sets enabled=1" "$tmp/uci" "set rist2rist.main.enabled=1"
+
+echo
+echo "-- the rules the bridge enforces itself --"
+
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"listen_url":"rist://203.0.113.5:5000?secret=abc123"}')")
+check "a URL carrying a secret is rejected" "$out" \
+	"d['ok'] is False and d['error'] == 'secret_in_url'"
+check_no_log "a rejected URL is never committed" "$tmp/uci" "commit"
+
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"secret":"abc123"}')")
+check "a secret-bearing field is rejected" "$out" \
+	"d['ok'] is False and d['error'] == 'secret_field'"
+
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"listen_url":"rist://0.0.0.0:6000","evil":"x"}')")
+check "an unknown field is rejected, not ignored" "$out" \
+	"d['ok'] is False and d['error'] == 'unknown_field'"
+
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"profile":"2"}')")
+check "reconcile may not set profile (narrower than set_config)" "$out" \
+	"d['ok'] is False and d['error'] == 'unknown_field'"
+
+echo
+echo "-- reload --"
+
+rm -f "$tmp/reload"
+out=$(run 1 reload "$(tb '{}')")
+check "reload succeeds with a token" "$out" "d['ok'] is True and d['reloaded'] is True"
+check_log "reload invoked the service entry point" "$tmp/reload" "reload"
+
+echo
+echo "-- release (portal-side recovery, without router access) --"
+
+configured; claimed
+rm -f "$tmp"/uci*
+out=$(run 1 release "$(tb '{}')")
+check "release succeeds with a token" "$out" "d['ok'] is True and d['released'] is True"
+check_log "release clears the token" "$tmp/uci" "set rist2rist.main.pair_token_hash="
+check_log "release clears managed" "$tmp/uci" "set rist2rist.main.managed=0"
+check_log "release commits" "$tmp/uci" "commit rist2rist"
+
+out=$(run 1 release '{"token":"not-the-token"}')
+check "release without a valid token is refused" "$out" \
+	"d['ok'] is False and d['error'] == 'bad_token'"
+
+echo
+if [ "$fails" -eq 0 ]; then
+	echo "ALL PASS"
+else
+	echo "$fails FAILED"
+	exit 1
+fi

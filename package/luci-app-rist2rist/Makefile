@@ -2,12 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-rist2rist
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
-
-# LuCI app (JS/init/config/packaging) is AGPL-3.0-or-later; the rist2rist
-# tool patch built from librist tools/ remains BSD-2-Clause (upstreamable).
-PKG_LICENSE:=AGPL-3.0-or-later AND BSD-2-Clause
-PKG_LICENSE_FILES:=LICENSE
+PKG_RELEASE:=3
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
@@ -30,13 +25,18 @@ define Package/luci-app-rist2rist
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=LuCI support for Custom Reactive RIST Proxy
-  DEPENDS:=+libopenssl +libcjson +luci-base
+  DEPENDS:=+libopenssl +cJSON +luci-base
 endef
 
-# Step 1: Copy your local development src folder straight into the compilation workspace
+# Step 1: materialise the source. ./src is PRISTINE upstream librist (pinned at the commit
+# named in patches/README) and every open-broadcast change lives in ./patches, so the
+# customisation is reviewable here in the app repo and survives a clean clone.
+# (Previously the edits were made in-place in ./src, which was also an embedded git repo —
+# so nothing was tracked by this repo and a clean checkout could not build at all.)
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/* $(PKG_BUILD_DIR)/
+	$(Build/Patch)
 endef
 
 # Build only tools/rist2rist; ninja's dep graph stops at librist.a + its objects,
@@ -52,19 +52,38 @@ define Build/Install
 	$(INSTALL_BIN) $(MESON_BUILD_DIR)/tools/rist2rist $(PKG_INSTALL_DIR)/usr/bin/rist2rist
 endef
 
-# 3. Securely grab the single binary from the build outputs and drop it into the image matrix
 define Package/luci-app-rist2rist/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/rist2rist $(1)/usr/bin/
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/rist2rist.config $(1)/etc/config/rist2rist
-	
+
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/rist2rist.init $(1)/etc/init.d/rist2rist
 
-	$(INSTALL_DIR) $(1)/usr/share/luci/resources/view
-	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/rist2rist.js $(1)/usr/share/luci/resources/view/
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/rist2rist.js $(1)/www/luci-static/resources/view/
+
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-rist2rist.json $(1)/usr/share/luci/menu.d/
+
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-rist2rist.json $(1)/usr/share/rpcd/acl.d/
+
+	# rpcd exec plugin: the read-only bridge API (milestone M-B1) that the encoder
+	# calls as JSON-RPC over HTTP at /ubus. LuCI remains another client of the same
+	# methods, so there is one API rather than two.
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(INSTALL_BIN) ./root/usr/libexec/rpcd/rist2rist $(1)/usr/libexec/rpcd/rist2rist
+endef
+
+define Package/luci-app-rist2rist/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/rpcd restart 2>/dev/null || true
+/etc/init.d/uhttpd reload 2>/dev/null || true
+exit 0
 endef
 
 $(eval $(call BuildPackage,luci-app-rist2rist))

@@ -1,0 +1,407 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Pat Carter
+
+##########################################################################
+# rpcd exec plugin -- read and configure the rist2rist bridge.
+#
+#   rist2rist.claim       (NO token) mint a pair token; only on a virgin bridge
+#   rist2rist.release     (token)    return the bridge to unclaimed
+#   rist2rist.status      (token)    running state, pid and the REAL effective argv
+#   rist2rist.get_config  (token)    the UCI configuration as structured JSON
+#   rist2rist.set_config  (token)    apply a whitelisted config object, then commit
+#   rist2rist.reconcile   (token)    apply listen_url + outputs only (the "adopt" action)
+#   rist2rist.reload      (token)    restart the procd instance to activate the config
+#
+# AUTHENTICATION HAPPENS IN THIS PLUGIN, not by an rpcd session login. rpcd's exec
+# interface does not tell the plugin which session called it, so rather than
+# provision a system user we verify the bridge's PAIR TOKEN here. That is also what
+# lets the ACL expose these methods to the `unauthenticated` group without opening
+# them up: every method except `claim` demands the token, and `claim` is refused
+# unless the bridge has never been claimed and is not already relaying.
+#
+# THE CLAIM IS THE SAFETY RULE. Claiming is what makes a bridge configurable, so an
+# operator never has to touch the router: a bridge provisioned with a token at
+# imaging (registered to the account at fulfilment) is already claimed, and one that
+# ships unclaimed is claimed once, from the LAN, by the account's encoder.
+#
+# Two rules are enforced here rather than trusted to callers:
+#   * a field whitelist -- an unknown key is REJECTED, never silently ignored, so a
+#     caller cannot believe it applied something the bridge dropped;
+#   * no URL value may carry a secret parameter (secret=/aes-type=/psk=/token=).
+#     URLs are loggable by definition (H2), and a config report is exactly where
+#     a link key would otherwise leak.
+#
+# Access is governed by /usr/share/rpcd/acl.d/luci-app-rist2rist.json. A LAN client
+# reaches this as JSON-RPC over HTTP at the router's /ubus endpoint.
+##########################################################################
+
+# Test hook: lets the package's own test harness stub /lib/functions.sh.
+FUNCTIONS_SH=${FUNCTIONS_SH:-/lib/functions.sh}
+. "$FUNCTIONS_SH"
+
+# Test hook: the service reload entry point. An absolute path, so PATH stubbing
+# cannot reach it.
+RELOAD_CMD=${RELOAD_CMD:-/etc/init.d/rist2rist}
+
+CONFIG=rist2rist
+
+# Minimal JSON string escaping for values (URLs/paths) that can contain quotes.
+json_str() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+err() { # err <code> <message>
+	printf '{"ok":false,"error":"%s","message":"%s"}\n' "$1" "$(json_str "$2")"
+}
+
+# ======================================================================
+# read
+# ======================================================================
+
+# config_foreach callback: one JSON object per configured output destination.
+emit_output() {
+	local cfg="$1" address interface weight
+	config_get address   "$cfg" address
+	config_get interface "$cfg" interface
+	config_get weight    "$cfg" weight
+	[ -z "$address" ] && return 0
+	printf '{"section":"%s","address":"%s","interface":"%s","weight":"%s"},' \
+		"$(json_str "$cfg")" "$(json_str "$address")" \
+		"$(json_str "$interface")" "$(json_str "$weight")"
+}
+
+method_get_config() {
+	local listen_url profile out_profile managed claimed
+	local enabled verbose_log loglevel
+	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
+	local telemetry_enabled telemetry_target outputs token_hash
+
+	config_load "$CONFIG"
+
+	config_get_bool enabled           main enabled 0
+	config_get_bool managed           main managed 0
+	config_get      listen_url        main listen_url
+	config_get      profile           main profile
+	config_get      out_profile       main out_profile
+	config_get_bool verbose_log       main verbose_log 0
+	config_get      loglevel          main loglevel
+	config_get      buffer_min        main buffer_min
+	config_get      buffer_max        main buffer_max
+	config_get      rtt_min           main rtt_min
+	config_get      rtt_max           main rtt_max
+	config_get      reorder_buffer    main reorder_buffer
+	config_get_bool telemetry_enabled main telemetry_enabled 0
+	config_get      telemetry_target  main telemetry_target
+	config_get      token_hash        main pair_token_hash
+
+	# Claimed is derived from the token existing, not tracked separately -- one
+	# definition, so the two can never disagree.
+	[ -n "$token_hash" ] && claimed=1 || claimed=0
+
+	outputs=$(config_foreach emit_output destination)
+
+	printf '{'
+	printf '"ok":true,'
+	printf '"claimed":%s,' "$([ "$claimed" = "1" ] && echo true || echo false)"
+	printf '"managed":%s,' "$([ "$managed" = "1" ] && echo true || echo false)"
+	printf '"enabled":%s,' "$([ "$enabled" = "1" ] && echo true || echo false)"
+	printf '"listen_url":"%s",' "$(json_str "$listen_url")"
+	printf '"profile":"%s",' "$(json_str "$profile")"
+	printf '"out_profile":"%s",' "$(json_str "$out_profile")"
+	printf '"verbose_log":%s,' "$([ "$verbose_log" = "1" ] && echo true || echo false)"
+	printf '"loglevel":"%s",' "$(json_str "$loglevel")"
+	printf '"recovery":{"buffer_min":"%s","buffer_max":"%s","rtt_min":"%s","rtt_max":"%s","reorder_buffer":"%s"},' \
+		"$(json_str "$buffer_min")" "$(json_str "$buffer_max")" \
+		"$(json_str "$rtt_min")" "$(json_str "$rtt_max")" "$(json_str "$reorder_buffer")"
+	printf '"telemetry":{"enabled":%s,"target":"%s"},' \
+		"$([ "$telemetry_enabled" = "1" ] && echo true || echo false)" \
+		"$(json_str "$telemetry_target")"
+	printf '"outputs":[%s]' "${outputs%,}"
+	printf '}'
+	printf '\n'
+}
+
+method_status() {
+	local svc="" pid="" running=false argv=""
+
+	# procd owns the process; ask it. jsonfilter is part of the base image.
+	if command -v ubus >/dev/null 2>&1; then
+		svc=$(ubus call service list '{"name":"rist2rist"}' 2>/dev/null)
+	fi
+
+	if [ -n "$svc" ] && command -v jsonfilter >/dev/null 2>&1; then
+		pid=$(printf '%s' "$svc" | jsonfilter -e '@.rist2rist.instances.*.pid' 2>/dev/null | head -n 1)
+	fi
+
+	# The real effective argv comes from the kernel, not from a second copy of the
+	# init script's URL assembly: one definition, and it cannot drift.
+	if [ -n "$pid" ]; then
+		running=true
+		[ -r "/proc/$pid/cmdline" ] && argv=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+	fi
+
+	printf '{"ok":true,"running":%s,"pid":"%s","argv":"%s"}\n' \
+		"$running" "$(json_str "$pid")" "$(json_str "$argv")"
+}
+
+# ======================================================================
+# the pair token
+# ======================================================================
+
+# The request body arrives on stdin and is read exactly once.
+REQ_BODY=""
+
+jget() { # jget <jsonfilter-expression>
+	printf '%s' "$REQ_BODY" | jsonfilter -e "$1" 2>/dev/null
+}
+
+token_hash_of() { # token_hash_of <token> -> hex sha256
+	printf '%s' "$1" | sha256sum | cut -d' ' -f1
+}
+
+# Only its hash is ever stored, so the bridge cannot re-reveal a token it issued.
+require_token() {
+	local want have
+	config_load "$CONFIG"
+	config_get want main pair_token_hash
+	if [ -z "$want" ]; then
+		err unclaimed "this bridge has not been claimed; call claim first"
+		return 1
+	fi
+	have=$(jget '@.token')
+	if [ -z "$have" ]; then
+		err token_required "a token is required"
+		return 1
+	fi
+	if [ "$(token_hash_of "$have")" != "$want" ]; then
+		err bad_token "the token is not valid for this bridge"
+		return 1
+	fi
+	return 0
+}
+
+# Drop transport metadata from the body before it reaches the config applier:
+#   * the pair token -- so it can never be written into a config field, which also
+#     keeps the field whitelist meaningful;
+#   * rpcd's OWN injected keys. rpcd prepends `ubus_rpc_session` (a hex session id)
+#     to the arguments of every exec call. Left in, the field whitelist rejects
+#     EVERY write with `unknown_field`, and no off-device test can catch that --
+#     there is no rpcd in that path to inject the key. Found on real hardware.
+strip_meta() {
+	printf '%s' "$REQ_BODY" | sed \
+		-e 's/"token"[[:space:]]*:[[:space:]]*"[^"]*"[[:space:]]*,//' \
+		-e 's/,[[:space:]]*"token"[[:space:]]*:[[:space:]]*"[^"]*"//' \
+		-e 's/"token"[[:space:]]*:[[:space:]]*"[^"]*"//' \
+		-e 's/"ubus_rpc_[a-z_]*"[[:space:]]*:[[:space:]]*"[^"]*"[[:space:]]*,//' \
+		-e 's/,[[:space:]]*"ubus_rpc_[a-z_]*"[[:space:]]*:[[:space:]]*"[^"]*"//' \
+		-e 's/"ubus_rpc_[a-z_]*"[[:space:]]*:[[:space:]]*"[^"]*"//'
+}
+
+method_claim() {
+	config_load "$CONFIG"
+	local existing outputs token
+	config_get existing main pair_token_hash
+	if [ -n "$existing" ]; then
+		err already_claimed "this bridge has already been claimed"
+		return 0
+	fi
+
+	# Only a VIRGIN bridge may be claimed. One that is already relaying should not be
+	# takeable by whoever happens to be on the LAN, and a bridge provisioned with a
+	# token at imaging never reaches this path at all.
+	outputs=$(config_foreach emit_output destination)
+	if [ -n "$outputs" ]; then
+		err not_virgin "this bridge is already configured; clear its outputs before claiming"
+		return 0
+	fi
+
+	token=$(head -c 64 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | cut -c1-32)
+	if [ -z "$token" ]; then
+		err rng_failed "could not generate a token"
+		return 0
+	fi
+
+	uci set "$CONFIG.main.pair_token_hash=$(token_hash_of "$token")" || { err commit_failed "uci set failed"; return 0; }
+	uci set "$CONFIG.main.claimed_by=$(jget '@.device_uid')"
+	uci set "$CONFIG.main.claimed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	# Claiming is what makes a bridge configurable, so nobody has to set this by hand.
+	uci set "$CONFIG.main.managed=1"
+	uci commit "$CONFIG" || { err commit_failed "uci commit failed"; return 0; }
+
+	# The plaintext token is returned EXACTLY ONCE.
+	printf '{"ok":true,"token":"%s","managed":true}\n' "$token"
+}
+
+method_release() {
+	uci set "$CONFIG.main.pair_token_hash="
+	uci set "$CONFIG.main.claimed_by="
+	uci set "$CONFIG.main.claimed_at="
+	uci set "$CONFIG.main.managed=0"
+	uci commit "$CONFIG" || { err commit_failed "uci commit failed"; return 0; }
+	printf '{"ok":true,"released":true,"managed":false}\n'
+}
+
+# ======================================================================
+# write
+# ======================================================================
+
+require_managed() {
+	config_load "$CONFIG"
+	local m
+	config_get_bool m main managed 0
+	if [ "$m" != "1" ]; then
+		err unmanaged "this bridge is not managed; set rist2rist.main.managed=1 on this router to allow configuration"
+		return 1
+	fi
+	return 0
+}
+
+# A URL must not carry a link secret (H2: URLs are loggable by definition).
+url_ok() { # url_ok <url> <field>
+	case "$1" in
+		*secret=*|*aes-type=*|*psk=*|*token=*|*password=*)
+			err secret_in_url "$2 must not contain a secret parameter"
+			return 1;;
+	esac
+	return 0
+}
+
+# Reject a body that mentions secret-bearing keys at all.
+body_has_secret_key() {
+	printf '%s' "$REQ_BODY" | grep -qiE '"(secret|psk|password|passphrase|aes-type|aes_type)"[[:space:]]*:'
+}
+
+# Enforce the field whitelist. This is a text-level scan (jsonfilter cannot
+# enumerate keys); every key name appearing anywhere in the body must be in $1,
+# including the nested key names of an array element.
+check_fields() {
+	local allowed=" $1 " k keys
+	keys=$(printf '%s' "$REQ_BODY" | grep -oE '"[A-Za-z_][A-Za-z0-9_-]*"[[:space:]]*:' \
+		| sed -e 's/"//g' -e 's/[[:space:]]*:$//' | sort -u)
+	for k in $keys; do
+		case "$allowed" in
+			*" $k "*) ;;
+			*) err unknown_field "unknown or disallowed field: $k"; return 1;;
+		esac
+	done
+	return 0
+}
+
+# Apply the whitelisted keys. $1 = the fields this entry point accepts.
+apply_config() {
+	local allowed="$1" j=0 present=""
+	local listen_url profile out_profile enabled
+	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
+	local telemetry_enabled telemetry_target
+	local i addr iface weight sec
+
+	body_has_secret_key && { err secret_field "the request contains a secret-bearing field"; return 1; }
+	check_fields "$allowed" || return 1
+
+	listen_url=$(jget '@.listen_url')
+	if [ -n "$listen_url" ]; then
+		url_ok "$listen_url" listen_url || return 1
+		uci set "$CONFIG.main.listen_url=$listen_url" || { err apply_failed "listen_url"; return 1; }
+	fi
+
+	profile=$(jget '@.profile')
+	[ -n "$profile" ] && uci set "$CONFIG.main.profile=$profile"
+	out_profile=$(jget '@.out_profile')
+	[ -n "$out_profile" ] && uci set "$CONFIG.main.out_profile=$out_profile"
+
+	enabled=$(jget '@.enabled')
+	[ -n "$enabled" ] && uci set "$CONFIG.main.enabled=$([ "$enabled" = "true" ] && echo 1 || echo 0)"
+
+	buffer_min=$(jget '@.recovery.buffer_min')
+	[ -n "$buffer_min" ] && uci set "$CONFIG.main.buffer_min=$buffer_min"
+	buffer_max=$(jget '@.recovery.buffer_max')
+	[ -n "$buffer_max" ] && uci set "$CONFIG.main.buffer_max=$buffer_max"
+	rtt_min=$(jget '@.recovery.rtt_min')
+	[ -n "$rtt_min" ] && uci set "$CONFIG.main.rtt_min=$rtt_min"
+	rtt_max=$(jget '@.recovery.rtt_max')
+	[ -n "$rtt_max" ] && uci set "$CONFIG.main.rtt_max=$rtt_max"
+	reorder_buffer=$(jget '@.recovery.reorder_buffer')
+	[ -n "$reorder_buffer" ] && uci set "$CONFIG.main.reorder_buffer=$reorder_buffer"
+
+	telemetry_enabled=$(jget '@.telemetry.enabled')
+	[ -n "$telemetry_enabled" ] && uci set "$CONFIG.main.telemetry_enabled=$([ "$telemetry_enabled" = "true" ] && echo 1 || echo 0)"
+	telemetry_target=$(jget '@.telemetry.target')
+	if [ -n "$telemetry_target" ]; then
+		url_ok "$telemetry_target" telemetry_target || return 1
+		uci set "$CONFIG.main.telemetry_target=$telemetry_target"
+	fi
+
+	# Outputs, if the body mentions them at all: replace the set WHOLESALE. A
+	# partial edit could leave a stale destination active, which is worse than
+	# none, and the caller cannot see which one survived.
+	present=$(printf '%s' "$REQ_BODY" | grep -c '"outputs"' || true)
+	if [ "$present" -gt 0 ]; then
+		i=0
+		while :; do
+			addr=$(jget "@.outputs[$i].address")
+			[ -z "$addr" ] && break
+			i=$((i + 1))
+		done
+		while uci -q delete "$CONFIG.@destination[0]" >/dev/null 2>&1; do :; done
+		j=0
+		while [ "$j" -lt "$i" ]; do
+			addr=$(jget "@.outputs[$j].address")
+			iface=$(jget "@.outputs[$j].interface")
+			weight=$(jget "@.outputs[$j].weight")
+			url_ok "$addr" "outputs[$j].address" || return 1
+			sec=$(uci add "$CONFIG" destination)
+			uci set "$CONFIG.$sec.address=$addr"
+			[ -n "$iface" ] && uci set "$CONFIG.$sec.interface=$iface"
+			[ -n "$weight" ] && uci set "$CONFIG.$sec.weight=$weight"
+			j=$((j + 1))
+		done
+	fi
+
+	uci commit "$CONFIG" || { err commit_failed "uci commit failed"; return 1; }
+	printf '{"ok":true,"saved":true,"reloaded":false}\n'
+}
+
+method_reload() {
+	if [ -x "$RELOAD_CMD" ]; then
+		"$RELOAD_CMD" reload >/dev/null 2>&1
+		printf '{"ok":true,"reloaded":true}\n'
+	else
+		err reload_failed "$RELOAD_CMD not found"
+	fi
+}
+
+# ======================================================================
+
+case "$1" in
+	list)
+		# rpcd requires this to enumerate the object's methods.
+		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "set_config": {}, "reconcile": {}, "reload": {} }'
+		;;
+	call)
+		REQ_BODY=$(cat)
+		if [ "$2" = "claim" ]; then
+			# No token: claiming is what establishes one.
+			method_claim
+		elif require_token; then
+			REQ_BODY=$(strip_meta)
+			case "$2" in
+				status)     method_status ;;
+				get_config) method_get_config ;;
+				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery telemetry target buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address interface weight" ;;
+				reconcile)  require_managed && apply_config "listen_url outputs address interface weight" ;;
+				reload)     method_reload ;;
+				release)    method_release ;;
+				*)          echo '{}' ;;
+			esac
+		fi
+		;;
+	*)
+		echo '{}'
+		;;
+esac
+
+# An error response is still a successful invocation: the caller reads the JSON.
+# Without this, a refused call (unclaimed / bad_token / unmanaged) would exit
+# non-zero and rpcd would report the call itself as failed.
+exit 0
