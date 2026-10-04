@@ -12,6 +12,9 @@
 			}
 		},
 		"write": {
+			"ubus": {
+				"rist2rist": [ "set_config", "reconcile", "reload" ]
+			},
 			"uci": [ "rist2rist" ]
 		}
 	}

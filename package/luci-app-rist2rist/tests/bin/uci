@@ -1,0 +1,38 @@
+#!/bin/sh
+# Test double for uci: records the commands the plugin issues so the selftest can
+# assert them, and emulates the two behaviours the plugin depends on -- `add`
+# returns a fresh section name, and the `-q delete` loop terminates.
+LOG=${UCI_STUB_LOG:-/dev/null}
+
+if [ "$1" = "-q" ]; then
+	shift
+fi
+
+cmd=$1
+shift
+
+case "$cmd" in
+	add)
+		n=$(cat "$LOG.add" 2>/dev/null || echo 0)
+		n=$((n + 1))
+		echo "$n" > "$LOG.add"
+		echo "add rist2rist destination" >> "$LOG"
+		echo "cfg$n"
+		;;
+	set)
+		echo "set $*" >> "$LOG"
+		;;
+	delete)
+		d=$(cat "$LOG.del" 2>/dev/null || echo 0)
+		if [ "$d" -ge 1 ]; then
+			# nothing left to delete -> stop the caller's while-loop
+			exit 1
+		fi
+		echo $((d + 1)) > "$LOG.del"
+		echo "delete $*" >> "$LOG"
+		;;
+	commit)
+		echo "commit $*" >> "$LOG"
+		;;
+esac
+exit 0

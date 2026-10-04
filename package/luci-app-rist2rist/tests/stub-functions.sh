@@ -4,6 +4,9 @@
 #
 # dash/zsh local variables are dynamically scoped, so `eval "$1=..."` here
 # assigns the caller's own local -- exactly how the real config_get behaves.
+#
+# STUB_MAIN_MANAGED selects the managed flag so the write path can be exercised in
+# both states without editing this file.
 
 config_load() { :; }
 
@@ -27,6 +30,7 @@ config_foreach() {
 
 # --- main ---
 STUB_main_enabled=1
+STUB_main_managed="${STUB_MAIN_MANAGED:-0}"
 STUB_main_listen_url="rist://0.0.0.0:5000"
 STUB_main_profile="advanced"
 STUB_main_out_profile="advanced"

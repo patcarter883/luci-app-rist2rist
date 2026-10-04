@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test double for the service reload entry point.
+echo "reload $*" >> "${RELOAD_STUB_LOG:-/dev/null}"
+exit 0
