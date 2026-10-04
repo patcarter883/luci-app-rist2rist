@@ -1,0 +1,121 @@
+#!/bin/sh
+##########################################################################
+# rpcd exec plugin -- read-only view of the rist2rist bridge.
+#
+# Methods (reached over ubus; LuCI is one client, the encoder app is another):
+#   rist2rist.status      running state, pid and the REAL effective argv
+#   rist2rist.get_config  the UCI configuration as structured JSON
+#
+# This is milestone M-B1: READ-ONLY. Writable config (set_config / reload /
+# reconcile) and the mDNS advertisement are later milestones; nothing here
+# changes bridge state.
+#
+# Access is governed by /usr/share/rpcd/acl.d/luci-app-rist2rist.json. The
+# encoder reaches this as JSON-RPC over HTTP at the router's /ubus endpoint,
+# with an rpcd session whose login holds that ACL (see /etc/config/rpcd).
+##########################################################################
+
+# Test hook: lets the package's own test harness stub /lib/functions.sh.
+FUNCTIONS_SH=${FUNCTIONS_SH:-/lib/functions.sh}
+. "$FUNCTIONS_SH"
+
+CONFIG=rist2rist
+
+# Minimal JSON string escaping for values (URLs/paths) that can contain quotes.
+json_str() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# config_foreach callback: one JSON object per configured output destination.
+emit_output() {
+	local cfg="$1" address interface weight
+	config_get address   "$cfg" address
+	config_get interface "$cfg" interface
+	config_get weight    "$cfg" weight
+	[ -z "$address" ] && return 0
+	printf '{"section":"%s","address":"%s","interface":"%s","weight":"%s"},' \
+		"$(json_str "$cfg")" "$(json_str "$address")" \
+		"$(json_str "$interface")" "$(json_str "$weight")"
+}
+
+method_get_config() {
+	local listen_url profile out_profile
+	local enabled verbose_log loglevel
+	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
+	local telemetry_enabled telemetry_target outputs
+
+	config_load "$CONFIG"
+
+	config_get_bool enabled           main enabled 0
+	config_get      listen_url        main listen_url
+	config_get      profile           main profile
+	config_get      out_profile       main out_profile
+	config_get_bool verbose_log       main verbose_log 0
+	config_get      loglevel          main loglevel
+	config_get      buffer_min        main buffer_min
+	config_get      buffer_max        main buffer_max
+	config_get      rtt_min           main rtt_min
+	config_get      rtt_max           main rtt_max
+	config_get      reorder_buffer    main reorder_buffer
+	config_get_bool telemetry_enabled main telemetry_enabled 0
+	config_get      telemetry_target  main telemetry_target
+
+	outputs=$(config_foreach emit_output destination)
+
+	printf '{'
+	printf '"enabled":%s,' "$([ "$enabled" = "1" ] && echo true || echo false)"
+	printf '"listen_url":"%s",' "$(json_str "$listen_url")"
+	printf '"profile":"%s",' "$(json_str "$profile")"
+	printf '"out_profile":"%s",' "$(json_str "$out_profile")"
+	printf '"verbose_log":%s,' "$([ "$verbose_log" = "1" ] && echo true || echo false)"
+	printf '"loglevel":"%s",' "$(json_str "$loglevel")"
+	printf '"recovery":{"buffer_min":"%s","buffer_max":"%s","rtt_min":"%s","rtt_max":"%s","reorder_buffer":"%s"},' \
+		"$(json_str "$buffer_min")" "$(json_str "$buffer_max")" \
+		"$(json_str "$rtt_min")" "$(json_str "$rtt_max")" "$(json_str "$reorder_buffer")"
+	printf '"telemetry":{"enabled":%s,"target":"%s"},' \
+		"$([ "$telemetry_enabled" = "1" ] && echo true || echo false)" \
+		"$(json_str "$telemetry_target")"
+	printf '"outputs":[%s]' "${outputs%,}"
+	printf '}'
+	printf '\n'
+}
+
+method_status() {
+	local svc="" pid="" running=false argv=""
+
+	# procd owns the process; ask it. jsonfilter is part of the base image.
+	if command -v ubus >/dev/null 2>&1; then
+		svc=$(ubus call service list '{"name":"rist2rist"}' 2>/dev/null)
+	fi
+
+	if [ -n "$svc" ] && command -v jsonfilter >/dev/null 2>&1; then
+		pid=$(printf '%s' "$svc" | jsonfilter -e '@.rist2rist.instances.*.pid' 2>/dev/null | head -n 1)
+	fi
+
+	# The real effective argv comes from the kernel, not from a second copy of the
+	# init script's URL assembly: one definition, and it cannot drift.
+	if [ -n "$pid" ]; then
+		running=true
+		[ -r "/proc/$pid/cmdline" ] && argv=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+	fi
+
+	printf '{"running":%s,"pid":"%s","argv":"%s"}\n' \
+		"$running" "$(json_str "$pid")" "$(json_str "$argv")"
+}
+
+case "$1" in
+	list)
+		# rpcd requires this to enumerate the object's methods.
+		echo '{ "status": {}, "get_config": {} }'
+		;;
+	call)
+		case "$2" in
+			status)     method_status ;;
+			get_config) method_get_config ;;
+			*)          echo '{}' ;;
+		esac
+		;;
+	*)
+		echo '{}'
+		;;
+esac

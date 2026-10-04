@@ -1,0 +1,21 @@
+[binaries]
+c       = 'emcc'
+cpp     = 'em++'
+ar      = 'emar'
+ranlib  = 'emranlib'
+strip   = '/usr/bin/true'
+pkgconfig = '/usr/bin/false'
+
+[built-in options]
+c_args      = ['-pthread']
+c_link_args = ['-pthread']
+
+[properties]
+needs_exe_wrapper = true
+sys_root = ''
+
+[host_machine]
+system     = 'emscripten'
+cpu_family = 'wasm32'
+cpu        = 'wasm32'
+endian     = 'little'

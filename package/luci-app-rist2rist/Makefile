@@ -28,10 +28,15 @@ define Package/luci-app-rist2rist
   DEPENDS:=+libopenssl +cJSON +luci-base
 endef
 
-# Step 1: Copy your local development src folder straight into the compilation workspace
+# Step 1: materialise the source. ./src is PRISTINE upstream librist (pinned at the commit
+# named in patches/README) and every open-broadcast change lives in ./patches, so the
+# customisation is reviewable here in the app repo and survives a clean clone.
+# (Previously the edits were made in-place in ./src, which was also an embedded git repo —
+# so nothing was tracked by this repo and a clean checkout could not build at all.)
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/* $(PKG_BUILD_DIR)/
+	$(Build/Patch)
 endef
 
 # Build only tools/rist2rist; ninja's dep graph stops at librist.a + its objects,
@@ -65,6 +70,12 @@ define Package/luci-app-rist2rist/install
 
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-rist2rist.json $(1)/usr/share/rpcd/acl.d/
+
+	# rpcd exec plugin: the read-only bridge API (milestone M-B1) that the encoder
+	# calls as JSON-RPC over HTTP at /ubus. LuCI remains another client of the same
+	# methods, so there is one API rather than two.
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(INSTALL_BIN) ./root/usr/libexec/rpcd/rist2rist $(1)/usr/libexec/rpcd/rist2rist
 endef
 
 define Package/luci-app-rist2rist/postinst

@@ -3,7 +3,8 @@
 		"description": "Grant UCI, ubus, and file access for rist2rist",
 		"read": {
 			"ubus": {
-				"service": [ "list" ]
+				"service": [ "list" ],
+				"rist2rist": [ "status", "get_config" ]
 			},
 			"uci": [ "rist2rist" ],
 			"file": {

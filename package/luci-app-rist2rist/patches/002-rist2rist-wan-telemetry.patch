@@ -1,0 +1,440 @@
+diff --git a/tools/oob_shared.c b/tools/oob_shared.c
+index 62167b4..529be38 100644
+--- a/tools/oob_shared.c
++++ b/tools/oob_shared.c
+@@ -63,9 +63,9 @@ int oob_build_api_payload(uint16_t *buffer, char *sourceip, char *destip, char *
+ {
+ 	// We populate a valid IP header here but we do not really use it for any type of routing
+ 	// We also populate a message that has the same information already present in the IP header but write it in text format
+-	// This is only for demonstration purposes as we do not use the IP or the text message for anything on 
+-	// the receiving end or inside the library. However, this is a good method to create internal communication 
+-	// messages between peers. When designing your solution, just remember that in the OOB channel, there is no 
++	// This is only for demonstration purposes as we do not use the IP or the text message for anything on
++	// the receiving end or inside the library. However, this is a good method to create internal communication
++	// messages between peers. When designing your solution, just remember that in the OOB channel, there is no
+ 	// extra buffer delay and no packet recovery.
+ 	struct ipheader *ip = (struct ipheader *) buffer;
+ 	// unassigned protocol 252 used for API communication, api_id (54321 to identify this API message type)
+@@ -78,6 +78,22 @@ int oob_build_api_payload(uint16_t *buffer, char *sourceip, char *destip, char *
+ 	return total_len;
+ }
+ 
++int oob_build_api_payload_ident(uint16_t *buffer, char *sourceip, char *destip, const void *payload, int payload_len, uint16_t ident)
++{
++	struct ipheader *ip = (struct ipheader *) buffer;
++	populate_ip_header(ip, sourceip, destip, ident, RIST_OOB_API_IP_PROTOCOL);
++	// Payload follows the IP header at byte offset sizeof(struct ipheader);
++	// the existing oob_build_api_payload above uses (uint16_t *) arithmetic
++	// which doubles the offset — preserved there for backward compatibility,
++	// fixed here so a matching oob_process_api_message reader (which advances
++	// by header_size in bytes) sees the payload where it expects it.
++	memcpy((uint8_t *)buffer + sizeof(struct ipheader), payload, payload_len);
++	int total_len = sizeof(struct ipheader) + payload_len;
++	ip->iph_len = htons(total_len);
++	ip->iph_chksum = csum(buffer, (total_len + 1) / 2);
++	return total_len;
++}
++
+ char *oob_process_api_message(int buffer_len, char *buffer, int *message_len)
+ {
+ 	struct ipheader *ip = (struct ipheader *) buffer;
+diff --git a/tools/oob_shared.h b/tools/oob_shared.h
+index ed66f45..3a7751d 100644
+--- a/tools/oob_shared.h
++++ b/tools/oob_shared.h
+@@ -11,6 +11,7 @@
+ 
+ #define RIST_OOB_API_IP_PROTOCOL 252
+ #define RIST_OOB_API_IP_IDENT_AUTH 54321
++#define RIST_OOB_API_IP_IDENT_TELEMETRY 54322
+ #define RIST_OOB_ERROR_INVALID_LENGTH -1
+ #define RIST_OOB_ERROR_INVALID_PROTO -2
+ #define RIST_OOB_ERROR_INVALID_IDENT -3
+@@ -39,4 +40,5 @@ RIST_PACKED_STRUCT(udpheader, {
+ 
+ void populate_ipv4_rist_header(unsigned short int address_family, unsigned char *recv_buf, ssize_t recv_bufsize, struct sockaddr * addr, socklen_t addrlen);
+ int oob_build_api_payload(uint16_t *buffer, char *sourceip, char *destip, char *message, int message_len);
++int oob_build_api_payload_ident(uint16_t *buffer, char *sourceip, char *destip, const void *payload, int payload_len, uint16_t ident);
+ char *oob_process_api_message(int buffer_len, char *buffer, int *message_len);
+diff --git a/tools/rist2rist.c b/tools/rist2rist.c
+index 011f992..16b0983 100644
+--- a/tools/rist2rist.c
++++ b/tools/rist2rist.c
+@@ -30,9 +30,59 @@
+ #endif
+ #include "oob_shared.h"
+ #include "string-shim.h"
++#ifdef _WIN32
++#include <ws2tcpip.h>
++#else
++#include <arpa/inet.h>
++#endif
+ 
+ #define RIST2RIST_VERSION "31"
+ 
++#define RTT_HYSTERESIS_MS 15
++#define MAX_SENDER_PEERS  8
++
++struct __attribute__((__packed__)) wan_telemetry_t {
++	uint8_t  link_quality;     // 0..100
++	uint32_t worst_case_rtt;   // ms, network byte order
++};
++
++struct sender_peer_stat {
++	uint32_t peer_id;
++	int      in_use;
++	double   quality;
++	uint32_t rtt;
++	size_t   bandwidth;
++};
++
++/* These globals are written from librist's protocol threads: the sender-peer
++ * stats callback runs on the sender thread and the receiver-flow callback on
++ * the receiver thread (librist starts one protocol thread per context — see
++ * rist_thread_create(sender_thread) / (receiver_thread) in librist's rist.c),
++ * while the auth callbacks run on the receiver thread. They DO race, so every
++ * access is under g_telemetry_lock. (The earlier "no locking needed" comment
++ * was wrong: it assumed a single worker thread.) */
++static struct sender_peer_stat g_sender_peers[MAX_SENDER_PEERS];
++static uint8_t  g_last_link_quality = 0xFFu;       /* sentinel: forces first emit */
++static uint32_t g_last_rtt          = 0xFFFFFFFFu; /* sentinel: forces first emit */
++static struct rist_ctx  *g_lan_receiver_ctx  = NULL;
++static struct rist_peer *g_lan_receiver_peer = NULL;
++/* Quality of the encoder->rist2rist (input) leg, from RIST_STATS_RECEIVER_FLOW.
++ * The sender-peer quality only covers the rist2rist->downstream legs, so loss on
++ * the input leg is invisible there; we report the worst of the two. */
++static double   g_lan_recv_quality  = 100.0;
++
++#ifdef _WIN32
++#  include <windows.h>
++static SRWLOCK g_telemetry_lock = SRWLOCK_INIT;
++#  define TELEMETRY_LOCK()   AcquireSRWLockExclusive(&g_telemetry_lock)
++#  define TELEMETRY_UNLOCK() ReleaseSRWLockExclusive(&g_telemetry_lock)
++#else
++#  include <pthread.h>
++static pthread_mutex_t g_telemetry_lock = PTHREAD_MUTEX_INITIALIZER;
++#  define TELEMETRY_LOCK()   pthread_mutex_lock(&g_telemetry_lock)
++#  define TELEMETRY_UNLOCK() pthread_mutex_unlock(&g_telemetry_lock)
++#endif
++
+ struct rist_sender_args {
+ 	char* cname;
+ 	char* shared_secret;
+@@ -43,6 +93,7 @@ struct rist_sender_args {
+ 	uint32_t flow_id;
+ 	int statsinterval;
+ 	int npd_enabled;
++	enum rist_profile profile;
+ };
+ 
+ struct rist_cb_arg {
+@@ -74,6 +125,7 @@ static struct option long_options[] = {
+ { "verbose-level",   required_argument, NULL, 'v' },
+ { "remote-logging",  required_argument, NULL, 'r' },
+ { "profile",         required_argument, NULL, 'p' },
++{ "out-profile",     required_argument, NULL, 'P' },
+ { "npd",             no_argument,       NULL, 'n' },
+ #if HAVE_SRP_SUPPORT
+ { "srpfile",         required_argument, NULL, 'F' },
+@@ -101,6 +153,7 @@ const char help_str[] = "Where OPTIONS are:\n"
+ "       -v | --verbose-level value                | To disable logging: -1, log levels match syslog levels   |\n"
+ "       -r | --remote-logging IP:PORT             | Send logs and stats to this IP:PORT using udp messages   |\n"
+ "       -p | --profile number                     | Rist receive profile (0 = simple, 1 = main, 2 = advanced)|\n"
++"       -P | --out-profile number                 | Rist output profile  (0 = simple, 1 = main, 2 = advanced)|\n"
+ "       -n | --npd                                | Enable Null Packet Deletion on output                    |\n"
+ #if HAVE_SRP_SUPPORT
+ "       -F | --srpfile filepath                   | When in listening mode, use this file to hold the list   |\n"
+@@ -152,14 +205,22 @@ static int cb_auth_connect(void *arg, const char* connecting_ip, uint16_t connec
+ 	oob_block.payload = buffer;
+ 	oob_block.payload_len = ret;
+ 	rist_oob_write(receiver_ctx, &oob_block);
++	/* Track the LAN-side peer so we can write WAN telemetry back over its OOB channel. */
++	TELEMETRY_LOCK();
++	if (arg == g_lan_receiver_ctx) {
++		g_lan_receiver_peer = peer;
++	}
++	TELEMETRY_UNLOCK();
+ 	return 0;
+ }
+ 
+ static int cb_auth_disconnect(void *arg, struct rist_peer *peer)
+ {
+-	(void)peer;
+-	struct rist_ctx *ctx = (struct rist_ctx *)arg;
+-	(void)ctx;
++	TELEMETRY_LOCK();
++	if (arg == g_lan_receiver_ctx && peer == g_lan_receiver_peer) {
++		g_lan_receiver_peer = NULL;
++	}
++	TELEMETRY_UNLOCK();
+ 	return 0;
+ }
+ 
+@@ -175,8 +236,119 @@ static int cb_recv_oob(void *arg, const struct rist_oob_block *oob_block)
+ 	return 0;
+ }
+ 
++/* Caller must hold g_telemetry_lock. */
++static void telemetry_emit_locked(void)
++{
++	if (!g_lan_receiver_ctx || !g_lan_receiver_peer) {
++		return;
++	}
++
++	/* Aggregate quality across all known sender (downstream/WAN) peers. */
++	double   weighted_q_sum = 0.0;
++	double   q_sum          = 0.0;
++	size_t   total_bw       = 0;
++	uint32_t max_rtt        = 0;
++	int      n_peers        = 0;
++	for (int i = 0; i < MAX_SENDER_PEERS; i++) {
++		if (!g_sender_peers[i].in_use) continue;
++		n_peers++;
++		weighted_q_sum += g_sender_peers[i].quality * (double)g_sender_peers[i].bandwidth;
++		q_sum          += g_sender_peers[i].quality;
++		total_bw       += g_sender_peers[i].bandwidth;
++		if (g_sender_peers[i].rtt > max_rtt) {
++			max_rtt = g_sender_peers[i].rtt;
++		}
++	}
++
++	/* Output-leg quality (100 until a downstream peer reports in). */
++	double q_out = 100.0;
++	if (n_peers > 0) {
++		q_out = (total_bw > 0) ? (weighted_q_sum / (double)total_bw)
++		                       : (q_sum / (double)n_peers);
++	}
++
++	/* Report the worst of the input (encoder->rist2rist) and output legs, so
++	 * loss on EITHER leg pulls the encoder's WAN quality down. */
++	double q_final = (q_out < g_lan_recv_quality) ? q_out : g_lan_recv_quality;
++	if (q_final < 0.0)   q_final = 0.0;
++	if (q_final > 100.0) q_final = 100.0;
++	uint8_t  link_quality = (uint8_t)(q_final + 0.5);
++	uint32_t rtt          = max_rtt;
++
++	int quality_changed = (link_quality != g_last_link_quality);
++	int rtt_changed     = (abs((int)rtt - (int)g_last_rtt) > RTT_HYSTERESIS_MS);
++	if (!quality_changed && !rtt_changed) {
++		return;
++	}
++
++	struct wan_telemetry_t telemetry;
++	telemetry.link_quality   = link_quality;
++	telemetry.worst_case_rtt = htonl(rtt);
++
++	/* The encoder expects the RAW 5-byte wan_telemetry struct on the wire — it
++	 * rejects any OOB payload whose size != sizeof(wan_telemetry) (see
++	 * open-broadcast-encoder source/lib/lib.h / source/main.cpp rist_oob_cb).
++	 * Do NOT wrap it in the IP/API envelope used for auth messages. */
++	struct rist_oob_block oob_block = {
++		.peer        = g_lan_receiver_peer,
++		.payload     = &telemetry,
++		.payload_len = sizeof(telemetry),
++		.ts_ntp      = 0,
++	};
++	rist_oob_write(g_lan_receiver_ctx, &oob_block);
++
++	g_last_link_quality = link_quality;
++	g_last_rtt          = rtt;
++
++	rist_log(&logging_settings, RIST_LOG_DEBUG,
++		"telemetry: q=%u (out=%.1f in=%.1f) rtt=%u ms peers=%d\n",
++		link_quality, q_out, g_lan_recv_quality, rtt, n_peers);
++}
++
++static void telemetry_emit(void)
++{
++	TELEMETRY_LOCK();
++	telemetry_emit_locked();
++	TELEMETRY_UNLOCK();
++}
++
++static void wan_telemetry_update(const struct rist_stats_sender_peer *sp)
++{
++	TELEMETRY_LOCK();
++	/* Find or insert this peer in the per-peer cache. */
++	int slot = -1;
++	int first_free = -1;
++	for (int i = 0; i < MAX_SENDER_PEERS; i++) {
++		if (g_sender_peers[i].in_use && g_sender_peers[i].peer_id == sp->peer_id) {
++			slot = i;
++			break;
++		}
++		if (!g_sender_peers[i].in_use && first_free < 0) {
++			first_free = i;
++		}
++	}
++	if (slot < 0) {
++		if (first_free < 0) {
++			TELEMETRY_UNLOCK();
++			return; /* table full — drop silently */
++		}
++		slot = first_free;
++		g_sender_peers[slot].in_use = 1;
++		g_sender_peers[slot].peer_id = sp->peer_id;
++	}
++	g_sender_peers[slot].quality   = sp->quality;
++	g_sender_peers[slot].rtt       = sp->rtt;
++	g_sender_peers[slot].bandwidth = sp->bandwidth;
++
++	telemetry_emit_locked();
++	TELEMETRY_UNLOCK();
++}
++
+ static int cb_stats(void *arg, const struct rist_stats *stats_container) {
+-	rist_log(&logging_settings, RIST_LOG_INFO, "%s\n\n", stats_container->stats_json);
++	/* DEBUG, not INFO: this fires at the stats interval for every peer on both
++	 * contexts, and at INFO it wrote a continuous JSON stream into the router's
++	 * syslog ring (flash wear) on a device whose whole job is a quiet hop. */
++	rist_log(&logging_settings, RIST_LOG_DEBUG, "%s\n\n", stats_container->stats_json);
+ #if HAVE_PROMETHEUS_SUPPORT
+ 	if (prom_stats_ctx) {
+ 		rist_prometheus_parse_stats(prom_stats_ctx, stats_container, (uintptr_t)arg);
+@@ -184,6 +356,19 @@ static int cb_stats(void *arg, const struct rist_stats *stats_container) {
+ #else
+ 	(void)arg;
+ #endif
++	if (stats_container->stats_type == RIST_STATS_SENDER_PEER) {
++		wan_telemetry_update(&stats_container->stats.sender_peer);
++	} else if (stats_container->stats_type == RIST_STATS_RECEIVER_FLOW) {
++		/* Quality of the encoder->rist2rist (input) leg. Captures loss the
++		 * downstream sender-peer stats can't see; folded into the telemetry. */
++		double q = stats_container->stats.receiver_flow.quality;
++		if (q < 0.0)   q = 0.0;
++		if (q > 100.0) q = 100.0;
++		TELEMETRY_LOCK();
++		g_lan_recv_quality = q;
++		telemetry_emit_locked();
++		TELEMETRY_UNLOCK();
++	}
+ 	rist_stats_free(stats_container);
+ 	return 0;
+ }
+@@ -193,7 +378,7 @@ static struct rist_ctx* setup_rist_sender(struct rist_sender_args *setup) {
+ 	printf("CName: %s\n", setup->cname);
+ 	printf("Outurl: %s\n", setup->outputurl);
+ 	int rist;
+-	if (rist_sender_create(&ctx, RIST_PROFILE_MAIN, setup->flow_id, &logging_settings) != 0) {
++	if (rist_sender_create(&ctx, setup->profile, setup->flow_id, &logging_settings) != 0) {
+ 		rist_log(&logging_settings, RIST_LOG_ERROR, "Could not create rist sender context\n");
+ 		exit(1);
+ 	}
+@@ -308,9 +493,14 @@ static int cb_recv(void *arg, struct rist_data_block *b)
+ 	struct rist_cb_arg *cb_arg = (struct rist_cb_arg *) arg;
+ 	struct rist_data_block *block = (struct rist_data_block*)b;
+ 	if (cb_arg->client_args->flow_id != b->flow_id) {
+-		printf("Flow ID %ud\n",b->flow_id);
++		rist_log(&logging_settings, RIST_LOG_DEBUG, "Flow ID %u\n", b->flow_id);
+ 		cb_arg->client_args->flow_id = b->flow_id;
+-		assert(cb_arg->sender_ctx != NULL);
++		/* No assert on the packet path: a SIGABRT here would crash-loop under
++		 * procd respawn. With no sender there is simply nothing to write to. */
++		if (cb_arg->sender_ctx == NULL) {
++			rist_receiver_data_block_free2(&b);
++			return -1;
++		}
+ 		rist_sender_flow_id_set(cb_arg->sender_ctx, b->flow_id);
+ 	}
+ 	b->virt_src_port = cb_arg->src_port;
+@@ -345,6 +535,9 @@ int main (int argc, char **argv) {
+ 	char *remote_log_address = NULL;
+ 	int exitcode = 0;
+ 	enum rist_profile profile = RIST_PROFILE_SIMPLE;
++	// Output (downstream) profile, independent of the input receive profile.
++	// Default to advanced so it matches an advanced-profile downstream receiver.
++	enum rist_profile out_profile = RIST_PROFILE_ADVANCED;
+ #ifdef _WIN32
+ #define STDERR_FILENO 2
+ 	signal(SIGINT, intHandler);
+@@ -355,6 +548,10 @@ int main (int argc, char **argv) {
+ 	act.sa_handler = intHandler;
+ 	act.sa_flags = 0;
+ 	sigaction(SIGINT, &act, NULL);
++	/* procd stops and restarts services with SIGTERM. Without this the master
++	 * loop never sees keep_running=0 and the out: cleanup (rist_destroy and the
++	 * frees) never runs on a normal stop — the daemon is killed mid-flight. */
++	sigaction(SIGTERM, &act, NULL);
+ #endif
+ 
+ 	// Default log settings
+@@ -373,9 +570,9 @@ int main (int argc, char **argv) {
+ 	 * return codes (see long_options). */
+ 	const char *short_opts =
+ #if HAVE_SRP_SUPPORT
+-		"r:i:o:s:e:N:v:S:p:F:nMhu";
++		"r:i:o:s:e:N:v:S:p:P:F:nMhu";
+ #else
+-		"r:i:o:s:e:N:v:S:p:nMhu";
++		"r:i:o:s:e:N:v:S:p:P:nMhu";
+ #endif
+ 	while ((c = getopt_long(argc, argv, short_opts, long_options, &option_index)) != -1) {
+ 		switch (c) {
+@@ -405,6 +602,9 @@ int main (int argc, char **argv) {
+ 		case 'p':
+ 			profile = atoi(optarg);
+ 			break;
++		case 'P':
++			out_profile = atoi(optarg);
++			break;
+ 		case 'n':
+ 			client_args.npd_enabled = 1;
+ 			break;
+@@ -513,12 +713,25 @@ usage:
+ 		goto out;
+ 	}
+ 
++	/* Publish receiver ctx for the WAN-telemetry path before auth can fire. */
++	g_lan_receiver_ctx = receiver_ctx;
++	memset(g_sender_peers, 0, sizeof(g_sender_peers));
++
+ 	if (rist_auth_handler_set(receiver_ctx, cb_auth_connect, cb_auth_disconnect, receiver_ctx) == -1) {
+ 		rist_log(&logging_settings, RIST_LOG_ERROR, "Could not init rist auth handler\n");
+ 		exitcode = 1;
+ 		goto out;
+ 	}
+ 
++	/* Enable OOB on the receiver (encoder-facing) context. Without this,
++	 * rist_oob_write() back to the encoder — the auth ack in cb_auth_connect and
++	 * the WAN telemetry in wan_telemetry_update — fails with "OOB not enabled". */
++	if (rist_oob_callback_set(receiver_ctx, cb_recv_oob, receiver_ctx) == -1) {
++		rist_log(&logging_settings, RIST_LOG_ERROR, "Could not enable out-of-band data on receiver\n");
++		exitcode = 1;
++		goto out;
++	}
++
+ 	struct rist_peer_config app_peer_config = {
+ 		.version = RIST_PEER_CONFIG_VERSION,
+ 		.virt_dst_port = RIST_DEFAULT_VIRT_DST_PORT,
+@@ -587,6 +800,7 @@ usage:
+ 			goto out;
+ 		}
+ 	}
++	client_args.profile = out_profile;
+ 	cb_arg.sender_ctx = setup_rist_sender(&client_args);
+ 	if (rist_start(receiver_ctx)) {
+ 		rist_log(&logging_settings, RIST_LOG_ERROR, "Could not start rist receiver\n");
+@@ -603,11 +817,21 @@ usage:
+ 	}
+ 	else {
+ 		// Master loop
++		/* rist_receiver_data_read2 returns >0 with a block, 0 on timeout, <0 on
++		 * error. Without the <0 branch a socket error made it return
++		 * immediately and spin a router at 100% CPU. */
+ 		while (keep_running)
+ 		{
+-			struct rist_data_block *b;
++			struct rist_data_block *b = NULL;
+ 			int ret = rist_receiver_data_read2(receiver_ctx, &b, 5);
+-			if (ret && b && b->payload) cb_recv(&cb_arg, b);
++			if (ret < 0) {
++				rist_log(&logging_settings, RIST_LOG_ERROR,
++					"rist_receiver_data_read2 failed (%d); backing off\n", ret);
++				struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
++				nanosleep(&ts, NULL);
++				continue;
++			}
++			if (ret > 0 && b && b->payload) cb_recv(&cb_arg, b);
+ 		}
+ 	}
+ 
