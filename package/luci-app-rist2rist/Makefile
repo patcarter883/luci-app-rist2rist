@@ -2,8 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-rist2rist
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=3
-
+PKG_RELEASE:=5
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 include $(INCLUDE_DIR)/package.mk
@@ -71,6 +70,12 @@ define Package/luci-app-rist2rist/install
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-rist2rist.json $(1)/usr/share/rpcd/acl.d/
 
+
+	# ifup hook: a WAN leg skipped while its modem was absent is rebuilt when
+	# the interface appears, so an unplugged modem is a non-event rather than
+	# something an operator has to notice and fix by hand.
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
+	$(INSTALL_BIN) ./files/99-rist2rist $(1)/etc/hotplug.d/iface/99-rist2rist
 	# rpcd exec plugin: the read-only bridge API (milestone M-B1) that the encoder
 	# calls as JSON-RPC over HTTP at /ubus. LuCI remains another client of the same
 	# methods, so there is one API rather than two.

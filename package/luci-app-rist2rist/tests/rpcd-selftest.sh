@@ -185,8 +185,13 @@ check "get_config: listen_url carried" "$out" "d['listen_url'] == 'rist://0.0.0.
 check "get_config: recovery block present" "$out" "d['recovery']['reorder_buffer'] == '20'"
 check "get_config: telemetry target carried" "$out" "d['telemetry']['target'] == '192.0.2.10:9999'"
 check "get_config: both destinations emitted" "$out" "len(d['outputs']) == 2"
-check "get_config: destination fields correct" "$out" \
-	"d['outputs'][1]['address'] == '198.51.100.7:5000' and d['outputs'][1]['weight'] == '2'"
+check "get_config: a destination is ADDRESS ONLY" "$out" \
+	"d['outputs'][1]['address'] == '198.51.100.7:5000' and 'interface' not in d['outputs'][1] and 'weight' not in d['outputs'][1]"
+check "get_config: uplinks reported" "$out" "len(d['uplinks']) == 2"
+check "get_config: uplink interface + weight carried" "$out" \
+	"d['uplinks'][0]['interface'] == 'lo' and d['uplinks'][1]['weight'] == '3'"
+check "get_config: uplink presence is reported" "$out" \
+	"d['uplinks'][0]['present'] is True and d['uplinks'][1]['present'] is False"
 
 # status needs no ubus/jsonfilter off-device, so it must still emit valid JSON.
 out=$(run 1 status "$(tb '{}')")
@@ -222,13 +227,29 @@ check "reconcile succeeds with a token" "$out" "d['ok'] is True"
 check_log "reconcile sets listen_url" "$tmp/uci" "set rist2rist.main.listen_url=rist://0.0.0.0:6000"
 
 rm -f "$tmp"/uci*
-out=$(run 1 reconcile "$(tb '{"outputs":[{"address":"203.0.113.9:5000","interface":"wan","weight":"1"}]}')")
-check "reconcile with outputs succeeds" "$out" "d['ok'] is True"
+out=$(run 1 reconcile "$(tb '{"outputs":[{"address":"203.0.113.9:5000"}]}')")
+check "reconcile with an address-only output succeeds" "$out" "d['ok'] is True"
 check_log "reconcile adds a destination section" "$tmp/uci" "add rist2rist destination"
 check_log "reconcile sets the output address" "$tmp/uci" "set rist2rist.cfg1.address=203.0.113.9:5000"
 check_log "reconcile commits" "$tmp/uci" "commit rist2rist"
 # The token must never land in a config field.
 check_no_log "the token is stripped before the applier" "$tmp/uci" "$TOKEN"
+
+# The uplink list is LOCAL configuration. A caller naming an interface, or a
+# weight, must be REJECTED rather than silently ignored -- otherwise an encoder
+# could believe it had pinned a leg the bridge dropped.
+rm -f "$tmp"/uci*
+out=$(run 1 reconcile "$(tb '{"outputs":[{"address":"203.0.113.9:5000","interface":"wwan0"}]}')")
+check "reconcile rejects an interface on a destination" "$out" \
+	"d['ok'] is False and d['error'] == 'unknown_field'"
+
+out=$(run 1 reconcile "$(tb '{"listen_url":"rist://0.0.0.0:6000","weight":"5"}')")
+check "reconcile rejects a weight" "$out" \
+	"d['ok'] is False and d['error'] == 'unknown_field'"
+
+out=$(run 1 set_config "$(tb '{"outputs":[{"address":"203.0.113.9:5000","weight":"5"}]}')")
+check "set_config rejects a weight on a destination" "$out" \
+	"d['ok'] is False and d['error'] == 'unknown_field'"
 
 # rpcd PREPENDS `ubus_rpc_session` to every exec call's arguments. Left in the
 # body, the field whitelist rejects EVERY write with `unknown_field` -- and no

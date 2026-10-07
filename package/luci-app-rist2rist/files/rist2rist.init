@@ -3,11 +3,27 @@
 START=99
 USE_PROCD=1
 
+# The fanned-out output URLs, and the recovery query string for the OUTPUT (WAN)
+# leg. Both are file-level because config_foreach runs its callback in THIS shell,
+# not a subshell: the callback writes state start_service reads back afterwards.
+# (Not about "dynamic scope" -- config_foreach does not fork.)
 OUTPUT_URLS=""
-# Recovery query string for the OUTPUT (WAN) leg. Built in start_service and
-# consumed by append_output_url. A file-level global (like OUTPUT_URLS) so it
-# survives the config_foreach callback boundary without relying on dynamic scope.
 OUTPUT_RECOVERY=""
+
+# WAN uplinks -- the local leg list every destination is fanned across.
+#
+# The encoder supplies only WHERE the stream goes (the cloud POP the backplane
+# allocated for the session). WHICH physical links carry it, and their relative
+# weights, are this router's business and are configured locally as `config
+# uplink` sections. So the encoder never needs this router's modem names, and
+# adding or reweighting a link is a local act.
+#
+# UPLINK_CONFIGURED counts the uplinks the config declares; UPLINK_LEGS holds only
+# those whose interface is actually PRESENT, one "interface weight" per line. The
+# two differ exactly when a modem is unplugged, which is what lets an all-legs
+# -absent bridge be a non-event instead of a crash loop.
+UPLINK_CONFIGURED=0
+UPLINK_LEGS=""
 
 # The umdns service file this bridge publishes itself under (DT-19 discovery).
 MDNS_SERVICE_FILE="/etc/umdns/rist2rist.json"
@@ -109,19 +125,68 @@ remove_mdns_service() {
     return 0
 }
 
-append_output_url() {
-    local cfg="$1"
-    local address interface weight url query
-    config_get address "$cfg" 'address'
+# with_query <url> <query> -- append a query string, respecting an existing '?'.
+with_query() {
+    case "$1" in
+        *\?*) printf '%s&%s' "$1" "$2" ;;
+        *)    printf '%s?%s' "$1" "$2" ;;
+    esac
+}
+
+# Append one assembled output URL to OUTPUT_URLS.
+append_url() {
+    OUTPUT_URLS="${OUTPUT_URLS:+${OUTPUT_URLS},}${1}"
+}
+
+# config_foreach callback: record one uplink whose interface is actually present.
+#
+# A leg whose interface is absent CANNOT work, and passing miface= anyway is
+# actively harmful: librist fails SO_BINDTODEVICE, then fails to resolve the peer
+# host, and rist2rist.c calls exit(1) on "Could not add peer connector to sender"
+# (tools/rist2rist.c:212). procd then restarts it forever -- a crash loop that
+# buries the log and burns CPU for as long as the modem stays unplugged, which is
+# the NORMAL state on a bench with no modems attached. So treat it as "this leg is
+# not ready yet", skip it, and let a later reload pick it up (see the hotplug hook
+# that ships alongside this file).
+#
+# Test via /sys/class/net, the same idiom bridge_uid() above already uses, so
+# there is no dependence on ip(8)/ifconfig being present in the image.
+collect_uplink() {
+    local cfg="$1" interface weight
     config_get interface "$cfg" 'interface'
     config_get weight "$cfg" 'weight'
 
+    [ -z "$interface" ] && return
+
+    UPLINK_CONFIGURED=$((UPLINK_CONFIGURED + 1))
+
+    if [ ! -e "/sys/class/net/${interface}" ]; then
+        logger -t rist2rist "uplink '${cfg}': interface ${interface} is not present, skipping this leg"
+        return
+    fi
+
+    UPLINK_LEGS="${UPLINK_LEGS}${interface} ${weight}
+"
+}
+
+# config_foreach callback: emit this destination once per PRESENT uplink, which is
+# what bonds it across every available WAN link.
+#
+# The destination carries only an ADDRESS -- the cloud POP the encoder selected for
+# the session. WHICH links carry it, and their relative weights, are local
+# configuration and deliberately not the encoder's business, so the encoder never
+# has to know this router's modem names.
+append_output_url() {
+    local cfg="$1"
+    local address base query q url interface weight
+    config_get address "$cfg" 'address'
+
     [ -z "$address" ] && return
 
-    # Prepend rist:// only if the user didn't supply a full URL
+    # Prepend rist:// only if the caller didn't supply a full URL
     case "$address" in
-        *://*) url="$address" ;;
-        *)     url="rist://${address}" ;;
+        *://*) base="$address" ;;
+        *)     base="rist://${address}" ;;
     esac
 
     # Assemble librist query params. timing-mode=0 (SOURCE) — the librist default;
@@ -134,20 +199,35 @@ append_output_url() {
     # encoder-facing (-i) leg and the downstream receiver — without it the output
     # sender ran on librist defaults (~1 s of retransmit history) while the
     # receiver waits up to buffer-max for resends, a silent recovery hole on
-    # exactly the lossy WAN leg. miface binds the WAN interface; weight is the
-    # load-balancing weight.
+    # exactly the lossy WAN leg.
     query="timing-mode=0"
     [ -n "$OUTPUT_RECOVERY" ] && query="${query}&${OUTPUT_RECOVERY}"
-    [ -n "$interface" ]       && query="${query}&miface=${interface}"
-    [ -n "$weight" ]          && query="${query}&weight=${weight}"
-    if [ -n "$query" ]; then
-        case "$url" in
-            *\?*) url="${url}&${query}" ;;
-            *)    url="${url}?${query}" ;;
-        esac
+
+    if [ "$UPLINK_CONFIGURED" -eq 0 ]; then
+        # No uplinks declared: this bridge is not bonding, so send over the default
+        # route. A single-WAN box needs no uplink list, and requiring one would be
+        # a second place to state the same thing.
+        logger -t rist2rist "destination '${cfg}': no uplinks configured, sending via the default route"
+        append_url "$(with_query "$base" "$query")"
+        return
     fi
 
-    OUTPUT_URLS="${OUTPUT_URLS:+${OUTPUT_URLS},}${url}"
+    if [ -z "$UPLINK_LEGS" ]; then
+        # Uplinks ARE declared but none is present -- every modem is unplugged.
+        # Emitting nothing is the correct answer: start_service then leaves the
+        # daemon stopped, which is a non-event rather than a crash loop.
+        logger -t rist2rist "destination '${cfg}': no uplink is present, nothing to send"
+        return
+    fi
+
+    while read -r interface weight; do
+        [ -n "$interface" ] || continue
+        q="${query}&miface=${interface}"
+        [ -n "$weight" ] && q="${q}&weight=${weight}"
+        append_url "$(with_query "$base" "$q")"
+    done <<UPLINK_LEGS_EOF
+$UPLINK_LEGS
+UPLINK_LEGS_EOF
 }
 
 start_service() {
@@ -206,6 +286,12 @@ start_service() {
     # (it adds timing-mode itself, so it is omitted here).
     OUTPUT_RECOVERY="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}"
 
+    # Resolve the local uplink list BEFORE the destinations: each destination is
+    # emitted once per PRESENT uplink, so the legs must be known first.
+    UPLINK_CONFIGURED=0
+    UPLINK_LEGS=""
+    config_foreach collect_uplink 'uplink'
+
     OUTPUT_URLS=""
     config_foreach append_output_url 'destination'
     [ -z "$OUTPUT_URLS" ] && return
@@ -233,7 +319,10 @@ start_service() {
     fi
     procd_set_param stdout 1
     procd_set_param stderr 1
-    procd_set_param respawn
+    # throttle(5) + threshold(3600): at most one restart every 5 s, and stop after
+    # an hour of continuous failure rather than thrashing forever. A leg that comes
+    # back later is picked up by the hotplug hook; a genuinely dead config stops.
+    procd_set_param respawn 3600 5 30
     procd_close_instance
 }
 

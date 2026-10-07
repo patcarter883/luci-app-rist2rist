@@ -187,14 +187,43 @@ return view.extend({
 		o.depends('telemetry_enabled', '1');
 
 		// -------------------------------------------------------------
-		// DYNAMIC MULTI-PATH REPLICAS ARRAY (WAN SENDERS)
+		// LOCAL WAN UPLINKS -- the bonding legs.
 		// -------------------------------------------------------------
-		s = m.section(form.GridSection, 'destination', _('WAN Replication Outputs (SMPTE ST 2022-7 Mode)'));
+		// Configured HERE, never supplied by a caller. The encoder names only the
+		// cloud POP a session goes to; this list decides which of this router's
+		// links carry it. Every destination is replicated once per uplink whose
+		// interface is present, so an unplugged modem drops just that leg.
+		s = m.section(form.GridSection, 'uplink', _('WAN Uplinks (Bonding Legs)'));
+		s.anonymous = true;
+		s.addremove = true;
+
+		o = s.option(form.Value, 'interface', _('Physical WAN Interface'),
+			_('The modem interface this leg binds to. Bypasses system-level Policy ' +
+			  'Based Routing (PBR); the stream is sent out of every uplink whose ' +
+			  'interface is present.'));
+		o.placeholder = 'wwan0';
+		o.datatype = 'string';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'weight', _('Path Weight'),
+			_('librist load-balancing weight for this leg. 0 = duplicate the full ' +
+			  'stream down this link (SMPTE 2022-7 redundancy); >0 = load-balance, ' +
+			  'splitting traffic across links in proportion to their weights.'));
+		o.placeholder = '0';
+		o.datatype = 'uinteger';
+		o.rmempty = true;
+
+		// -------------------------------------------------------------
+		// DESTINATIONS -- where the encoder sends the stream.
+		// -------------------------------------------------------------
+		s = m.section(form.GridSection, 'destination', _('Stream Destinations (cloud POP)'));
 		s.anonymous = true;
 		s.addremove = true;
 
 		o = s.option(form.Value, 'address', _('Remote Receiver Address'),
-			_('Enter a RIST URL (rist://host:port) or bare host:port. Hostnames and IPv4 addresses are both accepted.'));
+			_('The cloud POP the encoder selected for this session, as a RIST URL ' +
+			  '(rist://host:port) or bare host:port. The uplink list above decides ' +
+			  'which links carry it.'));
 		o.placeholder = 'rist://1.2.3.4:5678';
 		o.datatype = 'string';
 		o.rmempty = false;
@@ -207,19 +236,6 @@ return view.extend({
 			return _('Must be a RIST URL (rist://host:port) or host:port');
 		};
 
-		o = s.option(form.Value, 'interface', _('Bind to Physical WAN Interface'),
-			_('Forces this replica out of the designated physical cellular link, bypassing system-level Policy Based Routing (PBR).'));
-		o.placeholder = 'wwan0';
-		o.datatype = 'string';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'weight', _('Path Weight'),
-			_('librist load-balancing weight for this path. 0 = duplicate the full ' +
-			  'stream to this path (SMPTE 2022-7 redundancy); >0 = load-balance, ' +
-			  'splitting traffic across paths in proportion to their weights.'));
-		o.placeholder = '5';
-		o.datatype = 'uinteger';
-		o.rmempty = true;
 
 		return m.render().then(function(node) {
 			node.insertBefore(renderStatusSection(status, log), node.firstChild);

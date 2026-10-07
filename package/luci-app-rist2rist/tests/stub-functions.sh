@@ -23,12 +23,19 @@ config_get_bool() {
 # config_foreach <callback> <type>
 config_foreach() {
 	local cb="$1" type="$2"
-	[ "$type" = "destination" ] || return 0
-	# STUB_DESTINATIONS=0 models a VIRGIN bridge (no outputs configured), which is
-	# the only state in which a claim is accepted.
-	[ "${STUB_DESTINATIONS:-1}" = "0" ] && return 0
-	eval "$cb dst_au"
-	eval "$cb dst_eu"
+	case "$type" in
+		destination)
+			# STUB_DESTINATIONS=0 models a VIRGIN bridge (no outputs
+			# configured), the only state in which a claim is accepted.
+			[ "${STUB_DESTINATIONS:-1}" = "0" ] && return 0
+			eval "$cb dst_au"
+			eval "$cb dst_eu"
+			;;
+		uplink)
+			eval "$cb up_a"
+			eval "$cb up_b"
+			;;
+	esac
 }
 
 # --- main ---
@@ -49,9 +56,15 @@ STUB_main_reorder_buffer="20"
 STUB_main_telemetry_enabled=1
 STUB_main_telemetry_target="192.0.2.10:9999"
 
+# Destinations are ADDRESS ONLY -- the cloud POP for the session. The uplinks they
+# are bonded across live in the separate uplink sections below and are deliberately
+# NOT part of this object.
 STUB_dst_au_address="203.0.113.5:5000"
-STUB_dst_au_interface="wan"
-STUB_dst_au_weight="1"
 STUB_dst_eu_address="198.51.100.7:5000"
-STUB_dst_eu_interface="wanb"
-STUB_dst_eu_weight="2"
+
+# Local WAN uplinks. up_a uses `lo` (present on any machine) and up_b uses `wwan1`
+# (absent on a normal one), so `present` is exercised in both states.
+STUB_up_a_interface="lo"
+STUB_up_a_weight="0"
+STUB_up_b_interface="wwan1"
+STUB_up_b_weight="3"

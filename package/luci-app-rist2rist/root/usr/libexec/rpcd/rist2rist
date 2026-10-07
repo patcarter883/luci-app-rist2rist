@@ -8,6 +8,11 @@
 #   rist2rist.get_config  (token)    the UCI configuration as structured JSON
 #   rist2rist.set_config  (token)    apply a whitelisted config object, then commit
 #   rist2rist.reconcile   (token)    apply listen_url + outputs only (the "adopt" action)
+#
+# A destination is an ADDRESS ONLY. The encoder names the cloud POP to send to;
+# which of this router's WAN links carry it, and their weights, are local `config
+# uplink` sections and are NOT settable through this API -- they are reported
+# read-only in get_config's `uplinks` array so a client can display them.
 #   rist2rist.reload      (token)    restart the procd instance to activate the config
 #
 # AUTHENTICATION HAPPENS IN THIS PLUGIN, not by an rpcd session login. rpcd's exec
@@ -57,22 +62,42 @@ err() { # err <code> <message>
 # ======================================================================
 
 # config_foreach callback: one JSON object per configured output destination.
+#
+# A destination is an ADDRESS ONLY -- the cloud POP the encoder selected. The
+# uplinks it is bonded across are local configuration (see emit_uplink), so
+# reading this back tells a caller where the stream goes and nothing at all about
+# this router's links.
 emit_output() {
-	local cfg="$1" address interface weight
-	config_get address   "$cfg" address
+	local cfg="$1" address
+	config_get address "$cfg" address
+	[ -z "$address" ] && return 0
+	printf '{"section":"%s","address":"%s"},' \
+		"$(json_str "$cfg")" "$(json_str "$address")"
+}
+
+# config_foreach callback: one JSON object per configured WAN uplink.
+#
+# READ-ONLY to callers by design: which physical links exist, and how traffic is
+# shared across them, is the router's own business and is configured locally. It
+# is reported only so a client can SHOW what a bridge is bonded across.
+# `present` reflects whether the interface exists right now, which is why a leg
+# can be configured and legitimately idle.
+emit_uplink() {
+	local cfg="$1" interface weight present
 	config_get interface "$cfg" interface
 	config_get weight    "$cfg" weight
-	[ -z "$address" ] && return 0
-	printf '{"section":"%s","address":"%s","interface":"%s","weight":"%s"},' \
-		"$(json_str "$cfg")" "$(json_str "$address")" \
-		"$(json_str "$interface")" "$(json_str "$weight")"
+	[ -z "$interface" ] && return 0
+	[ -e "/sys/class/net/${interface}" ] && present=true || present=false
+	printf '{"section":"%s","interface":"%s","weight":"%s","present":%s},' \
+		"$(json_str "$cfg")" "$(json_str "$interface")" \
+		"$(json_str "$weight")" "$present"
 }
 
 method_get_config() {
 	local listen_url profile out_profile managed claimed
 	local enabled verbose_log loglevel
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
-	local telemetry_enabled telemetry_target outputs token_hash
+	local telemetry_enabled telemetry_target outputs uplinks token_hash
 
 	config_load "$CONFIG"
 
@@ -97,6 +122,7 @@ method_get_config() {
 	[ -n "$token_hash" ] && claimed=1 || claimed=0
 
 	outputs=$(config_foreach emit_output destination)
+	uplinks=$(config_foreach emit_uplink uplink)
 
 	printf '{'
 	printf '"ok":true,'
@@ -114,7 +140,8 @@ method_get_config() {
 	printf '"telemetry":{"enabled":%s,"target":"%s"},' \
 		"$([ "$telemetry_enabled" = "1" ] && echo true || echo false)" \
 		"$(json_str "$telemetry_target")"
-	printf '"outputs":[%s]' "${outputs%,}"
+	printf '"outputs":[%s],' "${outputs%,}"
+	printf '"uplinks":[%s]' "${uplinks%,}"
 	printf '}'
 	printf '\n'
 }
@@ -291,7 +318,7 @@ apply_config() {
 	local listen_url profile out_profile enabled
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
 	local telemetry_enabled telemetry_target
-	local i addr iface weight sec
+	local i addr sec
 
 	body_has_secret_key && { err secret_field "the request contains a secret-bearing field"; return 1; }
 	check_fields "$allowed" || return 1
@@ -344,13 +371,9 @@ apply_config() {
 		j=0
 		while [ "$j" -lt "$i" ]; do
 			addr=$(jget "@.outputs[$j].address")
-			iface=$(jget "@.outputs[$j].interface")
-			weight=$(jget "@.outputs[$j].weight")
 			url_ok "$addr" "outputs[$j].address" || return 1
 			sec=$(uci add "$CONFIG" destination)
 			uci set "$CONFIG.$sec.address=$addr"
-			[ -n "$iface" ] && uci set "$CONFIG.$sec.interface=$iface"
-			[ -n "$weight" ] && uci set "$CONFIG.$sec.weight=$weight"
 			j=$((j + 1))
 		done
 	fi
@@ -385,8 +408,8 @@ case "$1" in
 			case "$2" in
 				status)     method_status ;;
 				get_config) method_get_config ;;
-				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery telemetry target buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address interface weight" ;;
-				reconcile)  require_managed && apply_config "listen_url outputs address interface weight" ;;
+				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery telemetry target buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address" ;;
+				reconcile)  require_managed && apply_config "listen_url outputs address" ;;
 				reload)     method_reload ;;
 				release)    method_release ;;
 				*)          echo '{}' ;;
