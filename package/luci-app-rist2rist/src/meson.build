@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 project('libRIST', 'c',
-	version: '0.2.18',
+	version: '0.2.20',
 	default_options: ['c_std=c99', 'warning_level=3', 'libdir=lib'],
         meson_version: '>= 0.51.0')
 
@@ -17,9 +17,9 @@ cdata = configuration_data()
 #If any interfaces have been added, removed, or changed since the last update, increment current, and set revision to 0.
 #If any interfaces have been added since the last public release, then increment age.
 #If any interfaces have been removed or changed since the last public release, then set age to 0.
-librist_abi_current = 13
-librist_abi_revision = 0
-librist_abi_age = 9
+librist_abi_current = 16
+librist_abi_revision = 1
+librist_abi_age = 12
 librist_soversion = librist_abi_current - librist_abi_age
 librist_version = '@0@.@1@.@2@'.format(librist_abi_current - librist_abi_age, librist_abi_age, librist_abi_revision)
 
@@ -30,7 +30,7 @@ librist_version = '@0@.@1@.@2@'.format(librist_abi_current - librist_abi_age, li
 #PATCH not used (doesn't make sense for API version, remains here for backwards compat)
 
 librist_api_version_major = 4
-librist_api_version_minor = 10
+librist_api_version_minor = 13
 librist_api_version_patch = 0
 
 librist_src_root = meson.current_source_dir()
@@ -339,6 +339,7 @@ if have_srp
     platform_files += 'src/proto/eap.c'
 	platform_files += 'src/crypto/srp_constants.c'
 	platform_files += 'src/crypto/srp.c'
+	platform_files += 'src/crypto/eap_v4_crypto.c'
 endif
 
 cdata.set10('HAVE_MBEDTLS', mbedcrypto_lib_found)
@@ -353,6 +354,7 @@ librist = library('librist',
 	'src/proto/rtp.c',
 	'src/proto/rist_time.c',
 	'src/flow.c',
+	'src/rist_pacer.c',
 	'src/logging.c',
 	'src/network.c',
 	'src/adv.c',
@@ -368,6 +370,7 @@ librist = library('librist',
 	'src/stats.c',
 	'src/udpsocket.c',
 	'src/libevsocket.c',
+	'src/tun_cidr.c',
 	'contrib/stdio-shim.c',
 	'contrib/time-shim.c',
 	'contrib/pthread-shim.c',

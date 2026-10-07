@@ -56,7 +56,10 @@ extern "C" {
 #endif
 
 /*** Public API ***/
+/* Historical fixed target / floor for the UDP socket buffers (1 MB). */
 #define UDPSOCKET_SOCK_BUFSIZE (1048576)
+/* Upper target requested before the kernel clamps to net.core.{r,w}mem_max. */
+#define UDPSOCKET_SOCK_BUFSIZE_MAX (8388608)
 
 typedef struct udpsocket_url_param {
 	char *key;

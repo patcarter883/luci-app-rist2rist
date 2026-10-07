@@ -185,6 +185,28 @@ RIST_API int rist_receiver_flow_attr_callback_set(struct rist_ctx *ctx,
                                                    receiver_flow_attr_callback_t cb,
                                                    void *arg);
 
+/**
+ * @brief Enable or disable CBR output pacing
+ *
+ * The output loop releases every packet whose deadline has passed, so packets
+ * that arrived together leave together. With pacing on, they are spread at the
+ * stream's measured rate instead, which matters wherever the consumer recovers
+ * a clock from output timing.
+ *
+ * The setting is context-wide, not per output target: pacing happens in the
+ * flow's output loop, before any fan-out to individual destinations, so all of
+ * them share one release schedule. Only flows created after this call are
+ * affected, so call it before rist_start().
+ *
+ * Equivalent to ?cbr-output= on an output URL, and the two must agree;
+ * whichever is applied first wins and a later disagreement is refused.
+ *
+ * @param ctx RIST receiver context
+ * @param enable true to pace the output, false to release on arrival
+ * @return 0 on success, -1 on error or on conflict with an earlier setting
+ */
+RIST_API int rist_receiver_set_cbr_output(struct rist_ctx *ctx, bool enable);
+
 #ifdef __cplusplus
 }
 #endif

@@ -6,15 +6,617 @@ Recommendations TR-06-1 (Simple Profile), TR-06-2 (Main Profile),
 and TR-06-3 (Advanced Profile).
 
 
-Changes for 0.2.18 (pre-release):
+Changes for 0.2.20:
 ---------------------------------
 
 ABI/API:
+  - ABI version 16:1:12 (soversion 4, binary-compatible with 0.2.15,
+    0.2.16, 0.2.17, 0.2.18, and 0.2.19)
+  - API version 4.13.0 (unchanged)
+
+Bug Fixes:
+  - ?multiplex-mode= and ?rtp-ptype= are accepted again on udp urls
+    (regression in 0.2.19).  ristsender refused any url carrying either one,
+    and ristsender and ristreceiver stopped applying the multiplex mode they
+    were given.
+
+
+Changes for 0.2.19:
+---------------------------------
+
+ABI/API:
+  - ABI version 16:0:12 (soversion 4, binary-compatible with 0.2.15,
+    0.2.16, 0.2.17, and 0.2.18)
+  - API version 4.13.0 (new features, backwards-compatible)
+
+Features:
+  - Receiver output can now be spaced at the stream's own rate instead of
+    released in whatever batch the recovery buffer has made due. Intended for
+    constant-bitrate streams feeding equipment that recovers a clock from
+    arrival timing. Off by default. Set it with
+    rist_receiver_set_cbr_output(), with ristreceiver's --cbr-output 0|1, or
+    with cbr-output=1 on a udp/rtp output URL (rist_udp_config version 2).
+    Pacing never releases a packet early and never holds one past its
+    deadline, so enabling it cannot cost packets. The setting applies to the
+    whole context rather than per output target, because pacing happens in the
+    flow's output loop ahead of the fan-out and all outputs share one release
+    schedule; a request for a different value is refused. Spacing is coarser
+    on Windows builds without pthreads, whose condition wait cannot express
+    sub-millisecond timeouts.
+  - Advanced Profile receivers now dejitter off the sender's clock. The
+    receive path reconstructs a monotonic source timeline from the 1 MHz
+    RTP timestamp (TR-06-3 Section 5.2.1) and stamps packets with it instead
+    of local arrival, so output spacing follows the source cadence like the
+    Main profile. Reconstruction is wrap-safe (the 32-bit 1 MHz field rolls
+    over about every 72 minutes). Because librist releases before this one
+    emitted this timestamp on a broken clock, the receiver verifies the
+    rebuilt clock over the first second and corrects to arrival timing for
+    the rest of the session if it is not advancing at real time (an older,
+    non-conformant sender). Set timing-mode=arrival to force arrival.
+  - Bonded senders can auto-mute a failing leg by RTT. When a leg's smoothed
+    RTT stays above ?rtt-drop=<ms> for ?rtt-drop-settle=<ms>, it is pulled out
+    of the weighted payload rotation and its retransmissions are rerouted to a
+    healthy leg, so the healthy leg(s) carry 100% of the stream and no traffic
+    rides the slow path. It rejoins after RTT stays below ?rtt-restore=<ms> for
+    a longer, conservative dwell (asymmetric hysteresis: quick to drop, slow to
+    rejoin, so a still-marginal link cannot flap back in). The connection stays
+    up and keeps probing RTT while muted; a low-rate redundant trickle
+    (?rtt-drop-trickle=<N>, 1-in-N duplicate packets, on by default) keeps the
+    muted leg measured so recovery is warm rather than a cold cut-over (set 0
+    for a hard mute). The
+    last healthy leg is never muted. Per-leg mute state (rtt_muted) and a
+    cumulative mute-event counter (rtt_mute_events) are exposed in the sender
+    stats JSON and the Prometheus exporter. Disabled by default (rtt-drop=0);
+    no wire change.
+  - EAP SHA256-SRP6a gains Version 4: the passphrase pushed over an
+    authenticated SRP session is now carried under AES-256-GCM (authenticated
+    encryption) instead of the v3 AES-CTR (confidentiality-only) form. Keys are
+    per-direction (HKDF-Expand-SHA256 off the SRP session key), the 96-bit
+    nonce is monotonic and in-packet, the EAP/SRP header is bound as AAD, and
+    the receiver verifies the tag and accepts only strictly-increasing nonces
+    before installing. v4 engages only when both peers advertise EAP version 4
+    (a GCM backend is present); a v3/v2 peer falls back to AES-CTR unchanged.
+  - TUN tools (risttunnel -l) and rist_tun_set_ip() now accept IPv6 local
+    addresses with prefix lengths up to /128 (e.g. fd00::1/64). Linux uses
+    rtnetlink RTM_NEWADDR; macOS uses in6_aliasreq. IPv4 behaviour is
+    unchanged.
+  - rist_oob_read() is now implemented.  When out-of-band data is enabled
+    without a callback (rist_oob_callback_set with a NULL callback), incoming
+    OOB packets are queued and can be drained by polling rist_oob_read(), as
+    the public API already documented.  The previous stub returned success
+    without writing the output pointer, which could crash a polling caller.
+  - risttunnel gains a single-port mode (-1/--single-port): a bidirectional
+    IP tunnel carried over one UDP port instead of two.  A single RIST
+    connection runs the forward direction over the RTP data_fd path
+    (ARQ-protected) and the reverse direction over the OOB channel on the
+    same socket (best-effort, no ARQ).  The caller passes only -o, the
+    listener only -b.  Because librist learns the OOB return peer only from
+    received OOB, the listener captures the connecting peer through the
+    auth/connect callback and hands it explicitly to rist_oob_write(), while
+    the caller injects inbound OOB into its TUN through an OOB receive
+    callback.  Intended for low-bandwidth, NAT-friendly control tunnels
+    where the heavy direction is forward and the reverse is light.
+
+Security audit:
+  - Tool and API memory-safety and hygiene. The YAML and SRP-verifier
+    parsers no longer over-read or over-write on malformed input; the
+    ipv4-mux receiver and the OOB API message handler reject short datagrams
+    (were a SIZE_MAX send and an unbounded heap read), and the OOB API
+    message is written at the correct byte offset; Prometheus label values
+    taken from a peer's SDES cname are escaped (label injection); passphrases
+    are no longer logged in clear; derived key material is wiped on every
+    path and on key destroy (via a single shared helper); plus several
+    NULL-guard, format-string, getopt-width and zero-init fixes.
+  - Receiver and Advanced-profile hardening. A zero recovery buffer is
+    rejected (was a config-time divide-by-zero SIGFPE); a failed null-packet
+    expansion delivers the packet unexpanded instead of stale scratch (and no
+    longer feeds SIZE_MAX into the ts-null bitrate stats); Main-profile NACK
+    range records are capped per record and per packet (retry-queue DoS
+    amplifier); the GRE H bit no longer rewrites a configured key size from
+    unauthenticated wire data; state-changing Advanced control messages (NACK,
+    RTT echo, flow attributes, PSK future nonce) are honored only after the
+    handshake, and the keepalive capability flip is set-only; and the Advanced
+    source-clock rate verdict is re-run each window instead of latching arrival
+    timing for the whole session.
+  - EAP/SRP pre-authentication hardening. Spoofed SERVER_KEY/VALIDATOR
+    requests no longer crash an SRP caller on a NULL client context; EAPOL
+    START/LOGOFF can no longer reset the brute-force try counter or revive a
+    failed context; the passphrase dispatcher keys off the negotiated session
+    version, so a v4 (AES-256-GCM) session refuses downgraded v3/derived-key
+    frames; the retransmit cache is invalidated only by a matching identifier;
+    a reset drops the armed passphrase retransmit to avoid GCM nonce reuse; a
+    failed passphrase install is answered with FAILURE instead of a false
+    SUCCESS; passphrase push is refused before authentication; wire usernames
+    are sanitized before logging (CR/LF injection); and SRP modexp requests
+    are rate-limited.
+  - PSK key-state hardening. The Advanced future-nonce control message
+    carried an unvalidated 16-bit key size that could drive PBKDF2 to write
+    past the derived-key stack buffer; it is now rejected at every layer. The
+    bad-decryption lockout no longer becomes a one-packet permanent key kill:
+    a fresh nonce or passphrase clears it, a valid decrypt decays the strike
+    counter, and zero-nonce packets are dropped without latching. The
+    PBKDF2-flood protection is preserved as an abuse-triggered per-key rekey
+    rate limit, so legitimate nonce churn (including a reflector's RTCP/media
+    nonce interleave) is never throttled.
+  - URL parsing: a malformed UDP URL no longer triggers an out-of-bounds
+    write while extracting the scheme prefix.  A URL beginning with '/'
+    underflowed the copy length and NUL-padded far past the 16-byte prefix
+    buffer; a scheme longer than 15 characters wrote the terminator out of
+    bounds.  Both the copy length and terminator index are now clamped.
+    Reachable via rist_parse_udp_address()/rist_parse_udp_address2() and the
+    ristsender/ristreceiver/udp2udp -i/-o URLs.  Covered by
+    test/rist/unit/test_url_udp_prefix_parse.
+  - URL parsing: building the Simple-profile RTCP peer address now uses a
+    bounded formatter, so a long input URL cannot overflow the peer-config
+    address buffer.
+
+Bug Fixes:
+  - librist builds under MSVC again. Three independent breaks, two of which
+    stopped the Visual Studio solution outright, so a Windows packaging build
+    produced no library, no tools and no installer. The new constant-bitrate
+    pacing counter is an atomic_uint_least64_t, a type the bundled MSVC
+    stdatomic shim did not declare, which broke rist-private.h and every
+    target including it. Separately the EAP authenticator-restart regression
+    test pulled in <pthread.h> directly, which does not exist there; it now
+    takes the mutex API from the Windows pthread-shim as the other tests do.
+    A third, narrower break stopped only the socket-rebind test, which typed
+    two sleep durations as useconds_t, a POSIX type MSVC does not provide.
+    None of this affects compilers with a native stdatomic.h and real
+    pthreads, which is every other supported toolchain.
+  - librist now builds against nettle 4.0. The AES-CTR, SRP and EAP v4 code
+    used three interfaces that 4.0 removed: the unified struct aes_ctx, and
+    the length argument on the sha256, hmac-sha256 and gcm digest calls. A
+    build configured for nettle (?use_nettle=true, which is what distributions
+    and VLC's contrib select over the bundled mbedtls) failed to compile
+    outright. nettle 3.x is still supported; the digest calls are selected on
+    NETTLE_VERSION_MAJOR. No behaviour change on any backend.
+  - CBR output pacing now spreads an arrival burst instead of passing most of
+    it through. Enabling it used to buy almost nothing: on a 71 Mbps feed the
+    output measured 92% of datagrams leaving back to back with pacing on,
+    against 94% with it off. The output loop releases on a deadline that every
+    packet of an arrival burst shares, so pacing has to hold the rest of the
+    burst back, and three things stopped it. The hold that keeps pacing from
+    aging a packet out of the recovery buffer was a fixed 1 ms, shorter than
+    the time a burst takes to drain at the paced cadence (twelve datagrams at
+    that rate need 1.8 ms), so packets past it re-anchored the schedule and
+    left together; it now scales with the output jitter bound. A pass with
+    nothing to send left the schedule running, banking due times in the past
+    that the next arrivals spent as one back-to-back run; such a pass now
+    re-anchors. The wake floor was a fixed 250 us against a 148 us datagram
+    interval, so a wake found two datagrams due and released the pair; it now
+    tracks half the measured interval, clamped to between 20 and 250 us, so a
+    stream slow enough that the floor already sits under its interval keeps
+    the old wake rate and the old cost. The standard deviation of the output
+    spacing goes from 608 us unpaced to 20.4 us, and back-to-back from 94% to
+    0.09%, for about two points more of a core on the receiver from the higher
+    wake rate.
+  - Advanced Profile senders no longer double-count the peer bitrate. The
+    Advanced media path accounts p->bw when it builds and sends a packet,
+    and the shared send path accounted it a second time, so the measured
+    peer bitrate read about 2x the real wire rate. That inflated estimate
+    fed the recovery_maxbitrate retransmit throttle, which could refuse
+    reactive retransmits while the link was not actually saturated. The
+    shared path now skips accounting for Advanced media it did not send.
+  - A (re)connecting sender leg now sends its SDES the moment it authenticates,
+    instead of waiting for the next periodic RTCP tick. The weighted balancer
+    starts forwarding data on a leg as soon as EAP/SRP auth completes, but the
+    receiver drops data on a leg until it has seen the SDES that binds the leg
+    to the flow. On every reconnect the first data raced ahead of the SDES, so
+    the receiver discarded roughly a full RTCP interval of packets ("handshake
+    still pending"); this is most visible when a bonded leg flaps repeatedly.
+    Emitting the SDES up front closes that window.
+  - Bonded legs survive a brief stall without a full re-handshake, and the
+    peer liveness timeout is now principled. A leg that went silent was declared
+    dead after a hardcoded 250 ms and had to re-run EAP/SRP from cold on return,
+    so on a flappy link every RTT spike past 250 ms self-inflicted a re-auth and
+    the receiver dropped data on the leg until the handshake rebuilt. Two
+    changes fix this. First, routing and session lifetime are split: the sender
+    pulls a briefly-silent leg from the payload rotation within a few RTCP
+    intervals (rerouting its share and its retransmissions to a healthy sibling),
+    while the authenticated session is kept far longer. Second, the teardown is
+    the larger of the configured session_timeout and twice the receiver buffer,
+    and session_timeout now defaults to the documented RIST_DEFAULT_SESSION_TIMEOUT
+    (2000 ms) with a floor of a few RTCP intervals, instead of the old 250 ms; a
+    leg that returns within that window resumes on the existing session with no
+    re-auth. The last leg with a live return path is never pulled, so a
+    single-path stream is never cut. Because a leg can be pulled either for
+    high RTT or for silence, the two are reconciled so they never pull every
+    leg at once: a leg is muted only while another stays a carrier, and the
+    balancer never drops data while a usable leg remains.
+  - Senders now really do hold a silent peer for one recovery buffer window
+    before dropping it, which is what the fix for #196 was meant to do. A peer
+    is declared dead when its return path goes quiet, which says nothing about
+    the forward path, so cutting a single-path stream on a late RTCP reply
+    strands a receiver that is still fine. Two defects made the grace period
+    inert. The window is the peer's recovery buffer, and that was only ever
+    computed for receive-side peers, leaving it at zero on every sender. The
+    four places that egress payload then tested it backwards, sending to a dead
+    peer only once the window had already run out -- and the gate above them had
+    already dropped the peer by then, so the window was the one interval in
+    which they stayed silent. With a 4 s buffer a single-path sender went quiet
+    3 s after the return path died; it now keeps sending for 13 s (twice the
+    buffer before the peer is declared dead, then the buffer again as grace).
+    Bonded legs are unaffected: a silent leg is pulled from the rotation by the
+    stall check long before it is ever declared dead. Populating the buffer on
+    send-side peers also makes the sender's liveness timeout match the
+    receiver's, instead of always falling back to session_timeout and tearing
+    the session down first.
+  - RTT auto-mute no longer ping-pongs the stream between two failing legs.
+    When every bonded leg was over the ceiling, the leg elected to keep
+    carrying was re-picked from the instantaneous RTT on every tick, so with
+    both legs oscillating the payload path swapped about once a second --
+    worse for the stream than committing to either leg, and the visible
+    remaining glitch on bonded cellular. The role is now sticky: the elected
+    leg holds it until it recovers, goes silent, or a sibling measures several
+    times better after the incumbent has served at least one drop dwell. The
+    mute log also no longer claims the ceiling was crossed when a leg was
+    muted while serving out its rejoin dwell.
+  - A leg rejoining after an RTT mute ramps its share back up instead of
+    resuming at full weight. A muted leg carries almost nothing, so its queue
+    drains and it measures well right until it is loaded again; handing back
+    the full share at once refilled the queue and re-muted it seconds later,
+    which self-oscillated for as long as the link stayed marginal. The share
+    now rises linearly over the rejoin dwell, so the leg reveals congestion
+    under a growing load and settles at whatever it can actually carry.
+  - Senders now report a bandwidth ceiling that leaves no room for
+    retransmissions. ?bandwidth= (recovery_maxbitrate) caps payload and
+    retransmissions together rather than payload alone, so a ceiling at or
+    below the payload rate refuses every NACK for the life of the stream.
+    The refusal was logged at debug level only, so what an operator saw was
+    a link that never recovered a packet, which reads as a network fault
+    rather than a configuration one. A warning now repeats every 30 seconds
+    while the condition holds, giving the payload rate, the ceiling and the
+    number of refusals in the interval.
+  - A recovery_maxbitrate of 0 set through the C API no longer turns recovery
+    off. The value looks like "no ceiling" and is what an application reaches
+    for when it does not want retransmissions throttled, but the sender read it
+    as a ceiling of zero and refused every retransmission for the life of the
+    stream, saying so at debug level only. A 0 is now read as unset: it is
+    replaced with the 100000 kbps default and warned about, which is how
+    ?bandwidth=0 on a URL already behaved. Applications that passed 0 meaning
+    "unlimited" get the default rather than a stream with no recovery.
+  - Receivers no longer rebuild a flow's baseline on a stale packet. When the
+    recovery buffer empties, the next packet in sets the flow's clock offset and
+    sequence baseline, and any packet would do. A bonded leg queued seconds deep
+    keeps delivering packets that old, so on a reset it could win the race and
+    rewind the baseline by its whole lag: the next packet from the healthy leg
+    then looked like a multi-second jump, which emptied the buffer again. Bonded
+    runs showed this repeat until the flow was declared dead, rewinding 12000
+    sequence numbers and 15 seconds of clock in one step. A packet further behind
+    the flow's high-water mark than the buffer is deep cannot be output anyway,
+    so it is no longer taken as a baseline while a current one may still arrive.
+    The wait is capped at one buffer window, so a flow left with nothing but a
+    lagged leg, or a source that restarted on a lower clock, still recovers.
+  - The trickle on an RTT-muted bonded leg now stops once the leg is queued
+    deeper than the receiver's buffer. Past that point nothing sent on it can
+    arrive in time to be output, and the arrivals are the stale baseline
+    candidates described above. RTCP keeps measuring the leg's RTT, and with no
+    payload queued behind them those measurements become honest, so the leg is
+    still retried; legs within the buffer window trickle as before.
+  - Receiver loss statistics no longer report impossible spikes. The output
+    path counted a lost packet for every empty slot it stepped over in the
+    recovery ring, which only matches the real loss while the reader sits
+    right behind the data; after an idle source or a buffer re-anchor the
+    walk spans far more slots than there are missing packets. A clean
+    29-minute bonded run reported 40600 packets lost in a one-second window
+    whose sequence numbers showed no gap at all, and 12% cumulative loss on
+    a stream that never visibly glitched. Loss is now taken from the
+    sequence gap, the same measure the nack path already used, so the
+    reported and recovered counts agree.
+  - Advanced Profile RTT echo replies now feed the smoothed RTT. The reply
+    handler recorded the measurement as the peer's last RTT but never folded it
+    into the 8-tap average, nor mirrored it onto the data leg where the balancer
+    and the stats read it. The value was therefore discarded, and any setup that
+    probes RTT only over the Advanced echo would leave the smoothed RTT stuck at
+    its seed -- blinding RTT auto-mute and the retransmission timers. In
+    practice the Main RTCP receiver reports still refreshed it, so this was
+    latent rather than user-visible. The smoothing rule now lives in one place
+    shared by every RTT source.
+  - Advanced Profile senders now emit a spec-conformant RTP timestamp. The
+    1 MHz timestamp (TR-06-3 Section 5.2.1) was built with a >> 16 shift that
+    ran the clock 65536x too fast and wrapped every ~65 ms; the sender now
+    writes the correct microsecond value on both media data and control
+    messages. No librist receiver uses this field (the receive path clocks
+    off packet arrival), so only the on-wire value changes; it matters for
+    third-party TR-06-3 receivers that read it.
+  - Public peer getters no longer crash on NULL arguments (issue #226).
+    rist_peer_get_cname() returns 0 when the output pointer is NULL (it
+    already guarded the peer), rist_peer_get_id() returns 0 on a NULL peer,
+    and rist_peer_get_socket() checks the peer before dereferencing it.
+    rist_peer_get_cname() also bounds the returned length with the actual
+    cname field size rather than a separate, coincidentally-equal constant.
+  - EAP-SRP: a bonded caller-sender leg that goes silent and then resumes on
+    the same source tuple (an interface flap or upstream outage that comes
+    back without a reconnect) no longer stays wedged (issue #224).  While the
+    leg was silent the far-end authenticator timed out and purged its session,
+    but the caller kept its still-valid miface-bound socket and stayed in EAP
+    SUCCESS, so it streamed data the authenticator now dropped while waiting
+    for an EAPOL START the caller never sent; the leg never rejoined the bond
+    without an operator restart.  A caller-sender leg silent past
+    session_timeout now resets EAP and re-runs the SRP handshake on its
+    existing socket; once it re-authenticates it is folded back into the
+    weighted balancing rotation, so it resumes carrying its full share of the
+    bond on its own instead of lingering as an authenticated-but-idle leg.
+  - EAP-SRP: a caller now re-authenticates on its own after the authenticator
+    (listener/hub) restarts.  A restarted authenticator loses all session state
+    and re-challenges previously-authenticated callers with EAP-Request/Identity,
+    but a caller parked in EAP SUCCESS refused that request and a freshly
+    restarted authenticator ignored the caller's recovery START, so the peer sat
+    in "Waiting for EAP authentication" and carried no data until an operator
+    restarted the caller.  A persistent identity request while authenticated now
+    drives one bounded re-run of the SRP handshake, and the authenticator
+    re-challenges on every START, so the session recovers without intervention.
+  - Receiver: the "Too many old packets, resetting buffer" error no longer
+    repeats on every output cycle on degraded or bonded links.  The flow reset
+    that emits it now clears its internal trigger, so a sustained run of late
+    packets logs at most one message per reset instead of flooding the log.
+  - recovery-depth: requesting the maximum depth no longer fails on 32-bit
+    platforms.  The effective maximum is capped to what the platform can
+    address (still 16 on 64-bit), with a log message when a request is capped;
+    this also fixes the recovery_depth unit test on 32-bit builds.
+  - Advanced<->Main retransmissions are now resolved correctly.  An
+    Advanced-profile sender indexes its retransmit buffer by the 32-bit
+    advanced sequence, but a peer that negotiated down to Main (TR-06-3: an
+    Advanced device starts each peer in Main and only frames Advanced once
+    the peer advertises I=1) requests retransmits with a 16-bit RTP sequence
+    and nack_seq_msb = 0.  Those two sequence spaces are independent, so the
+    Main peer's NACK never matched the 32-bit index and nothing was
+    retransmitted.  The Advanced sender now keeps a parallel 16-bit RTP
+    retransmit index and resolves, validates, and frames a downgraded-Main
+    peer's retransmits in the RTP domain.  Advanced<->Advanced behaviour is
+    unchanged.
+  - risttunnel: fix an intermittent SIGSEGV at startup caused by an
+    uninitialised logging-settings pointer.  risttunnel now points log_ptr
+    at the static logging settings like the other tools, so rist_logging_set()
+    configures them in place instead of writing through a garbage pointer.
+    As a side effect the -v loglevel now also applies to risttunnel's own
+    messages.
+  - risttunnel now presents SRP credentials on its sender/client legs.
+    Only the listener (-F verifier file) enabled EAP-SRP before, so a
+    risttunnel pointed at an SRP-protected listener failed with
+    "credentials have not been configured" while the listener waited
+    forever for authentication.  When the URL carries both an SRP
+    username and password, risttunnel now calls rist_enable_eap_srp_2()
+    on the peer like ristsender/ristreceiver/rist2rist; the receiver leg
+    falls back to the verifier file when no credentials are supplied.
+  - Fixed a use-after-free in rist_oob_dequeue.  rist_oob_write() stashes
+    the destination peer from a caller thread and the protocol thread
+    sends it later; a peer torn down by a NAT rebind or session timeout
+    in between (e.g. the child peer the risttunnel --single-port reverse
+    path captures via the auth/connect callback) left the send path
+    dereferencing a freed peer - an intermittent SIGSEGV.  The dequeue
+    now takes peerlist_lock, verifies the stashed peer is still on the
+    live peer list, drops the packet if it is gone, and holds the lock
+    across the whole send so a concurrent add/remove cannot free the
+    peer underneath it.
+  - rist_receiver_data_block_free2() is now a no-op on a NULL block,
+    like free(NULL).  The receiver data_fd/tun delivery path can
+    legitimately hold a NULL block by the time the fifo-overflow branch
+    frees it: free_data_block() nulls the pointer after a successful
+    free, and merged FEC pairs never allocate one.  The previous
+    unconditional (*block)->ref dereference therefore read offset 0x40
+    of a NULL pointer and crashed (observed as "segfault at 40") on
+    listeners running risttunnel under abrupt link changes.  The guard
+    protects every caller, not just the data_fd path.
+  - Advanced receiver: fix a spurious "Rist data out fifo queue overflow"
+    (issue #218) when an Advanced flow upgrades from Main to Advanced wire
+    framing mid-stream.  The two framings carry source_time in different
+    timestamp domains, so the framing switch resets the flow timing
+    baseline; that reset re-derived time_offset but left the clock-drift
+    sample buffer populated with stale Main-domain samples.  The next
+    median recalculation then jumped the offset by several seconds and
+    released the whole receiver buffer at once, overflowing the data-out
+    fifo.  The baseline reset now also clears the drift samples, matching
+    the existing clock-wrap reset.  This was most visible as reproducible
+    failures of the advanced+unicast+client tests on slower build hosts.
+  - Build: tools/ristsender.c no longer trips -Woverlength-strings
+    (issue #219).  Adding --blind-send to the usage text pushed the help
+    string past the 4095-character C99 string-literal limit; it is now
+    split into two literals printed back to back (output unchanged).
+  - Build: fix compilation with SRP support disabled (issue #220).  The
+    listener cname re-association added an unguarded eap_is_authenticated()
+    call whose declaration lives under HAVE_SRP_SUPPORT; the call is now
+    guarded, and without SRP the re-association safely refuses (the cname
+    is not a per-peer secret, so it must not migrate a peer unauthenticated).
+  - Sender stats reported tiny "packets_sent"/"packets_received" deltas
+    (issue #221) when the structured callback was registered with
+    rist_stats_callback_set().  That setter updated the common stats interval
+    but not the sender's own copy, which the sender loop actually reads, so it
+    stayed 0 and the callback fired every loop iteration instead of once per
+    interval; each report then covered only one pass.  The setter now also
+    sets the sender interval (matching rist_sender_stats_callback_set), and
+    the sender loop reads the interval fresh each pass and skips reporting
+    entirely when it is 0, so a stats-disabled sender no longer builds a
+    stats object every iteration.  Affected risttunnel's sender stats; the
+    bundled Prometheus path (ristsender) uses the legacy setter and was not.
+  - udpsocket: size the socket buffers toward the OS maximum instead of a
+    fixed 1 MB.  The helpers request up to 8 MB, which the kernel clamps to
+    net.core.{r,w}mem_max, so a listener absorbs a burst of simultaneous
+    connections without the kernel dropping the overflowing handshake
+    datagrams (seen as Udp: RcvbufErrors) while the single protocol thread
+    drains the socket.  Hosts with a small rmem_max fall back to the prior
+    1 MB / 200 KB behaviour and are unaffected.
+  - EAP-SRP: a single-port/NAT'd caller whose listener restarts now recovers on
+    its own.  Previously SRP callers were excluded from the silent caller socket
+    rebind, so once the listener lost all session state the caller sat idle
+    until an operator restarted it.  The caller now resets its EAP context and
+    re-authenticates on a fresh socket; the supplicant also retransmits its
+    EAPOL START while the far end is silent, so a restarted listener that missed
+    the first START still challenges it.  The rebind backoff resets once a peer
+    re-authenticates, so a later outage retries promptly instead of after an
+    ever-growing gap.  Covered by the srp mode of
+    test/rist/test_caller_socket_rebind.
+
+CI / Test Coverage:
+  - The reflector test no longer fails intermittently on slow or heavily
+    loaded build machines.  It asserted RTT and jitter-buffer convergence
+    behind fixed settling and timeout deadlines that a loaded builder could
+    miss, causing spurious FTBFS that cleared on retry.  It now polls for the
+    actual convergence conditions with generous caps and a longer test
+    timeout; the assertions are unchanged.
+
+
+Changes for 0.2.18:
+---------------------------------
+
+ABI/API:
+  - ABI version 15:0:11 (soversion 4, binary-compatible with 0.2.15,
+    0.2.16, and 0.2.17)
+  - API version 4.12.0 (new features, backwards-compatible)
   - RIST_PEER_CONFIG_VERSION bumped from 2 to 3 (one new field:
     srp_compat_legacy).  Existing zero-initialised peer configs
     continue to work; the new field defaults to 0 (spec-compliant).
+  - RIST_PEER_CONFIG_VERSION bumped from 3 to 4 (two new fields:
+    profile + profile_set, populated by the ?profile= URL parameter).
+    rist_peer_config_defaults_set() initialises both to safe defaults
+    (profile = RIST_DEFAULT_PROFILE, profile_set = 0).  Existing
+    zero-initialised configs keep their pre-bump behaviour.
+  - New rist_peer_config_defaults_set_versioned(cfg, version) initialises
+    only the fields defined at or below the given RIST_PEER_CONFIG_VERSION.
+    rist_peer_config_defaults_set() is now a static inline wrapper (peer.h)
+    that forwards the caller's compiled RIST_PEER_CONFIG_VERSION, so a
+    recompiled caller initialises exactly the fields its struct contains.
+    The exported rist_peer_config_defaults_set() symbol is retained for
+    binaries linked against an earlier library; it assumes version 0 and
+    sets only the baseline fields present in every struct revision.  Such
+    binaries must zero-initialise their config before the call: fields
+    added in version 1+ (split_mode, merge_mode, profile, profile_set)
+    are left untouched.
+  - RIST_PEER_CONFIG_VERSION bumped from 4 to 5 (two new fields:
+    recovery_priority, populated by the ?recovery-priority= URL
+    parameter, and recovery_depth, populated by ?recovery-depth=).
+    rist_peer_config_defaults_set_versioned() initialises them for
+    callers compiled against version 5 or later (recovery_priority = 0,
+    recovery_depth = RIST_RECOVERY_DEPTH_DEFAULT); zero-initialised
+    configs and callers built against an earlier version keep the legacy
+    NACK-routing behaviour and the default recovery ring.
+  - New public API rist_recovery_depth_set(ctx, depth) and the
+    RIST_RECOVERY_DEPTH_MIN/DEFAULT/MAX macros (peer.h) size the
+    Advanced-profile retransmission ring.  depth is a base-2 exponent:
+    the ring holds 65536 << depth packets (default 3 = 8x = the prior
+    fixed size, range 0..16).  Must be called before rist_start().
+  - New public macro RIST_PEER_WEIGHT_DUPLICATE (0) names the
+    rist_peer_config.weight sentinel that selects packet duplication
+    instead of weighted load-balancing.  Value unchanged.
+  - RIST_STATS_VERSION bumped from 2 to 3 and the JSON stats
+    schema_version from 3 to 4 (additive): rist_stats_sender_peer gains
+    profile + advanced_active, rist_stats_receiver_flow gains profile +
+    seq_bits + advanced_active.  Consumers reading only earlier fields are
+    unaffected.
+
+Features:
+  - Per-peer retransmission routing: the new ?recovery-priority=<n>
+    peer URL parameter (rist_peer_config.recovery_priority) lets a
+    receiver direct NACKs to a chosen peer when a flow is carried by
+    more than one RTCP-capable peer.  Each NACK group is sent to the
+    eligible peer with the highest recovery_priority, ties broken by
+    lowest RTT.  The default of 0 on every peer preserves the prior
+    lowest-RTT selection.  Useful when the lowest-RTT peer cannot
+    answer NACKs (e.g. a duplicate/relay feed with no retransmit
+    buffer) while a higher-RTT peer holds the retransmission buffer.
+  - Tunable Advanced-profile recovery depth: the recovery rings are now
+    heap-allocated and profile-sized, so Simple/Main flows allocate only
+    their 16-bit ring (65536 packets) instead of the Advanced footprint.
+    The Advanced ring size is selectable via ?recovery-depth=N (or
+    rist_recovery_depth_set()), where N is a base-2 exponent and the ring
+    holds 65536 << N packets.  The default of 3 (524288 packets) matches
+    the previous fixed size; higher values trade RAM for a deeper NACK
+    window.  Simple/Main ignore the knob.  A config-time warning is
+    emitted when a peer's bitrate and buffer settings would exceed the
+    recovery ring's addressable window.
+  - Advanced/Main profile interoperability (TR-06-3 Section 9): an
+    Advanced sender starts in Main framing and upgrades a peer to
+    Advanced framing only after that peer advertises Advanced capability,
+    so a Main-only receiver can still decode the stream.  An Advanced
+    receiver accepts a Main-framed source and follows a mid-stream
+    Main->Advanced upgrade.  Matched Advanced and matched Main pairs are
+    unchanged.
+  - The default RIST profile is now Advanced (RIST_DEFAULT_PROFILE, and
+    the ristsender/ristreceiver/YAML defaults that follow it), changed
+    from Main.  Thanks to the interop above, a default Advanced endpoint
+    negotiates Advanced framing with an Advanced peer and falls back to
+    Main framing with a Main-only peer, so existing Main deployments keep
+    working.  Pass -p 1 (or profile: 1 in YAML) to force Main as before.
+  - risttunnel now defaults to RIST_DEFAULT_PROFILE like the other tools,
+    instead of remaining hardcoded to Main, completing the default-profile
+    sweep.
+  - Advanced-profile visibility in statistics: the binary stats API and the
+    JSON stats now report each flow's configured profile and, on the
+    receiver, whether Advanced framing is actually active and the sequence
+    width in use.  The Prometheus exporter adds rist_client_flow_info /
+    rist_sender_peer_info series carrying these labels, so a dashboard can
+    tell at a glance when it is monitoring an Advanced stream.
 
 Bug Fixes:
+  - Advanced profile: a sequence gap larger than 65535 is no longer
+    truncated to 16 bits, so a real >64k loss on a 32-bit flow is recovered
+    instead of being mis-detected as a tiny gap.
+  - Advanced profile: receiver_mark_missing() now masks the sequence into the
+    retransmission ring index.  A 32-bit sequence eventually exceeds the ring
+    size; the old raw index ran off the array and could crash the receiver on
+    a long-running Advanced flow.
+  - The expected-next-sequence wrap mask no longer forces the value even (it
+    masked with UINT16_MAX-1), which mis-computed every odd successor on
+    16-bit flows.
+  - Advanced byte accounting now counts delivered payload only, matching the
+    Simple/Main convention, so received-byte and bitrate stats are consistent
+    across profiles.
+  - Duplicate detection compares the sequence number rather than the source
+    timestamp, fixing false duplicate decisions on Advanced arrival-stamped
+    packets.
+  - Merge-mode pairing computes the successor sequence in a 32-bit-safe way,
+    so paired packets are matched correctly on Advanced flows.
+  - Advanced Profile (TR-06-3) RTT Echo Responses inflated the measured
+    round-trip time by a constant factor.  The sender will not retransmit
+    a packet again within one RTT of the previous attempt, so the inflated
+    value made it ignore the repeat NACKs needed when a retransmission is
+    itself lost, leaving packets unrecovered under sustained loss.  The
+    Advanced echo now uses calculate_rtt_delay(), as the Simple and Main
+    profiles do.
+  - Fixed a receiver abort when a retransmitted or gap-filled packet's
+    arrival time is interpolated.  With peers whose clocks are not
+    synchronised the estimate could fall outside its neighbouring queue
+    slots, tripping an assert in debug builds or misordering the queue
+    otherwise.  Interpolation is now bounds-checked, rounded without
+    overshoot, wrap/reorder-aware, and clamped to the neighbour interval.
+  - NAT source-port rebind recovery (issue #188): when a calling
+    receiver's external source port changes (NAT mapping rebind, DHCP
+    renewal), the listening sender no longer treats it as a brand-new
+    caller that leaves the old peer record orphaned until session
+    timeout.  Listener-side re-association requires an authenticated
+    per-peer SRP session: once a new child completes SRP authentication
+    and learns its cname from an RTCP SDES, its source tuple is migrated
+    into the matching silent sibling.  This path is SRP-only because the
+    cname alone is not a per-peer secret under a shared PSK.  Plaintext
+    and shared-PSK callers recover on the caller side instead: a
+    caller-mode receiver on a MAIN+ profile with no pinned local port
+    rebinds its UDP socket to a fresh ephemeral port on session timeout
+    and restarts the handshake instead of giving up.
+  - ?profile=0|1|2 in a peer URL (0=Simple, 1=Main, 2=Advanced) now
+    overrides the wire profile of the context that owns the peer.
+    rist_parse_address2 parses the value into rist_peer_config; on the
+    first matching peer added before rist_start(), rist_peer_create
+    mutates the context profile and lazily initialises the Advanced
+    profile state when upgrading to Advanced.  Subsequent peers must
+    request the same profile (or omit the parameter); rist_peer_create
+    returns -1 with a WARN once the context profile is locked (after
+    rist_start() or a prior peer fixed it).  Any consumer that passes
+    URLs through rist_parse_address2 + rist_peer_create now gets the
+    URL-driven profile selection with no further integration work.
+  - Fixed a use-after-free in the global logger when an application frees
+    its rist_logging_settings, either directly via
+    rist_logging_settings_free2() or by destroying a context that embeds
+    them (as FFmpeg does), while the global logger still references that
+    callback and argument.  The global logging settings are now cleared
+    when the matching settings are freed, so logs emitted afterwards (for
+    example from background threads on a rapid close/reopen) no longer
+    call into freed memory.
+  - rist_peer_config_defaults_set() no longer writes past the end of a
+    peer config supplied by a binary compiled against an older
+    RIST_PEER_CONFIG_VERSION, and parse_url_options() / store_peer_settings()
+    no longer touch version-specific fields unless peer_config->version is
+    high enough: reflector, multicast_ttl, multicast_source and local_port
+    require version >= 2; srp_compat_legacy requires version >= 3.
   - Windows XP support restored: rist_transport_poll() now uses
     select() via the existing contrib/poll_win.c shim instead of
     WSAPoll() (Vista+ only).  Regression introduced in 0.2.17.
@@ -27,6 +629,10 @@ Bug Fixes:
   - Prometheus exporter: counter rows in multiple_metric_datapoints
     mode now have a space between the value and the timestamp.
     Affected every existing _total row.
+  - Prometheus exporter: in single_stat_point mode, the displayed
+    value no longer freezes at the first callback and silently
+    drops every subsequent sample.  Affected all receiver-flow,
+    sender-peer, and per-peer-receiver gauges.
   - Receiver flow stats: bitrate, bitrate_retries, bitrate_rejected
     and bitrate_ts_nulls now decay to zero when the corresponding
     traffic stops, instead of remaining frozen at the last value
@@ -39,7 +645,7 @@ SRP interoperability:
     the PAD) will not handshake with 0.2.16+.  Upgrading both ends
     to 0.2.16+ remains the recommended fix.
   - New URL parameter for transitional interop:
-        ?srp-compat=legacy
+        ?srp-compat=1
     On both ends of the SRP exchange, this opts the SRP wire format
     back into the pre-0.2.16 unpadded form.  Must be set on BOTH
     sides; mixed configuration will still fail.  An explicit WARN
@@ -47,7 +653,7 @@ SRP interoperability:
     as an escape hatch while older deployments are upgraded.
   - When an SRP handshake fails, the authenticator (and the client
     on M2 mismatch) now emits a single INFO hint pointing at the
-    srp-compat=legacy escape hatch.  The hint is advisory only —
+    srp-compat=1 escape hatch.  The hint is advisory only -
     the SRP-6a transcript binds M1 to the authenticator's wire-mode
     B, so there is no purely-local way to distinguish "wrong
     password" from "peer is on the other wire format" once the
@@ -63,23 +669,31 @@ CI / Test Coverage:
     against the 2048-bit RFC 5054 group.  Added four end-to-end tests
     covering both PAD and legacy modes plus the two cross-mode failure
     cases.
+  - The issue #188 NAT/socket-rebind and multipath cname integration
+    tests now compile under MSVC: they use the Windows pthread-shim
+    (runtime mutex initialisation and PTHREAD_START_FUNC thread entry
+    points) instead of a direct <pthread.h> dependency.
 
 Tools:
   - ristsender: new --blind-send option.  Decouples the sender from
-    RIST peer state — multicast input groups are joined immediately
+    RIST peer state - multicast input groups are joined immediately
     and incoming UDP data is written to the RIST context regardless
     of whether any output peer has connected.  Intended for
     fire-and-forget broadcast topologies (multicast output in
     simple/main/advanced profile, or ristsender used as a relay /
     fan-out in front of non-RIST consumers).
   - Prometheus exporter: new per-peer receiver metric block
-    rist_receiver_peer_* with labels {peer_id, flow_id,
+    rist_receiver_peer_* with labels {peer_id, peer_url, flow_id,
     receiver_id}, mirroring rist_sender_peer_*.  Auto-registered
     from rist_stats_receiver_flow.peers[].
   - Prometheus exporter: new client-flow gauge
     rist_client_flow_avg_buffer_time_seconds reporting the dynamic
     receiver buffer fill level (sourced from avg_buffer_time in
     rist_stats_receiver_flow, converted from ms to seconds).
+  - Prometheus exporter: now also exports receiver counters that were
+    previously JSON-only: retries, dropped-late, dropped-full, duplicates,
+    and the NACK-depth recovery buckets (recovered after two / three / four
+    / more NACKs).
 
 
 Changes for 0.2.17:

@@ -121,6 +121,7 @@ void librist_crypto_srp_mbedtls_hash_init(HASH_CONTEXT *ctx, bool correct_init) 
 #elif HAVE_NETTLE
 #include <nettle/sha2.h>
 #include <nettle/bignum.h>
+#include <nettle/version.h>
 #define BIGNUM MP_INT
 #define BIGNUM_INIT(num) mpz_init(num)
 #define BIGNUM_FREE(num) mpz_clear(num)
@@ -198,7 +199,12 @@ static int librist_crypto_srp_hash_final(HASH_CONTEXT *hash_ctx, uint8_t *data)
 #if HAVE_MBEDTLS
 	return mbedtls_sha256_finish_ret( hash_ctx, data);
 #else
+	/* nettle 4.0 dropped the length argument; this digest is never truncated. */
+#if NETTLE_VERSION_MAJOR >= 4
+	nettle_sha256_digest( hash_ctx, data);
+#else
 	nettle_sha256_digest( hash_ctx, SHA256_DIGEST_LENGTH, data);
+#endif
 	return 0;
 #endif
 }
@@ -432,7 +438,7 @@ struct librist_crypto_srp_authenticator_ctx {
 	uint8_t m2[SHA256_DIGEST_LENGTH];
 
 	bool correct_hashing_init;
-	bool legacy_pad;             //pre-0.2.16 unpadded u/k (srp-compat=legacy)
+	bool legacy_pad;             //pre-0.2.16 unpadded u/k (srp-compat=1)
 };
 
 struct librist_crypto_srp_authenticator_ctx *librist_crypto_srp_authenticator_ctx_create(const char* n_hex, const char *g_hex, const uint8_t *v_bytes, size_t v_len, const uint8_t *s_bytes, size_t s_len, bool correct, bool legacy_pad) {
@@ -710,7 +716,7 @@ int librist_crypto_srp_authenticator_verify_m1(struct librist_crypto_srp_authent
 	ret = librist_crypto_srp_calculate_m2(&ctx->A, m1_buf, ctx->key, ctx->m2, ctx->correct_hashing_init);
 
 #if DEBUG_EXTRACT_SRP_EXCHANGE
-	print_hash(ctx->key, "M2: ");
+	print_hash(ctx->m2, "M2: ");
 #endif
 out:
 	BIGNUM_FREE(&u);
@@ -739,7 +745,7 @@ struct librist_crypto_srp_client_ctx {
 	uint8_t m1[SHA256_DIGEST_LENGTH];
 
 	bool correct_hashing_init;
-	bool legacy_pad;             //pre-0.2.16 unpadded u/k (srp-compat=legacy)
+	bool legacy_pad;             //pre-0.2.16 unpadded u/k (srp-compat=1)
 };
 
 int librist_crypto_srp_client_write_A_bytes(struct librist_crypto_srp_client_ctx *ctx, uint8_t *A_buf, size_t A_buf_len) {

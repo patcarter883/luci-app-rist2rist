@@ -53,11 +53,21 @@ RIST_API int rist_tun_read(int fd, uint8_t *buf, size_t len);
 RIST_API int rist_tun_write(int fd, const uint8_t *buf, size_t len);
 
 /**
+ * @brief Parse an IPv4 or IPv6 address with optional CIDR prefix.
+ *
+ * Accepts "ADDR" (defaults to /32 or /128) or "ADDR/PREFIX". The address
+ * family is inferred from the presence of ':' in ADDR.
+ *
+ * @return  0 on success, -1 on invalid input.
+ */
+RIST_API int rist_tun_parse_cidr(const char *cidr, char *ip_out, size_t ip_len, int *prefix_out);
+
+/**
  * @brief Assign an IP address and prefix length to the TUN interface.
  *
  * @param dev         Interface name (e.g. "utun3").
- * @param ip          IP address string (e.g. "10.0.0.1").
- * @param prefix_len  Prefix length (e.g. 24).
+ * @param ip          IPv4 or IPv6 address string (e.g. "10.0.0.1", "fd00::1").
+ * @param prefix_len  Prefix length (0-32 for IPv4, 0-128 for IPv6).
  * @return            0 on success, -1 on failure.
  */
 RIST_API int rist_tun_set_ip(const char *dev, const char *ip, int prefix_len);

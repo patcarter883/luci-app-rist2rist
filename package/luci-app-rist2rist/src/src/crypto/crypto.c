@@ -62,15 +62,3 @@ int _librist_crypto_random_u32(uint32_t *out) {
 	*out = u32;
 	return 0;
 }
-
-uint32_t rand_u32(void)
-{
-	uint32_t u32;
-	uint8_t *u8 = (void *) &u32;
-
-	for (size_t i = 0; i < sizeof(u32); i++) {
-		u8[i] = rand() % 256;
-	}
-
-	return u32;
-}

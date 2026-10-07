@@ -9,7 +9,21 @@
 #include "psk.h"
 #include "log-private.h"
 #include "crypto-private.h"
+#include "proto/rist_time.h"
 #include <string.h>
+
+/* Minimum wall-time between nonce-adoption rekeys (PBKDF2) on one key.
+ * Bounds the CPU a packet flood with randomized nonces can burn. The floor
+ * is dictated by the reflector topology: a subscriber's single key sees
+ * interleaved nonces from the reflector's own RTCP and the forwarded
+ * publisher media, so legitimate rekeys arrive at the RTCP cadence
+ * (~2 per 100 ms interval); the limit must stay well above that or valid
+ * media is dropped. 10 ms still caps a flood at ~100 PBKDF2/s per key. */
+#define RIST_REKEY_MIN_INTERVAL (ONE_SECOND / 100)
+
+/* bad_count strikes marking decryption-failure abuse before the decrypt-path
+ * rekey rate limit engages; legitimate nonce churn keeps bad_count at 0. */
+#define RIST_REKEY_ABUSE_STRIKES 2
 
 #if HAVE_MBEDTLS
 #include "mbedtls/aes.h"
@@ -62,6 +76,11 @@ int _librist_crypto_psk_rist_key_destroy(struct rist_key *key)
 	    linux_crypto_free(&key->linux_crypto_ctx);
 #endif
     }
+	/* Wipe key material: the peer struct is freed without zeroing. */
+	_librist_crypto_secure_zero(key->password, sizeof(key->password));
+	_librist_crypto_secure_zero(key->gre_nonce, sizeof(key->gre_nonce));
+	_librist_crypto_secure_zero(key->iv, sizeof(key->iv));
+	_librist_crypto_secure_zero(key->aes_key_sched, sizeof(key->aes_key_sched));
 	return 0;
 }
 
@@ -86,6 +105,14 @@ int _librist_crypto_psk_rist_key_clone(struct rist_key *key_in, struct rist_key 
 static void _librist_crypto_aes_key(struct rist_key *key)
 {
     uint8_t aes_key[256 / 8];
+    /* Hard invariant: key_size drives the PBKDF2 output length into this
+     * 32-byte stack buffer. Anything but a valid AES size here means the
+     * value arrived unvalidated from the wire or config; refuse rather
+     * than overflow. */
+    if (key->key_size != 128 && key->key_size != 192 && key->key_size != 256) {
+        key->bad_decryption = true;
+        return;
+    }
 #if HAVE_MBEDTLS
     mbedtls_md_context_t sha_ctx;
     const mbedtls_md_info_t *info_sha;
@@ -125,15 +152,15 @@ static void _librist_crypto_aes_key(struct rist_key *key)
 #elif HAVE_NETTLE
 	switch(key->key_size) {
 	case 256:
-        nettle_aes256_set_encrypt_key(&key->nettle_ctx.u.ctx256, aes_key);
+        nettle_aes256_set_encrypt_key(&key->nettle_ctx.ctx256, aes_key);
         break;
 	case 192:
-        nettle_aes192_set_encrypt_key(&key->nettle_ctx.u.ctx192, aes_key);
+        nettle_aes192_set_encrypt_key(&key->nettle_ctx.ctx192, aes_key);
         break;
 	case 128:
 		RIST_FALLTHROUGH;
 	default:
-		nettle_aes128_set_encrypt_key(&key->nettle_ctx.u.ctx128, aes_key);
+		nettle_aes128_set_encrypt_key(&key->nettle_ctx.ctx128, aes_key);
     }
 #elif defined(LINUX_CRYPTO)
     if (key->linux_crypto_ctx)
@@ -144,10 +171,12 @@ static void _librist_crypto_aes_key(struct rist_key *key)
     aes_key_setup(aes_key, key->aes_key_sched, key->key_size);
 #endif
     key->used_times = 0;
+    _librist_crypto_secure_zero(aes_key, sizeof(aes_key));
     return;
 #if HAVE_MBEDTLS
 fail:
     mbedtls_md_free(&sha_ctx);
+    _librist_crypto_secure_zero(aes_key, sizeof(aes_key));
     /* Leave any prior key install in place but force the lockout flag so we
      * don't run AES-CTR with whatever happened to be on the stack. */
     key->bad_decryption = true;
@@ -166,26 +195,26 @@ void _librist_crypto_aes_ctr(const uint8_t key[], int key_size, uint8_t iv[], co
 	mbedtls_aes_crypt_ctr(&ctx, payload_len, &nc_off, iv, stream_block, inbuf, outbuf);
 	mbedtls_aes_free(&ctx);
 #elif HAVE_NETTLE
-    struct aes_ctx aes_ctx;
+    union rist_nettle_aes_ctx aes_ctx;
     memset(&aes_ctx, 0, sizeof(aes_ctx));
     nettle_cipher_func *f;
     switch (key_size) {
     case 256:
-		nettle_aes256_set_encrypt_key(&aes_ctx.u.ctx256, key);
+		nettle_aes256_set_encrypt_key(&aes_ctx.ctx256, key);
 		f = (nettle_cipher_func *)nettle_aes256_encrypt;
 		break;
 	case 192:
-		nettle_aes192_set_encrypt_key(&aes_ctx.u.ctx192, key);
+		nettle_aes192_set_encrypt_key(&aes_ctx.ctx192, key);
 		f = (nettle_cipher_func *)nettle_aes192_encrypt;
 		break;
 	case 128:
-		nettle_aes128_set_encrypt_key(&aes_ctx.u.ctx128, key);
+		nettle_aes128_set_encrypt_key(&aes_ctx.ctx128, key);
 		f = (nettle_cipher_func *)nettle_aes128_encrypt;
 		break;
 	default:
 		return;
 	}
-	nettle_ctr_crypt(&aes_ctx.u, f, AES_BLOCK_SIZE, iv, payload_len, outbuf, inbuf);
+	nettle_ctr_crypt(&aes_ctx, f, AES_BLOCK_SIZE, iv, payload_len, outbuf, inbuf);
 #else
     uint32_t aes_key_sched[60];
     aes_key_setup(key, aes_key_sched, key_size);
@@ -212,7 +241,7 @@ static void _librist_crypto_psk_aes_ctr(struct rist_key *key, const uint8_t inbu
 	default:
 		return;
 	}
-	nettle_ctr_crypt(&key->nettle_ctx.u, f, AES_BLOCK_SIZE, key->iv,payload_len, outbuf, inbuf);
+	nettle_ctr_crypt(&key->nettle_ctx, f, AES_BLOCK_SIZE, key->iv,payload_len, outbuf, inbuf);
 #elif defined(LINUX_CRYPTO)
 	if (key->linux_crypto_ctx)
 		linux_crypto_decrypt(inbuf, outbuf, payload_len, key->iv, key->linux_crypto_ctx);
@@ -268,22 +297,34 @@ void _librist_crypto_psk_decrypt(struct rist_key *key, uint8_t nonce[4], uint32_
 {
 	uint32_t nonce_val;
 	memcpy(&nonce_val, nonce, sizeof(nonce_val));
-    // A zero nonce never comes from a legitimate sender; refuse to decrypt
-    if (!nonce_val) {
-        key->bad_decryption = true;
+    /* A zero nonce never comes from a legitimate sender; drop the packet.
+     * Do NOT latch bad_decryption here: a zero nonce triggers no PBKDF2,
+     * so the latch only served as a one-packet permanent session kill. */
+    if (!nonce_val)
         return;
-    }
 
     if (memcmp(nonce, key->gre_nonce, sizeof(key->gre_nonce)) != 0) {
-        /* Skip PBKDF2 + rekey while locked out. */
-        if (key->bad_decryption)
+        /* Adopt the new nonce even while locked out: a latch no fresh nonce
+         * can clear turns one spoofed packet (or six garbage decryptions)
+         * into a permanent session kill and blocks legitimate passphrase
+         * rotations. The PBKDF2-CPU-DoS protection the lockout provided
+         * becomes a rekey rate limit that engages ONLY under abuse:
+         * legitimate nonce churn (rotations, reflector RTCP/media nonce
+         * interleave) decrypts cleanly and keeps bad_count at 0, so it is
+         * never throttled; a garbage flood pushes bad_count past
+         * RIST_REKEY_ABUSE_STRIKES and is throttled to RIST_REKEY_MIN_INTERVAL. */
+        uint64_t now = timestampNTP_u64();
+        if (key->bad_count > RIST_REKEY_ABUSE_STRIKES && key->last_rekey &&
+            (now - key->last_rekey) < RIST_REKEY_MIN_INTERVAL)
             return;
         memcpy(key->gre_nonce, nonce, sizeof(key->gre_nonce));
         _librist_crypto_aes_key(key);
         /* Only clear the flag if _librist_crypto_aes_key succeeded;
          * it sets bad_decryption=true on PBKDF2/setup failure. */
-        if (!key->bad_decryption)
-            key->bad_count = 0;
+        if (key->bad_decryption)
+            return;
+        key->bad_count = 0;
+        key->last_rekey = now;
     }
 
     if (key->used_times > RIST_AES_KEY_REUSE_TIMES) {
@@ -333,6 +374,9 @@ int _librist_crypto_psk_set_passphrase(struct rist_key *key, const uint8_t *pass
 	key->password_len = passphrase_len;
 	key->used_times = 0;
 	key->csprng_failed = false; /* fresh passphrase, retry CSPRNG */
+	key->bad_decryption = false; /* fresh passphrase: clear any lockout */
+	key->bad_count = 0;
+	key->last_rekey = 0;
 	_librist_crypto_psk_generate_nonce(key);
 	_librist_crypto_aes_key(key);
 	return 0;
@@ -354,8 +398,25 @@ void _librist_crypto_psk_preannounce_nonce(struct rist_key *key, const uint8_t n
 		return;
 	if (memcmp(nonce, key->gre_nonce, sizeof(key->gre_nonce)) == 0)
 		return;
-	if (key_size_bits)
+	/* key_size_bits comes straight off the wire (Advanced PSK nonce
+	 * control message); accept only valid AES sizes. */
+	if (key_size_bits) {
+		if (key_size_bits != 128 && key_size_bits != 192 && key_size_bits != 256)
+			return;
 		key->key_size = key_size_bits;
+	}
+	/* This control message is reachable before authentication and carries no
+	 * decrypt outcome, so there is no bad_count abuse signal to gate on (unlike
+	 * the decrypt path); keep the flat RIST_REKEY_MIN_INTERVAL rate limit
+	 * unconditionally. Preannounce is not in the media hot path, so the flat
+	 * floor costs nothing legitimate. */
+	uint64_t now = timestampNTP_u64();
+	if (key->last_rekey && (now - key->last_rekey) < RIST_REKEY_MIN_INTERVAL)
+		return;
 	memcpy(key->gre_nonce, nonce, sizeof(key->gre_nonce));
 	_librist_crypto_aes_key(key);
+	if (!key->bad_decryption) {
+		key->bad_count = 0;
+		key->last_rekey = now;
+	}
 }

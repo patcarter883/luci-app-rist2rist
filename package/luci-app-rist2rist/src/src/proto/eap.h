@@ -101,4 +101,5 @@ RIST_PRIV bool rist_eap_password_sending_done(struct eapsrp_ctx *ctx);
 RIST_PRIV bool rist_eap_may_rollover_tx(struct eapsrp_ctx *ctx);
 RIST_PRIV void rist_eap_send_passphrase(struct eapsrp_ctx *ctx, const char *passphrase);
 RIST_PRIV int _librist_proto_eap_start(struct eapsrp_ctx *ctx);
+RIST_PRIV void eap_reset_authenticatee(struct eapsrp_ctx *ctx);
 #endif

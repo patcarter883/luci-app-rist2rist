@@ -86,9 +86,10 @@ int parse_line(const char *line, size_t line_len, uint8_t **decoded_verifier, si
 	user_verifier_state_e state = IN_VERIFIER;
 	int ret = -1;
 	size_t read_verifier_len = 0;
-	char *read_verifier = calloc(READ_VERIFIER_LEN, 1);
+	/* +8: room for the inline base64 padding (up to 3) + terminator writes */
+	char *read_verifier = calloc(READ_VERIFIER_LEN + 8, 1);
 	size_t read_salt_len = 0;
-	char *read_salt = calloc(READ_SALT_LEN, 1);
+	char *read_salt = calloc(READ_SALT_LEN + 8, 1);
 	if (!read_salt || !read_verifier)
 		goto out;
 	for (size_t i=0; i < line_len; i++) {
@@ -188,7 +189,7 @@ void user_verifier_lookup(char * username,
 
 	size_t username_offset = 0;
 
-	char read_hashver[3] = {0};
+	char read_hashver[4] = {0}; /* 3 digits + NUL for atoi */
 	int read_hashver_len = 0;
 	user_verifier_state_e state = IN_USERNAME;
 	bool skipnextline = false;
@@ -231,8 +232,11 @@ void user_verifier_lookup(char * username,
 			break;
 		} else if (read == ':')
 		{
-			if (state == IN_VERIFIER)
+			if (state == IN_VERIFIER) {
+				if (line_len >= MAX_LINE_LEN)
+					goto out;
 				line[line_len++] = read;
+			}
 			if (state == IN_USERNAME && username_offset != username_len) {
 				if (line_one_done) {
 					break;

@@ -28,6 +28,7 @@
 #include <net/if.h>
 #include <net/if_utun.h>
 #include <netinet/in.h>
+#include <netinet6/in6_var.h>
 #include <arpa/inet.h>
 #include <net/route.h>
 
@@ -150,10 +151,62 @@ int rist_tun_write(int fd, const uint8_t *buf, size_t len)
 
 int rist_tun_set_ip(const char *dev, const char *ip, int prefix_len)
 {
-	if (prefix_len < 0 || prefix_len > 32) {
-		fprintf(stderr, "Invalid prefix length: %d\n", prefix_len);
+	struct in6_addr addr6;
+	struct in_addr addr4;
+
+	if (inet_pton(AF_INET6, ip, &addr6) == 1) {
+		struct in6_aliasreq ifra6;
+
+		if (prefix_len < 0 || prefix_len > 128) {
+			fprintf(stderr, "Invalid IPv6 prefix length: %d\n", prefix_len);
+			return -1;
+		}
+
+		memset(&ifra6, 0, sizeof(ifra6));
+		strncpy(ifra6.ifra_name, dev, IFNAMSIZ - 1);
+
+		ifra6.ifra_addr.sin6_len = sizeof(ifra6.ifra_addr);
+		ifra6.ifra_addr.sin6_family = AF_INET6;
+		ifra6.ifra_addr.sin6_addr = addr6;
+
+		ifra6.ifra_prefixmask.sin6_len = sizeof(ifra6.ifra_prefixmask);
+		ifra6.ifra_prefixmask.sin6_family = AF_INET6;
+		for (int i = 0; i < prefix_len / 8; i++)
+			ifra6.ifra_prefixmask.sin6_addr.s6_addr[i] = 0xff;
+		if (prefix_len % 8)
+			ifra6.ifra_prefixmask.sin6_addr.s6_addr[prefix_len / 8] =
+				(uint8_t)(0xff << (8 - (prefix_len % 8)));
+
+		ifra6.ifra_dstaddr.sin6_len = sizeof(ifra6.ifra_dstaddr);
+		ifra6.ifra_dstaddr.sin6_family = AF_INET6;
+		ifra6.ifra_dstaddr.sin6_addr = addr6;
+
+		int s = socket(AF_INET6, SOCK_DGRAM, 0);
+		if (s < 0) {
+			perror("socket AF_INET6");
+			return -1;
+		}
+
+		if (ioctl(s, SIOCAIFADDR_IN6, &ifra6) < 0) {
+			perror("ioctl SIOCAIFADDR_IN6");
+			close(s);
+			return -1;
+		}
+
+		close(s);
+		return 0;
+	}
+
+	if (inet_pton(AF_INET, ip, &addr4) != 1) {
+		fprintf(stderr, "Invalid IP address: %s\n", ip);
 		return -1;
 	}
+
+	if (prefix_len < 0 || prefix_len > 32) {
+		fprintf(stderr, "Invalid IPv4 prefix length: %d\n", prefix_len);
+		return -1;
+	}
+
 	struct ifaliasreq ifra;
 	memset(&ifra, 0, sizeof(ifra));
 	strncpy(ifra.ifra_name, dev, IFNAMSIZ - 1);
@@ -161,10 +214,7 @@ int rist_tun_set_ip(const char *dev, const char *ip, int prefix_len)
 	struct sockaddr_in *addr = (struct sockaddr_in *)&ifra.ifra_addr;
 	addr->sin_len = sizeof(*addr);
 	addr->sin_family = AF_INET;
-	if (inet_pton(AF_INET, ip, &addr->sin_addr) != 1) {
-		fprintf(stderr, "Invalid IP address: %s\n", ip);
-		return -1;
-	}
+	addr->sin_addr = addr4;
 
 	struct sockaddr_in *mask = (struct sockaddr_in *)&ifra.ifra_mask;
 	mask->sin_len = sizeof(*mask);

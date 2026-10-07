@@ -23,6 +23,7 @@
 #include "time-shim.h"
 #include "pthread-shim.h"
 #include "socket-shim.h"
+#include "rist_pacer.h"
 #include "libevsocket.h"
 #include "librist.h"
 #include "librist/transport.h"
@@ -33,15 +34,47 @@
 #include "librist/logging.h"
 #include "proto/gre.h"
 #include "proto/adv.h"
+#include "rist-adv-ts.h"
+#include "rist-reanchor.h"
+#include "rist-send-grace.h"
+#include "rist-bandwidth-guard.h"
+#include "rist-rtt-mute.h"
 
 struct cJSON;
 
 #undef RIST_DEPRECATED
 
 #define UINT16_SIZE (UINT16_MAX + 1)
-// These 4 control the memory footprint and buffer capacity of the lib
+
+/* Forward sequence-number gap. short_seq (Simple/Main) flows wrap at 16 bits;
+ * full 32-bit (Advanced) flows use the true difference so a genuine >64k gap is
+ * not truncated. Inputs are modular counters, so the subtraction is unsigned
+ * (well-defined wrap) before the optional 16-bit mask. */
+static inline uint32_t rist_seq_gap(uint32_t current, uint32_t last,
+                                    bool short_seq)
+{
+	uint32_t gap = current - last;
+	return short_seq ? (gap & UINT16_MAX) : gap;
+}
+
+/* Next expected sequence number after `last`. short_seq (Simple/Main) flows
+ * wrap at 16 bits; 32-bit (Advanced) flows use the natural successor. */
+static inline uint32_t rist_seq_next(uint32_t last, bool short_seq)
+{
+	uint32_t next = last + 1;
+	return short_seq ? (next & UINT16_MAX) : next;
+}
+
+// These control the memory footprint and buffer capacity of the lib
 // They MUST be a power of two or wrap-around index calculations will break
+// RIST_SERVER_QUEUE_BUFFERS is the DEFAULT Advanced-profile recovery-ring
+// capacity (in packets), == UINT16_SIZE << RIST_RECOVERY_DEPTH_DEFAULT (8x).
+// The ring is heap-allocated per flow/sender and can be resized at runtime to
+// UINT16_SIZE << depth via rist_recovery_depth_set() / ?recovery-depth=, up to
+// RIST_RECOVERY_QUEUE_MAX (depth 16, the full 32-bit space). Large depths are
+// limited by available RAM. Simple/Main are always UINT16_SIZE.
 #define RIST_SERVER_QUEUE_BUFFERS ((UINT16_SIZE) * 8)
+#define RIST_RECOVERY_QUEUE_MAX ((uint64_t)(UINT16_SIZE) << 16)
 #define RIST_RETRY_QUEUE_BUFFERS ((UINT16_SIZE) * 4)
 #define RIST_OOB_QUEUE_BUFFERS ((UINT16_SIZE) * 2)
 #define RIST_DATAOUT_QUEUE_BUFFERS (1024)
@@ -52,7 +85,32 @@ struct cJSON;
 /* nack requests are sent every time a data packet is received. */
 /* this timer will be triggered to ensure we output nacks even when there is no data coming in */
 #define RIST_MAX_JITTER (5) /* In milliseconds */
+
+/* Bounds on the output loop's wake interval when CBR pacing is on, trading CPU
+ * against spacing: residual burst is ceil(floor / datagram interval). The working
+ * floor tracks the measured interval and is clamped to these. */
+#define RIST_CBR_OUTPUT_MIN_US_DEFAULT (250)
+#define RIST_CBR_OUTPUT_MIN_US_FLOOR (20)
+/* Pacing gives way once a packet is this far past its release deadline, so it can
+ * never age a packet out of the recovery buffer. A floor: the working value has to
+ * cover a burst's drain time, which the output jitter ceiling bounds. */
+#define RIST_CBR_MAX_HOLD_US (1000)
+#define RIST_CBR_HOLD_JITTER_MULT (2)
+
+static inline uint32_t rist_cbr_hold_us(uint32_t max_output_jitter_ms)
+{
+	uint32_t hold = RIST_CBR_HOLD_JITTER_MULT * max_output_jitter_ms * 1000;
+	return hold > RIST_CBR_MAX_HOLD_US ? hold : RIST_CBR_MAX_HOLD_US;
+}
 #define RIST_PING_INTERVAL (100)  /* In milliseconds, how long to space ping requests */
+/* Missed RTCP/ping intervals before a bonded leg is pulled from the rotation
+ * (fast, reversible); kept well under the liveness timeout, the real teardown. */
+#define RIST_STALL_MUTE_PINGS (3)
+/* Floor for the per-peer liveness timeout, in missed RTCP/ping intervals. */
+#define RIST_LIVENESS_MIN_PINGS (4)
+/* How much better a sibling must measure before it takes the sole-carrier role
+ * from the incumbent, as a divisor of the incumbent's smoothed RTT. */
+#define RIST_SOLE_CARRIER_MARGIN (2)
 #define RIST_PBKDF2_HMAC_SHA256_ITERATIONS (1024)
 #define RIST_AES_KEY_REUSE_TIMES UINT32_MAX
 #define RIST_MAX_HOSTNAME (128)
@@ -110,6 +168,22 @@ struct rist_buffer {
 	bool free;
 	bool retry_queued;
 };
+
+/* Largest recovery depth whose ring (UINT16_SIZE << depth packets) is
+ * addressable as size_t: the two parallel index arrays cost
+ * sizeof(ptr) + sizeof(uint32_t) per slot. Depth 16 (2^32) only fits a 64-bit
+ * size_t; on a 32-bit size_t the exponent is reduced until it fits. Shared with
+ * the recovery-depth unit test. */
+static inline int rist_recovery_depth_platform_max(void)
+{
+	const uint64_t per = (uint64_t)sizeof(struct rist_buffer *) + sizeof(uint32_t);
+	const uint64_t limit = (uint64_t)SIZE_MAX / per;
+	int depth = RIST_RECOVERY_DEPTH_MAX;
+	while (depth > RIST_RECOVERY_DEPTH_MIN &&
+	       ((uint64_t)UINT16_SIZE << depth) > limit)
+		depth--;
+	return depth;
+}
 
 struct rist_missing_buffer {
 	uint32_t seq;
@@ -195,7 +269,7 @@ struct rist_flow {
 	atomic_int shutdown;
 	int max_output_jitter;
 
-	struct rist_buffer *receiver_queue[RIST_SERVER_QUEUE_BUFFERS]; /* output queue */
+	struct rist_buffer **receiver_queue; /* output queue, heap-allocated to receiver_queue_max */
 
 	pthread_rwlock_t queue_lock;
 
@@ -208,6 +282,21 @@ struct rist_flow {
 	atomic_ulong receiver_queue_output_idx;  /* next packet to output */
 	size_t receiver_queue_max;
 	bool flag_flow_buffer_start;
+
+	/* Constant-bitrate output pacing; see rist_pacer.h. cbr_arrived_bytes is
+	 * written by the receive threads and drained by the output thread: the
+	 * estimate must come from arrivals, since measuring the paced output would
+	 * make the rate an output of itself. */
+	bool cbr_output;
+	uint32_t cbr_output_min_us;
+	atomic_uint_least64_t cbr_arrived_bytes;
+	uint64_t cbr_arrived_seen;
+	struct rist_pacer_rate cbr_rate;
+	struct rist_pacer cbr_pacer;
+	uint64_t cbr_overdue_releases;   /* pacer yielded to the buffer deadline */
+	uint32_t cbr_max_hold_us;        /* longest a paced packet may wait */
+	bool cbr_paced_hold;             /* last output pass stopped on the pacer */
+	uint64_t cbr_interval_ns;        /* last paced interval, sizes the wake floor */
 
 	/* Missing incoming packets, waiting for retransmission */
 	struct rist_missing_buffer *missing;
@@ -241,6 +330,9 @@ struct rist_flow {
 	uint64_t last_output_time;
 	uint64_t max_source_time;
 	uint64_t too_late_ctr;
+	/* When we started holding off a re-anchor for want of a current packet.
+	 * Zero while not holding off. */
+	uint64_t reanchor_wait_since;
 
 	size_t offset_recalc_sample_count;
 	uint64_t offset_recalc_samples[2048];
@@ -309,9 +401,20 @@ struct rist_common_ctx {
 
 	/* Timers */
 	int rist_max_jitter;
+	/* CBR output pacing, per context: a flow's legs share one output, so this is
+	 * not a per-peer property. */
+	bool cbr_output;
+	bool cbr_output_set;   /* a value was stated; later conflicts refused */
+	uint32_t cbr_output_min_us;
 
 	/* Recovery buffer RTT multiplier (default 7, per RIST spec) */
 	int recovery_rtt_multiplier;
+
+	/* Advanced-profile recovery-ring capacity in packets (power of two).
+	 * Default RIST_SERVER_QUEUE_BUFFERS; tunable before rist_start() via
+	 * rist_recovery_depth_set(). Simple/Main ignore this and use
+	 * UINT16_SIZE. */
+	size_t recovery_queue_max;
 
 	/* Peer list sync - RW locks */
 	struct rist_peer *PEERS;
@@ -335,6 +438,10 @@ struct rist_common_ctx {
 	uint64_t stats_report_time;
 
 	enum rist_profile profile;
+	/* Set by rist_*_start() and by rist_peer_create() once a peer with
+	 * a definite profile has been inserted.  When set, rist_peer_create
+	 * refuses any peer whose ?profile= disagrees with cctx->profile. */
+	atomic_bool profile_locked;
 	uint8_t cname[RIST_MAX_HOSTNAME];
 
 	/* seq variables */
@@ -367,10 +474,18 @@ struct rist_common_ctx {
 	pthread_mutex_t stats_lock;
 
 	pthread_rwlock_t oob_queue_lock;
-	struct rist_buffer *oob_queue[RIST_OOB_QUEUE_BUFFERS]; /* oob queue */
+	struct rist_buffer *oob_queue[RIST_OOB_QUEUE_BUFFERS]; /* oob transmit queue */
 	size_t oob_queue_bytesize;
 	uint16_t oob_queue_read_index;
 	uint16_t oob_queue_write_index;
+
+	/* oob receive fifo: populated by the protocol thread when oob is
+	 * enabled but no callback is set, drained by rist_oob_read(). */
+	struct rist_buffer *oob_rx_queue[RIST_OOB_QUEUE_BUFFERS];
+	uint16_t oob_rx_queue_read_index;
+	uint16_t oob_rx_queue_write_index;
+	struct rist_buffer *oob_rx_current; /* backs the block handed out by the last rist_oob_read */
+	struct rist_oob_block oob_rx_block; /* borrowed view returned to the caller */
 
 	bool debug;
 	uint32_t birthtime_rtp_offset;
@@ -455,7 +570,7 @@ struct rist_sender {
 
 	bool sender_initialized;
 	uint32_t total_weight;
-	struct rist_buffer *sender_queue[RIST_SERVER_QUEUE_BUFFERS]; /* input queue */
+	struct rist_buffer **sender_queue; /* input queue, heap-allocated to sender_queue_max */
 	size_t sender_queue_bytesize;
 	size_t sender_queue_size;
 	size_t sender_queue_timelength;
@@ -480,9 +595,16 @@ struct rist_sender {
 	uint64_t cooldown_time;
 	int cooldown_mode;
 
-	/* Recovery — sized to RIST_SERVER_QUEUE_BUFFERS so Advanced Profile
+	/* Recovery - heap-allocated to sender_queue_max so Advanced Profile
 	 * can index with the full 32-bit seq space (seq & (queue_max - 1)). */
-	uint32_t seq_index[RIST_SERVER_QUEUE_BUFFERS];
+	uint32_t *seq_index;
+	/* Parallel 16-bit-RTP index (65536 entries), allocated only for an
+	 * Advanced-context sender. A peer that negotiated down to Main NACKs in
+	 * the 16-bit RTP sequence domain (nack_seq_msb = 0), which never matches
+	 * the 32-bit advanced seq_index; this lets the Advanced sender still find
+	 * and retransmit the requested packet for that peer. NULL on Main/Simple
+	 * senders (their primary seq_index is already the 16-bit domain). */
+	uint32_t *seq_rtp_index;
 	size_t sender_recover_min_time;
 	size_t sender_queue_buffer_size;
 
@@ -584,6 +706,32 @@ struct rist_peer {
 	/* RTT statistics */
 	uint64_t last_rtt;
 
+	/* Dynamic RTT-based muting (sender bonding, ?rtt-drop=). When muted the
+	 * leg is skipped in the weighted payload rotation but its connection and
+	 * RTCP probing continue so RTT keeps updating for the restore decision. */
+	bool rtt_muted;
+	struct rist_rtt_mute_state rtt_mute_state;
+	uint32_t rtt_trickle_counter; /* 1-in-N counter for redundant trickle sends */
+	uint32_t rtt_mute_count; /* cumulative count of RTT-triggered mute events */
+	/* Elected to keep carrying while every leg wants mute. Sticky: held until
+	 * the leg recovers or a sibling is clearly better, so the payload path
+	 * does not ping-pong between two equally bad legs. */
+	bool rtt_sole_carrier;
+	uint64_t rtt_sole_since;
+	/* Start of the post-restore weight ramp. A leg that was muted for high RTT
+	 * has an empty queue, so it measures well until it is loaded again;
+	 * rejoining at full share re-floods it. Zero when no ramp is in progress. */
+	uint64_t rtt_ramp_start;
+
+	/* Last time this peer was warned that its payload rate leaves no
+	 * retransmission budget under its bandwidth ceiling; 0 if never. */
+	uint64_t bandwidth_warn_ts;
+
+	/* Briefly-silent bonded leg: skipped in the payload rotation but kept
+	 * authenticated, so it resumes without re-auth if it returns before the
+	 * liveness timeout (rist_sender_stall_check / rist_peer_liveness_timeout). */
+	bool stalled;
+
 	/* Missing queue max size */
 	uint32_t missing_counter_max;
 
@@ -603,6 +751,7 @@ struct rist_peer {
 	/* Advanced Profile (TR-06-3) peer state */
 	bool is_advanced;              /* Peer operating in Advanced Profile mode */
 	bool remote_supports_advanced; /* Remote advertised I=1 in keep-alive */
+	struct rist_adv_ts_state rx_adv_ts; /* receive-side 1 MHz source-clock rebuild */
 
 	/* compression flag (sender only) */
 	bool compression;
@@ -654,6 +803,9 @@ struct rist_peer {
 	int dead;
 	int timed_out;
 	uint64_t dead_since;
+	/* Caller-side socket rebind bookkeeping. */
+	uint64_t last_rebind_time;
+	uint32_t rebind_attempts;
 	uint64_t birthtime_peer;
 	uint64_t birthtime_local;
 
@@ -741,7 +893,10 @@ RIST_PRIV struct rist_peer *rist_sender_peer_insert_local(struct rist_sender *ct
 														  const struct rist_peer_config *config, bool b_rtcp);
 RIST_PRIV void rist_fsm_init_comm(struct rist_peer *peer);
 RIST_PRIV int rist_oob_enqueue(struct rist_common_ctx *ctx, struct rist_peer *peer, const void *buf, size_t len);
+
+RIST_PRIV int rist_oob_dequeue_rx(struct rist_common_ctx *ctx, const struct rist_oob_block **oob_block);
 RIST_PRIV int init_common_ctx(struct rist_common_ctx *ctx, enum rist_profile profile);
+RIST_PRIV void init_advanced_state(struct rist_common_ctx *ctx);
 RIST_PRIV int rist_peer_remove(struct rist_common_ctx *ctx, struct rist_peer *peer, struct rist_peer **next);
 RIST_PRIV int rist_auth_handler(struct rist_common_ctx *ctx,
 								int (*conn_cb)(void *arg, const char *connecting_ip, uint16_t connecting_port, const char *local_ip, uint16_t local_port, struct rist_peer *peer),
@@ -751,6 +906,21 @@ RIST_PRIV void sender_peer_append(struct rist_sender *ctx, struct rist_peer *pee
 
 /* Get common context */
 RIST_PRIV struct rist_common_ctx *get_cctx(struct rist_peer *peer);
+
+/* Fold a fresh RTT measurement into the peer's 8-tap smoothed average. RTT is
+ * measured on whichever peer object receives the response, so mirror it onto
+ * the data leg: that is where the balancer and the stats read it from. */
+static inline void rist_peer_rtt_update(struct rist_peer *peer, uint64_t rtt)
+{
+	peer->last_rtt = rtt;
+	peer->eight_times_rtt -= peer->eight_times_rtt / 8;
+	peer->eight_times_rtt += peer->last_rtt;
+	if (peer->peer_data && peer->peer_data != peer)
+	{
+		peer->peer_data->last_rtt = peer->last_rtt;
+		peer->peer_data->eight_times_rtt = peer->eight_times_rtt;
+	}
+}
 
 /*static inline in header file */
 static inline void peer_append(struct rist_peer *p)

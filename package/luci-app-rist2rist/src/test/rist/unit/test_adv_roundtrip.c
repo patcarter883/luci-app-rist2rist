@@ -10,6 +10,7 @@
  */
 
 #include "proto/adv.h"
+#include "proto/rist_time.h"
 #include <lz4.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -301,46 +302,43 @@ static int test_malformed_packets(void)
 	return 0;
 }
 
-/* NTP ticks (1/65536 second) to 1 MHz timestamp conversion.
- * Send path:  ts_1mhz = (uint32_t)((source_time * 1000000ULL) >> 16)
- * Recv path:  source_time = ((uint64_t)ts_1mhz << 16) / 1000000ULL
- * The round-trip must preserve the value within rounding tolerance. */
+/* NTP (1 s = 2^32, per timestampNTP_u64) to the Advanced Profile's 1 MHz RTP
+ * timestamp (TR-06-3 Section 5.2.1), exercising the production conversion in
+ * timestampRTP_u32(1, .). The 32-bit 1 MHz counter wraps at ~4295 s, so the
+ * test values stay within the non-wrapping range. */
 static int test_timestamp_conversion(void)
 {
-	/* 1MHz timestamp is uint32 — wraps at ~4295 seconds.
-	 * Test values must stay within the non-wrapping range. */
 	uint64_t test_values[] = {
 		0,
-		65536,                  /* exactly 1 second */
-		65536 * 10,             /* 10 seconds */
-		65536 * 3600,           /* 1 hour */
-		1,                      /* smallest non-zero */
-		32768,                  /* 0.5 seconds */
-		(uint64_t)65536 * 4294, /* ~4294s, just under uint32 wrap */
+		1ULL << 32,             /* exactly 1 second */
+		(uint64_t)10 << 32,     /* 10 seconds */
+		(uint64_t)3600 << 32,   /* 1 hour */
+		1ULL << 31,             /* 0.5 seconds */
+		(uint64_t)4294 << 32,   /* ~4294 s, just under the uint32 wrap */
 	};
+
+	/* Sub-1-MHz-tick NTP resolution is lost on the round-trip; one 1 MHz tick
+	 * is 2^32/1e6 ~= 4295 NTP units, so allow up to two ticks of slack. */
+	uint64_t tol = (2ULL << 32) / RIST_ADV_CLOCK_HZ;
 
 	for (size_t i = 0; i < sizeof(test_values) / sizeof(test_values[0]); i++) {
 		uint64_t ntp_orig = test_values[i];
-		uint32_t ts_1mhz = (uint32_t)((ntp_orig * 1000000ULL) >> 16);
-		uint64_t ntp_back = ((uint64_t)ts_1mhz << 16) / 1000000ULL;
+		uint32_t ts_1mhz = timestampRTP_u32(1, ntp_orig);
+		uint64_t ntp_back = ((uint64_t)ts_1mhz << 32) / RIST_ADV_CLOCK_HZ;
 
-		/* Allow up to 1 NTP tick of rounding error per conversion direction */
 		int64_t diff = (int64_t)ntp_orig - (int64_t)ntp_back;
 		if (diff < 0) diff = -diff;
-		char msg[128];
+		char msg[160];
 		snprintf(msg, sizeof(msg), "ts round-trip ntp=%" PRIu64 " -> 1mhz=%u -> ntp=%" PRIu64 " (diff=%" PRId64 ")",
 			ntp_orig, ts_1mhz, ntp_back, diff);
-		CHECK(diff <= 66, msg); /* 66 = ceil(65536/1000000)*1000000/65536 + 1 */
+		CHECK((uint64_t)diff <= tol, msg);
 	}
 
-	/* Verify known exact conversions */
-	uint64_t one_sec_ntp = 65536;
-	uint32_t one_sec_1mhz = (uint32_t)((one_sec_ntp * 1000000ULL) >> 16);
-	CHECK(one_sec_1mhz == 1000000, "1 second NTP -> 1000000 us");
-
-	uint64_t half_sec_ntp = 32768;
-	uint32_t half_sec_1mhz = (uint32_t)((half_sec_ntp * 1000000ULL) >> 16);
-	CHECK(half_sec_1mhz == 500000, "0.5 second NTP -> 500000 us");
+	/* Exact conversions at the 1 MHz clock: whole and half seconds map to
+	 * their microsecond counts, and zero maps to zero. */
+	CHECK(timestampRTP_u32(1, 1ULL << 32) == 1000000, "1 second NTP -> 1000000 us");
+	CHECK(timestampRTP_u32(1, 1ULL << 31) == 500000, "0.5 second NTP -> 500000 us");
+	CHECK(timestampRTP_u32(1, 0) == 0, "0 NTP -> 0 us");
 
 	return 0;
 }

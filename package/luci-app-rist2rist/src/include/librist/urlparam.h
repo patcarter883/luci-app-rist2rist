@@ -21,6 +21,7 @@
 #define RIST_URL_PARAM_CNAME "cname"
 #define RIST_URL_PARAM_VIRT_DST_PORT "virt-dst-port"
 #define RIST_URL_PARAM_WEIGHT "weight"
+#define RIST_URL_PARAM_RECOVERY_PRIORITY "recovery-priority"
 #define RIST_URL_PARAM_MIFACE "miface"
 #define RIST_URL_PARAM_MCAST_TTL "ttl"
 #define RIST_URL_PARAM_MCAST_SOURCE "source"
@@ -28,7 +29,7 @@
 #define RIST_URL_PARAM_KEEPALIVE_INT "keepalive-interval"
 #define RIST_URL_PARAM_SRP_USERNAME "username"
 #define RIST_URL_PARAM_SRP_PASSWORD "password"
-#define RIST_URL_PARAM_SRP_COMPAT "srp-compat"  //"legacy" or "1" => pre-0.2.16 SRP wire format
+#define RIST_URL_PARAM_SRP_COMPAT "srp-compat"  //0|1 (1 => pre-0.2.16 SRP wire format)
 /* Less common URL parameters */
 #define RIST_URL_PARAM_BUFFER_SIZE_MIN "buffer-min"
 #define RIST_URL_PARAM_BUFFER_SIZE_MAX "buffer-max"
@@ -55,5 +56,12 @@
 #define RIST_URL_PARAM_RTT_MULTIPLIER "rtt-multiplier"
 #define RIST_URL_PARAM_REFLECTOR "reflector"
 #define RIST_URL_PARAM_LOCAL_PORT "local-port"
+#define RIST_URL_PARAM_RECOVERY_DEPTH "recovery-depth"  //0..16, ring = 65536<<depth packets, default 3 (Advanced profile)
+#define RIST_URL_PARAM_CBR_OUTPUT "cbr-output"  //0|1, on a udp/rtp output url: space receiver output at the stream's measured rate (assumes CBR)
+/* Dynamic RTT-based bonded-leg muting (sender) */
+#define RIST_URL_PARAM_RTT_DROP "rtt-drop"            //smoothed-RTT ceiling in ms; 0 = disabled
+#define RIST_URL_PARAM_RTT_RESTORE "rtt-restore"      //restore low-water in ms; 0 = derive from rtt-drop
+#define RIST_URL_PARAM_RTT_DROP_SETTLE "rtt-drop-settle" //dwell in ms before drop/restore
+#define RIST_URL_PARAM_RTT_DROP_TRICKLE "rtt-drop-trickle" //1-in-N duplicate rate on a muted leg; 0 = hard mute
 
 #endif /* LIBRIST_URL_PARAM_H */

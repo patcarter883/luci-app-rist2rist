@@ -15,6 +15,13 @@
 static struct rist_logging_settings *logging_settings = NULL;
 static atomic_int failed;
 
+/* Upper bounds only: the waits below poll for the actual condition and
+ * break as soon as it holds, so these caps just limit how long a slow or
+ * loaded host may take before giving up. */
+#define CONNECT_TIMEOUT_MS   30000
+#define PHASE_RX_TIMEOUT_MS  20000
+#define CONVERGE_TIMEOUT_MS  30000
+
 static int log_callback(void *arg, enum rist_log_level level, const char *msg) {
     (void)arg;
     if (level <= RIST_LOG_ERROR) {
@@ -142,7 +149,7 @@ int main(int argc, char *argv[]) {
         if (connected_peers < 2) {
             usleep(100000); // 100ms
         }
-        if (get_time_ms() - conn_start > 5000) { // 5 second connection timeout
+        if (get_time_ms() - conn_start > CONNECT_TIMEOUT_MS) {
             fprintf(stderr, "Timeout waiting for peers to connect! Connected peers: %d/2\n", connected_peers);
             atomic_store(&failed, 1);
             ret = 1;
@@ -211,7 +218,7 @@ int main(int argc, char *argv[]) {
                 rist_receiver_data_block_free2((struct rist_data_block **const)&b);
             }
         }
-        if (get_time_ms() - start_time > 8000) { /* 8 second timeout */
+        if (get_time_ms() - start_time > PHASE_RX_TIMEOUT_MS) {
             /* If we have received the vast majority of packets (e.g. > 80), we consider it a pass
              * since initial stream synchronization packet drops are a normal protocol characteristic. */
             if (sub_packets_received > 80 && ref_packets_received > 80) {
@@ -315,7 +322,7 @@ int main(int argc, char *argv[]) {
                 rist_receiver_data_block_free2((struct rist_data_block **const)&b);
             }
         }
-        if (get_time_ms() - start_time > 8000) { /* 8 second timeout for recovery */
+        if (get_time_ms() - start_time > PHASE_RX_TIMEOUT_MS) {
             /* If we have received the vast majority of packets (e.g. > 160), we consider it a pass
              * to avoid failing the test suite due to statistical packet loss fluctuations. */
             if (sub_packets_received > 160 && ref_packets_received > 160) {
@@ -343,15 +350,12 @@ int main(int argc, char *argv[]) {
     /* RIST_CLOCK = 4294967 NTP ticks per millisecond */
     const uint64_t RIST_CLK = 4294967ULL;
 
-    /* Step 3a: Wait 5s for natural RTCP echo exchanges and buffer negotiations to converge
-     * the EWMA RTTs and dynamically scale jitter buffers down from the initial maximums. */
+    /* Wait for convergence by polling the actual state: echo EWMA RTTs
+     * non-zero and both jitter buffers scaled down out of their initial
+     * maximum, bounded by CONVERGE_TIMEOUT_MS. */
     struct rist_common_ctx *pub_cctx = rist_struct_get_common(pub_ctx);
     struct rist_common_ctx *sub_cctx = rist_struct_get_common(sub_ctx);
 
-    fprintf(stdout, "Waiting 5s for natural RTT convergence...\n");
-    usleep(5000000); /* 5s */
-
-    /* Step 3b: Read publisher, subscriber, and reflector buffer and RTT states */
     uint64_t final_pub_eight_times_rtt  = 0;
     uint64_t final_sub_eight_times_rtt  = 0;
     uint64_t final_ref_eight_times_rtt  = 0;
@@ -359,49 +363,68 @@ int main(int argc, char *argv[]) {
     uint64_t sub_sender_max_buf_ticks   = 0;
     uint64_t ref_pub_recovery_buf_ticks   = 0;
     uint64_t ref_pub_sender_max_buf_ticks = 0;
+    const uint64_t initial_buf_ms = 775ULL;
 
-    pthread_mutex_lock(&pub_cctx->peerlist_lock);
-    {
-        struct rist_peer *pp = pub_cctx->PEERS;
-        while (pp) {
+    fprintf(stdout, "Waiting (up to %d ms) for natural RTT convergence and buffer scaling...\n",
+            CONVERGE_TIMEOUT_MS);
+    uint64_t converge_start = get_time_ms();
+    while (1) {
+        final_pub_eight_times_rtt = 0;
+        final_sub_eight_times_rtt = 0;
+        final_ref_eight_times_rtt = 0;
+        sub_recovery_buf_ticks = 0;
+        sub_sender_max_buf_ticks = 0;
+        ref_pub_recovery_buf_ticks = 0;
+        ref_pub_sender_max_buf_ticks = 0;
+
+        pthread_mutex_lock(&pub_cctx->peerlist_lock);
+        for (struct rist_peer *pp = pub_cctx->PEERS; pp; pp = pp->next) {
             if (!pp->dead && pp->authenticated) {
                 final_pub_eight_times_rtt = pp->eight_times_rtt;
                 break;
             }
-            pp = pp->next;
         }
-    }
-    pthread_mutex_unlock(&pub_cctx->peerlist_lock);
+        pthread_mutex_unlock(&pub_cctx->peerlist_lock);
 
-    pthread_mutex_lock(&sub_cctx->peerlist_lock);
-    {
-        struct rist_peer *sp = sub_cctx->PEERS;
-        while (sp) {
+        pthread_mutex_lock(&sub_cctx->peerlist_lock);
+        for (struct rist_peer *sp = sub_cctx->PEERS; sp; sp = sp->next) {
             if (!sp->dead && sp->authenticated) {
                 final_sub_eight_times_rtt  = sp->eight_times_rtt;
                 sub_recovery_buf_ticks     = sp->recovery_buffer_ticks;
                 sub_sender_max_buf_ticks   = sp->sender_max_buffer_ticks;
                 break;
             }
-            sp = sp->next;
         }
-    }
-    pthread_mutex_unlock(&sub_cctx->peerlist_lock);
+        pthread_mutex_unlock(&sub_cctx->peerlist_lock);
 
-    pthread_mutex_lock(&cctx->peerlist_lock);
-    {
-        struct rist_peer *rp = cctx->PEERS;
-        while (rp) {
+        pthread_mutex_lock(&cctx->peerlist_lock);
+        for (struct rist_peer *rp = cctx->PEERS; rp; rp = rp->next) {
             if (!rp->dead && rp->parent && rp->authenticated && rp->is_reflector_publisher) {
                 final_ref_eight_times_rtt    = rp->eight_times_rtt;
                 ref_pub_recovery_buf_ticks   = rp->recovery_buffer_ticks;
                 ref_pub_sender_max_buf_ticks = rp->sender_max_buffer_ticks;
                 break;
             }
-            rp = rp->next;
         }
+        pthread_mutex_unlock(&cctx->peerlist_lock);
+
+        uint64_t s_buf = sub_recovery_buf_ticks / RIST_CLK;
+        uint64_t r_buf = ref_pub_recovery_buf_ticks / RIST_CLK;
+        bool rtt_ready = final_pub_eight_times_rtt && final_sub_eight_times_rtt &&
+                         final_ref_eight_times_rtt;
+        /* [50, initial) satisfies both the "shrank" and the [50..800] range
+         * assertions below (initial_buf_ms < 800). */
+        bool sub_ready = s_buf >= 50ULL && s_buf < initial_buf_ms;
+        bool ref_ready = r_buf >= 50ULL && r_buf < initial_buf_ms;
+        if (rtt_ready && sub_ready && ref_ready)
+            break;
+        if (get_time_ms() - converge_start > CONVERGE_TIMEOUT_MS) {
+            fprintf(stderr, "WARN: RTT/buffer convergence not fully reached within %d ms; "
+                            "asserting on last-read values.\n", CONVERGE_TIMEOUT_MS);
+            break;
+        }
+        usleep(250000); /* 250ms */
     }
-    pthread_mutex_unlock(&cctx->peerlist_lock);
 
     uint64_t pub_measured_rtt_ms = final_pub_eight_times_rtt / 8 / RIST_CLK;
     uint64_t sub_measured_rtt_ms = final_sub_eight_times_rtt / 8 / RIST_CLK;
@@ -439,7 +462,6 @@ int main(int argc, char *argv[]) {
     }
 
     /* Verify Subscriber buffer dynamic sizing and shrinkage */
-    const uint64_t initial_buf_ms = 775ULL;
     if (sub_buf_ms >= initial_buf_ms) {
         fprintf(stderr, "FAIL: Subscriber buffer (%" PRIu64 "ms) did not shrink from initial (%" PRIu64 "ms)!\n", sub_buf_ms, initial_buf_ms);
         atomic_store(&failed, 1);

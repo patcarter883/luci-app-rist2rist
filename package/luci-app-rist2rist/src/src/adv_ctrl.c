@@ -97,7 +97,7 @@ int rist_adv_send_nack_bitmask(struct rist_peer *peer,
 	ctrl[off++] = blp & 0xFF;
 
 	uint32_t seq = ctx->adv_seq_unprotected++;
-	uint32_t ts = (uint32_t)((timestampNTP_u64() * 1000000ULL) >> 16);
+	uint32_t ts = timestampRTP_u32(1, timestampNTP_u64());
 	uint32_t ssrc = rist_adv_ssrc_unprotected(ctx->adv_ssrc_base);
 
 	int total = rist_adv_build_control(pkt, seq, ts, ssrc, ctrl, off);
@@ -151,7 +151,7 @@ int rist_adv_send_nack_range(struct rist_peer *peer,
 	ctrl[off++] = nalp & 0xFF;
 
 	uint32_t seq = ctx->adv_seq_unprotected++;
-	uint32_t ts = (uint32_t)((timestampNTP_u64() * 1000000ULL) >> 16);
+	uint32_t ts = timestampRTP_u32(1, timestampNTP_u64());
 	uint32_t ssrc = rist_adv_ssrc_unprotected(ctx->adv_ssrc_base);
 
 	int total = rist_adv_build_control(pkt, seq, ts, ssrc, ctrl, off);
@@ -213,7 +213,7 @@ int rist_adv_send_rtt_echo_request(struct rist_peer *peer)
 	ctrl[off++] = 0; ctrl[off++] = 0; ctrl[off++] = 0; ctrl[off++] = 0;
 
 	uint32_t seq = ctx->adv_seq_unprotected++;
-	uint32_t ts = (uint32_t)((ntp * 1000000ULL) >> 16);
+	uint32_t ts = timestampRTP_u32(1, ntp);
 
 	int total = rist_adv_build_control(pkt, seq, ts, req_ssrc, ctrl, off);
 	if (total < 0)
@@ -270,7 +270,7 @@ int rist_adv_send_rtt_echo_response(struct rist_peer *peer,
 
 	uint32_t seq = ctx->adv_seq_unprotected++;
 	uint64_t ntp = timestampNTP_u64();
-	uint32_t ts = (uint32_t)((ntp * 1000000ULL) >> 16);
+	uint32_t ts = timestampRTP_u32(1, ntp);
 	uint32_t ssrc = rist_adv_ssrc_unprotected(ctx->adv_ssrc_base);
 
 	int total = rist_adv_build_control(pkt, seq, ts, ssrc, ctrl, off);
@@ -334,7 +334,7 @@ int rist_adv_send_keepalive(struct rist_peer *peer)
 
 	uint32_t seq = ctx->adv_seq_unprotected++;
 	uint64_t ntp = timestampNTP_u64();
-	uint32_t ts = (uint32_t)((ntp * 1000000ULL) >> 16);
+	uint32_t ts = timestampRTP_u32(1, ntp);
 	uint32_t ssrc = rist_adv_ssrc_unprotected(ctx->adv_ssrc_base);
 
 	int total = rist_adv_build_control(pkt, seq, ts, ssrc, ctrl, off);
@@ -397,7 +397,7 @@ int rist_adv_send_unsupported(struct rist_peer *peer,
 
 	uint32_t seq = ctx->adv_seq_unprotected++;
 	uint64_t ntp = timestampNTP_u64();
-	uint32_t ts = (uint32_t)((ntp * 1000000ULL) >> 16);
+	uint32_t ts = timestampRTP_u32(1, ntp);
 
 	int total = rist_adv_build_control(pkt, seq, ts, resp_ssrc, ctrl, off);
 	if (total < 0)
@@ -431,7 +431,7 @@ int rist_adv_send_type8(struct rist_peer *peer,
 	struct rist_adv_params params;
 	memset(&params, 0, sizeof(params));
 	params.seq = ctx->adv_seq_unprotected++;
-	params.timestamp = (uint32_t)((timestampNTP_u64() * 1000000ULL) >> 16);
+	params.timestamp = timestampRTP_u32(1, timestampNTP_u64());
 	params.ssrc = rist_adv_ssrc_unprotected(ctx->adv_ssrc_base);
 	params.enc_type = RIST_ADV_TYPE_GRE_MAIN;
 	params.psk_mode = RIST_ADV_PSK_NONE;
@@ -488,7 +488,7 @@ int rist_adv_send_psk_nonce(struct rist_peer *peer,
 
 	uint32_t seq = ctx->adv_seq_unprotected++;
 	uint64_t ntp = timestampNTP_u64();
-	uint32_t ts = (uint32_t)((ntp * 1000000ULL) >> 16);
+	uint32_t ts = timestampRTP_u32(1, ntp);
 	uint32_t ssrc = rist_adv_ssrc_unprotected(ctx->adv_ssrc_base);
 
 	int total = rist_adv_build_control(pkt, seq, ts, ssrc, ctrl, off);
@@ -558,7 +558,7 @@ int rist_adv_send_flow_attr(struct rist_peer *peer)
 
 	uint32_t seq = ctx->adv_seq_unprotected++;
 	uint64_t ntp = timestampNTP_u64();
-	uint32_t ts = (uint32_t)((ntp * 1000000ULL) >> 16);
+	uint32_t ts = timestampRTP_u32(1, ntp);
 	uint32_t ssrc = rist_adv_ssrc_unprotected(ctx->adv_ssrc_base);
 
 	int total = rist_adv_build_control(pkt, seq, ts, ssrc, ctrl, off);
@@ -595,6 +595,24 @@ int rist_adv_recv_control(struct rist_peer *peer,
 		return -1;
 
 	const uint8_t *body = ctrl_payload + 4;
+
+	/* The Advanced control channel is cleartext by design (PSK=0 on all
+	 * control sends), so every handler here is pre-auth attack surface.
+	 * Mirror the Main-profile rule (rist_sender_recv_nack): state-changing
+	 * messages are honored only from peers that completed the (SDES or
+	 * EAP) handshake. Discovery/diagnostic traffic stays pre-auth. */
+	switch (ci) {
+	case RIST_ADV_CI_NACK_BITMASK:
+	case RIST_ADV_CI_NACK_RANGE:
+	case RIST_ADV_CI_RTT_ECHO_RESP:
+	case RIST_ADV_CI_FLOW_ATTR:
+	case RIST_ADV_CI_PSK_NONCE:
+		if (!peer->authenticated)
+			return 0;
+		break;
+	default:
+		break;
+	}
 
 	switch (ci) {
 	case RIST_ADV_CI_NACK_BITMASK: {
@@ -658,23 +676,23 @@ int rist_adv_recv_control(struct rist_peer *peer,
 		(void)req_ssrc;
 
 		uint64_t orig_ntp = ((uint64_t)orig_msw << 32) | orig_lsw;
-		uint64_t now = timestampNTP_u64();
-		uint64_t rtt_ntp = now - orig_ntp;
-		/* Convert NTP ticks to microseconds: rtt_us = rtt_ntp * 1e6 / 2^16 */
-		uint64_t rtt_us = (rtt_ntp * 1000000) >> 16;
-		rtt_us -= proc_delay;
-		peer->last_rtt = rtt_us;
+		rist_peer_rtt_update(peer,
+			calculate_rtt_delay(orig_ntp, timestampNTP_u64(), proc_delay));
 		rist_log_priv(ctx, RIST_LOG_DEBUG,
-			"Advanced RTT Echo Response: RTT=%"PRIu64" us\n", rtt_us);
+			"Advanced RTT Echo Response: RTT=%"PRIu64" us\n",
+			(peer->last_rtt * 1000000ULL) >> 32);
 		return 0;
 	}
 
 	case RIST_ADV_CI_KEEPALIVE: {
 		if (body_len < 10)
 			return -1;
-		/* Parse capabilities to detect I bit */
+		/* Parse capabilities to detect I bit; set-only, so a crafted
+		 * keepalive can't downgrade a peer back to Main framing
+		 * mid-session (the Main keepalive path is set-only too). */
 		uint32_t caps = (uint32_t)body[6] << 24 | body[7] << 16 | body[8] << 8 | body[9];
-		peer->remote_supports_advanced = !!(caps & RIST_ADV_KEEPALIVE_CAP_I);
+		if (caps & RIST_ADV_KEEPALIVE_CAP_I)
+			peer->remote_supports_advanced = true;
 		peer->last_pkt_received = timestampNTP_u64();
 		rist_log_priv(ctx, RIST_LOG_DEBUG,
 			"Advanced Keep-Alive: caps=0x%08x (I=%d)\n",
@@ -708,6 +726,8 @@ int rist_adv_recv_control(struct rist_peer *peer,
 		uint8_t future_nonce[4];
 		memcpy(future_nonce, body, 4);
 		uint16_t key_bits = (uint16_t)((body[4] << 8) | body[5]);
+		if (key_bits != 0 && key_bits != 128 && key_bits != 192 && key_bits != 256)
+			return -1;
 
 		bool odd = CHECK_BIT(future_nonce[0], 7);
 		struct rist_key *ak = odd ? &peer->key_rx_odd : &peer->key_rx;

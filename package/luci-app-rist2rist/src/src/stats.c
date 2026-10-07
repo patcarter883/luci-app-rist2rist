@@ -15,12 +15,25 @@
 #include "cjson/cJSON.h"
 
 /* Bump on any incompatible shape change to the stats JSON payloads. */
-#define RIST_STATS_JSON_SCHEMA_VERSION 3
+#define RIST_STATS_JSON_SCHEMA_VERSION 5
+
+/* How often to repeat the no-retransmission-budget warning. */
+#define RIST_BANDWIDTH_WARN_INTERVAL (30000ULL * RIST_CLOCK)
 
 static double round_two_digits(double number)
 {
 	long new_number = (long)(number * 100);
 	return (double)(new_number) / 100;
+}
+
+static const char *rist_profile_name(int profile)
+{
+	switch (profile) {
+	case RIST_PROFILE_SIMPLE:   return "simple";
+	case RIST_PROFILE_MAIN:     return "main";
+	case RIST_PROFILE_ADVANCED: return "advanced";
+	default:                    return "unknown";
+	}
 }
 
 void rist_sender_flow_statistics(struct rist_sender *ctx)
@@ -107,11 +120,32 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 
 	struct rist_common_ctx *cctx = get_cctx(peer);
 
+	if (peer->is_data
+	    && rist_retransmit_budget_starved(bitrate,
+					      (size_t)peer->config.recovery_maxbitrate * 1000)) {
+		uint64_t now = timestampNTP_u64();
+		if (rist_bandwidth_warn_due(peer->bandwidth_warn_ts,
+					    RIST_BANDWIDTH_WARN_INTERVAL, now)) {
+			peer->bandwidth_warn_ts = now;
+			rist_log_priv(cctx, RIST_LOG_WARN,
+				"Peer #%"PRIu32": no retransmission budget. Payload alone is %zu kbps "
+				"against a %u kbps bandwidth ceiling, and that ceiling covers payload "
+				"plus retransmissions, so every NACK is refused (%"PRIu32" this interval) "
+				"and lost packets are never recovered. Raise ?bandwidth= above the "
+				"payload rate, leaving headroom for recovery.\n",
+				peer->adv_peer_id, bitrate / 1000, peer->config.recovery_maxbitrate,
+				peer->stats_sender_instant.bandwidth_skip);
+		}
+	}
+
 	cJSON *peer_obj = cJSON_CreateObject();
 	cJSON_AddNumberToObject(peer_obj, "flow_id", peer->adv_flow_id);
 	cJSON_AddNumberToObject(peer_obj, "id", peer->adv_peer_id);
 	cJSON_AddStringToObject(peer_obj, "cname", peer->receiver_name);
 	cJSON_AddStringToObject(peer_obj, "type", peer->is_data ? "data" : "rtcp");
+	cJSON_AddNumberToObject(peer_obj, "profile", cctx->profile);
+	cJSON_AddStringToObject(peer_obj, "profile_name", rist_profile_name(cctx->profile));
+	cJSON_AddBoolToObject(peer_obj, "advanced_active", peer->is_advanced ? 1 : 0);
 	if (peer->miface[0])
 		cJSON_AddStringToObject(peer_obj, "miface", peer->miface);
 	cJSON *json_stats = cJSON_AddObjectToObject(peer_obj, "stats");
@@ -132,6 +166,8 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 	cJSON_AddNumberToObject(json_stats, "avg_rtt", (double)avg_rtt / RIST_CLOCK);
 	cJSON_AddNumberToObject(json_stats, "retry_buffer_size", (double)retry_buf_size);
 	cJSON_AddNumberToObject(json_stats, "cooldown_time", (double)time_left);
+	cJSON_AddBoolToObject(json_stats, "rtt_muted", peer->rtt_muted ? 1 : 0);
+	cJSON_AddNumberToObject(json_stats, "rtt_mute_events", (double)peer->rtt_mute_count);
 	cJSON *stats = cJSON_CreateObject();
 	cJSON_AddNumberToObject(stats, "schema_version", RIST_STATS_JSON_SCHEMA_VERSION);
 	cJSON *rist_sender_stats = cJSON_AddObjectToObject(stats, "sender-stats");
@@ -157,6 +193,10 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 	stats_container->stats.sender_peer.rtt = avg_rtt / RIST_CLOCK;
 	stats_container->stats.sender_peer.sent_bytes = peer->stats_sender_instant.sent_bytes;
 	stats_container->stats.sender_peer.retransmitted_bytes = peer->stats_sender_instant.retransmitted_bytes;
+	stats_container->stats.sender_peer.profile = (uint8_t)cctx->profile;
+	stats_container->stats.sender_peer.advanced_active = peer->is_advanced ? 1 : 0;
+	stats_container->stats.sender_peer.rtt_muted = peer->rtt_muted ? 1 : 0;
+	stats_container->stats.sender_peer.rtt_mute_events = peer->rtt_mute_count;
 
 	if (cctx->stats_callback != NULL)
 		cctx->stats_callback(cctx->stats_callback_argument, stats_container);
@@ -199,6 +239,11 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 	cJSON *flow_obj = cJSON_AddObjectToObject(stats_obj, "flowinstant");
 	cJSON_AddNumberToObject(flow_obj, "flow_id", flow->flow_id);
 	cJSON_AddNumberToObject(flow_obj, "dead",  flow->dead);
+	cJSON_AddNumberToObject(flow_obj, "profile", ctx->common.profile);
+	cJSON_AddStringToObject(flow_obj, "profile_name", rist_profile_name(ctx->common.profile));
+	cJSON_AddNumberToObject(flow_obj, "seq_bits", flow->short_seq ? 16 : 32);
+	cJSON_AddBoolToObject(flow_obj, "advanced_active",
+		(ctx->common.profile >= RIST_PROFILE_ADVANCED && !flow->short_seq) ? 1 : 0);
 	cJSON *json_stats = cJSON_AddObjectToObject(flow_obj, "stats");
 	cJSON *peers = cJSON_AddArrayToObject(flow_obj, "peers");
 	uint32_t flow_rtt = 0;
@@ -218,6 +263,13 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 		cJSON *peer_obj = cJSON_CreateObject();
 		cJSON_AddNumberToObject(peer_obj, "id", peer->adv_peer_id);
 		cJSON_AddNumberToObject(peer_obj, "dead", peer->dead);
+		/* Listener-mode children have url=NULL; the configured URL
+		 * lives on the parent peer. */
+		const char *peer_url_str = peer->url;
+		if ((peer_url_str == NULL || peer_url_str[0] == '\0') && peer->parent && peer->parent->url) {
+			peer_url_str = peer->parent->url;
+		}
+		cJSON_AddStringToObject(peer_obj, "url", peer_url_str ? peer_url_str : "");
 		cJSON *peer_stats = cJSON_AddObjectToObject(peer_obj, "stats");
 		cJSON_AddNumberToObject(peer_stats, "received_data", (double)peer->stats_receiver_instant.received);
 		cJSON_AddNumberToObject(peer_stats, "received_bytes", (double)peer->stats_receiver_instant.received_bytes);
@@ -365,6 +417,10 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 	stats_container->stats.receiver_flow.max_inter_packet_spacing = flow->stats_instant.max_ips;
 	stats_container->stats.receiver_flow.rtt = flow->peer_lst_len ? (flow_rtt / flow->peer_lst_len)/RIST_CLOCK : 0;
 	stats_container->stats.receiver_flow.avg_buffer_time = avg_buffer_duration;
+	stats_container->stats.receiver_flow.profile = (uint8_t)ctx->common.profile;
+	stats_container->stats.receiver_flow.seq_bits = flow->short_seq ? 16 : 32;
+	stats_container->stats.receiver_flow.advanced_active =
+		(ctx->common.profile >= RIST_PROFILE_ADVANCED && !flow->short_seq) ? 1 : 0;
 
 	/* CALLBACK CALL */
 	if (ctx->common.stats_callback != NULL)

@@ -10,15 +10,20 @@
 #include <stdio.h>
 #ifdef _WIN32
 #if HAVE_PTHREADS
-int pthread_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, uint32_t ms)
+int pthread_cond_timedwait_us(pthread_cond_t *cond, pthread_mutex_t *mutex, uint64_t us)
 {
 	timespec_t ts;
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
-	uint64_t odd = (tv.tv_usec + (ms * 1000)) * 1000;
-	ts.tv_sec = tv.tv_sec + odd / 1000000000ULL;
-	ts.tv_nsec = odd % 1000000000ULL;
+	uint64_t odd = ((uint64_t)tv.tv_usec + us) * 1000;
+	ts.tv_sec = tv.tv_sec + (long)(odd / 1000000000ULL);
+	ts.tv_nsec = (long)(odd % 1000000000ULL);
 	return pthread_cond_timedwait(cond, mutex, (const struct timespec *)&ts);
+}
+
+int pthread_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, uint32_t ms)
+{
+	return pthread_cond_timedwait_us(cond, mutex, (uint64_t)ms * 1000);
 }
 #else
 #include <errno.h>
@@ -187,6 +192,13 @@ int pthread_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, uint
 	return 0;
 }
 
+/* SleepConditionVariableCS cannot express sub-millisecond waits, so round up:
+ * coarser than asked for, never shorter, and never a zero wait. */
+int pthread_cond_timedwait_us(pthread_cond_t *cond, pthread_mutex_t *mutex, uint64_t us)
+{
+	return pthread_cond_timedwait_ms(cond, mutex, (uint32_t)((us + 999) / 1000));
+}
+
 int pthread_cond_signal(pthread_cond_t *cond)
 {
 	if (cond == NULL) {
@@ -346,15 +358,20 @@ int sem_post(sem_t *sem)
 
 // This is not part of the POSIX API
 // Convience function around pthread
-int pthread_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, uint32_t ms)
+int pthread_cond_timedwait_us(pthread_cond_t *cond, pthread_mutex_t *mutex, uint64_t us)
 {
 	timespec_t ts;
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
-	uint64_t odd =  (tv.tv_usec + (ms * 1000)) * 1000;
-	ts.tv_sec = tv.tv_sec + odd / 1000000000ULL;
-	ts.tv_nsec = odd % 1000000000ULL;
+	uint64_t odd = ((uint64_t)tv.tv_usec + us) * 1000;
+	ts.tv_sec = tv.tv_sec + (time_t)(odd / 1000000000ULL);
+	ts.tv_nsec = (long)(odd % 1000000000ULL);
 	return pthread_cond_timedwait(cond, mutex, (const struct timespec*)&ts);
+}
+
+int pthread_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, uint32_t ms)
+{
+	return pthread_cond_timedwait_us(cond, mutex, (uint64_t)ms * 1000);
 }
 
 #endif

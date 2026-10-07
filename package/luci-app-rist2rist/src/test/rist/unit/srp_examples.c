@@ -437,7 +437,7 @@ static void test_srp_correct_hashing_client_verify_M2(void **state) {
 
 /* Fresh authenticator+client pair using only the public SRP API.  These
  * tests do not depend on the deterministic fixture above (a/b are random
- * each run) and exercise the srp-compat=legacy plumbing end-to-end.
+ * each run) and exercise the srp-compat=1 plumbing end-to-end.
  *
  * Four exchanges on the 2048-bit NG_DEFAULT group:
  *   1. Both PAD (default)               → handshake succeeds (verify_m1 == 0)
@@ -445,7 +445,7 @@ static void test_srp_correct_hashing_client_verify_M2(void **state) {
  *   3. Authenticator PAD, client LEGACY → handshake fails (verify_m1 != 0)
  *   4. Authenticator LEGACY, client PAD → handshake fails (verify_m1 != 0)
  *
- * Cases 3 and 4 are the "operator forgot to set srp-compat on one side"
+ * Cases 3 and 4 are the "operator forgot to set srp-compat=1 on one side"
  * scenarios.  They MUST fail at M1 (otherwise the legacy-bypass would be
  * leaking through), but we do not attempt to detect the cross-mode case
  * cryptographically — that is impossible without changing the wire

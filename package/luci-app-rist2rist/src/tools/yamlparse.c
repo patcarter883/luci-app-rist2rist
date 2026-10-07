@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <string.h>
 #include "headers.h"
+#include <librist/peer.h>
 #include "logging.h"
 
 #ifndef strndup
@@ -69,11 +70,11 @@ yaml_node *parse_yaml_value(char *str, size_t *index, size_t *max) {
 		node->key = strndup(str + *index + start_pos, cr_pos - 1);
 		//printf("Key =%s=\n", node->key);
 	}
-	else if (space_pos < cr_pos && str[*index + start_pos + space_pos - 1] == ':') // Key Value pairs
+	else if (space_pos > 0 && space_pos < cr_pos && str[*index + start_pos + space_pos - 1] == ':') // Key Value pairs
 	{
 		node->key = strndup(str + *index + start_pos, space_pos - 1);
-		// Remove any additional spaces before the value
-		while (isspace(str[*index + start_pos + space_pos])) (space_pos)++;
+		// Remove any additional spaces before the value (bounded at end of line)
+		while (space_pos < cr_pos && isspace(str[*index + start_pos + space_pos])) (space_pos)++;
 		node->value = strndup(str + *index + start_pos + space_pos, cr_pos - space_pos);
 		//printf("Key =%s= Value =%s=\n", node->key, node->value);
 	}
@@ -81,7 +82,7 @@ yaml_node *parse_yaml_value(char *str, size_t *index, size_t *max) {
 	{
 		// If this is a list, remove the dash and space from it
 		size_t skip_chars = 0;
-		if (str[*index + start_pos] == '-')
+		if (str[*index + start_pos] == '-' && cr_pos >= 2)
 			skip_chars = 2;
 		node->value = strndup(str + *index + start_pos + skip_chars, cr_pos - skip_chars);
 		//printf("value =%s=\n", node->value);
@@ -113,7 +114,11 @@ yaml_node *parse_yaml_string(char *yaml_str) {
 
 void print_yaml_node(yaml_node *node) {
     if (node->key && node->value) {
-        printf("%s: %s\n", node->key, node->value);
+        /* Never echo secrets into terminal/log output */
+        if (strcmp(node->key, "secret") == 0)
+            printf("%s: (redacted)\n", node->key);
+        else
+            printf("%s: %s\n", node->key, node->value);
     } else if (node->key) {
         printf("%s:\n", node->key);
     } else {
@@ -241,7 +246,7 @@ rist_tools_config_object *parse_yaml(char * file){
 
 	// Initialize rist_tools_config_object (non-zero values)
 	config = calloc(1, sizeof(rist_tools_config_object));
-	config->profile = RIST_PROFILE_MAIN;
+	config->profile = RIST_DEFAULT_PROFILE;
 	config->stats_interval = 1000;
 	config->verbose_level = RIST_LOG_INFO;
 #ifdef HAVE_PROMETHEUS_SUPPORT
@@ -254,20 +259,33 @@ rist_tools_config_object *parse_yaml(char * file){
 	fseek(f, 0, SEEK_END);
 	long fsize = ftell(f);
 	fseek(f, 0, SEEK_SET);  /* same as rewind(f); */
-	char *yaml_str = malloc(fsize + 1);
-	size_t read = fread(yaml_str, fsize, 1, f);
-	(void)read;
+	if (fsize < 0) {
+		fclose(f);
+		return config;
+	}
+	char *yaml_str = malloc((size_t)fsize + 1);
+	if (!yaml_str) {
+		fclose(f);
+		return config;
+	}
+	size_t got = fread(yaml_str, 1, (size_t)fsize, f);
+	yaml_str[got] = '\0';
     yaml_node *root = parse_yaml_string(yaml_str);
 	// print entire config file (debug)
-    print_yaml_node(root);
+    if (root)
+	    print_yaml_node(root);
 	// transfer the data to the config structure
-	parse_config_file(config, current_key, root);
+	if (root)
+		parse_config_file(config, current_key, root);
+	free(yaml_str);
 	fclose(f);
 	return config;
 }
 
 void cleanup_tools_config(rist_tools_config_object * config)
 {
+	if (!config)
+		return;
 	if (config->remote_log_address)
         free(config->remote_log_address);
 	if (config->secret)

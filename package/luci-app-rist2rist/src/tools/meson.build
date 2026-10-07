@@ -45,7 +45,7 @@ if compile_prometheus
 	tools_dependencies += prometheus_dep
 endif
 
-executable('ristsender',
+ristsender_exe = executable('ristsender',
 	['ristsender.c', 'yamlparse.c', 'oob_shared.c', srp_shared, tools_deps, rev_target],
 	dependencies: [
 		librist_dep,
@@ -57,7 +57,7 @@ executable('ristsender',
 	include_directories: inc,
 	install: should_install)
 
-executable('ristreceiver',
+ristreceiver_exe = executable('ristreceiver',
 	['ristreceiver.c', 'yamlparse.c', 'oob_shared.c', srp_shared, tools_deps, rev_target],
 	dependencies: [
 		librist_dep,

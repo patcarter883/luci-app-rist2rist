@@ -30,6 +30,9 @@
 # define PTHREAD_START_FUNC(fname,aname) void *fname(void *aname)
 typedef void *(*pthread_start_func_t)(void *aname);
 RIST_PRIV int pthread_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, uint32_t ms);
+/* Sub-millisecond variant. Rounded up to a millisecond on Windows builds
+ * without pthreads, where the underlying wait cannot express less. */
+RIST_PRIV int pthread_cond_timedwait_us(pthread_cond_t *cond, pthread_mutex_t *mutex, uint64_t us);
 #else
 typedef CRITICAL_SECTION pthread_mutex_t;
 typedef void pthread_mutexattr_t;
@@ -63,6 +66,8 @@ RIST_PRIV int pthread_cond_init(pthread_cond_t *cond, pthread_condattr_t *attr);
 RIST_PRIV int pthread_cond_destroy(pthread_cond_t *cond);
 RIST_PRIV int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex);
 RIST_PRIV int pthread_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, uint32_t reltime_ms);
+/* Sub-millisecond variant; see the note on the implementation. */
+RIST_PRIV int pthread_cond_timedwait_us(pthread_cond_t *cond, pthread_mutex_t *mutex, uint64_t us);
 
 RIST_PRIV int pthread_cond_signal(pthread_cond_t *cond);
 RIST_PRIV int pthread_cond_broadcast(pthread_cond_t *cond);
@@ -89,6 +94,9 @@ RIST_PRIV int sem_wait(sem_t *sem);
 # define PTHREAD_START_FUNC(fname,aname) void *fname(void *aname)
 typedef void *(*pthread_start_func_t)(void *aname);
 RIST_PRIV int pthread_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, uint32_t ms);
+/* Sub-millisecond variant. Rounded up to a millisecond on Windows builds
+ * without pthreads, where the underlying wait cannot express less. */
+RIST_PRIV int pthread_cond_timedwait_us(pthread_cond_t *cond, pthread_mutex_t *mutex, uint64_t us);
 #endif
 
 #endif /* __PTHREAD_SHIM_H */

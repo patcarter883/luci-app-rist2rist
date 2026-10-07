@@ -70,7 +70,9 @@ int oob_build_api_payload(uint16_t *buffer, char *sourceip, char *destip, char *
 	struct ipheader *ip = (struct ipheader *) buffer;
 	// unassigned protocol 252 used for API communication, api_id (54321 to identify this API message type)
 	populate_ip_header(ip, sourceip, destip, RIST_OOB_API_IP_IDENT_AUTH, RIST_OOB_API_IP_PROTOCOL);
-	memcpy(buffer + sizeof(struct ipheader), message, message_len);
+	/* buffer is uint16_t*: pointer math must be done in bytes, or the
+	 * message lands at 2x the header size and the receiver can't find it. */
+	memcpy((char *)buffer + sizeof(struct ipheader), message, message_len);
 	int total_len = sizeof(struct ipheader) + message_len;
 	ip->iph_len = htons(total_len);
 	// Calculate the checksum for integrity since there is no packet recovery
@@ -82,6 +84,15 @@ char *oob_process_api_message(int buffer_len, char *buffer, int *message_len)
 {
 	struct ipheader *ip = (struct ipheader *) buffer;
 	int header_size = sizeof(struct ipheader);
+
+	/* The header fields are read before any other check, so the datagram
+	 * must be at least a full header; otherwise the three checks below run
+	 * on out-of-bounds bytes and message_len can go negative (unbounded
+	 * %.*s read in the callers' log path). */
+	if (buffer_len < header_size) {
+		*message_len = RIST_OOB_ERROR_INVALID_LENGTH;
+		return NULL;
+	}
 
 	// Check reported length vs buffer length
 	if (htons(buffer_len) != ip->iph_len) {

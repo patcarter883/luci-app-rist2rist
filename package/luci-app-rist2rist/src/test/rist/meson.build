@@ -43,12 +43,242 @@ test_reflector = executable('test_reflector',
                                 stdatomic_dependency
                             ])
 
+# issue #188 coverage: listener-side cname re-association.  Three
+# modes (plaintext / psk / srp) exercise the SRP-only gate: only an
+# authenticated per-peer SRP session may migrate an existing peer
+# record onto a new source tuple.
+test_nat_port_rebind = executable('test_nat_port_rebind',
+                                  'test_nat_port_rebind.c',
+                                  extra_sources,
+                                  include_directories: inc,
+                                  link_with: librist,
+                                  dependencies: [
+                                      threads,
+                                      tools_dependencies,
+                                      stdatomic_dependency
+                                  ])
+
+# Security regression guard: a shared-PSK peer that forges the victim's
+# cname must NOT be absorbed into the victim's peer record (cname is not
+# a per-peer secret under PSK).
+test_psk_cname_hijack = executable('test_psk_cname_hijack',
+                                   'test_psk_cname_hijack.c',
+                                   extra_sources,
+                                   include_directories: inc,
+                                   link_with: librist,
+                                   dependencies: [
+                                       threads,
+                                       tools_dependencies,
+                                       stdatomic_dependency
+                                   ])
+
+# Multipath safety: two same-cname bonded paths must not be merged by
+# the cname re-association, and a healthy path must not rebind.
+test_multipath_cname = executable('test_multipath_cname',
+                                  'test_multipath_cname.c',
+                                  extra_sources,
+                                  include_directories: inc,
+                                  link_with: librist,
+                                  dependencies: [
+                                      threads,
+                                      tools_dependencies,
+                                      stdatomic_dependency
+                                  ])
+
+# Multipath safety: one bonded leg rebinds mid-stream while the other
+# stays alive; the survivor must be undisturbed and the stream must not
+# stall.
+test_multipath_leg_rebind = executable('test_multipath_leg_rebind',
+                                       'test_multipath_leg_rebind.c',
+                                       extra_sources,
+                                       include_directories: inc,
+                                       link_with: librist,
+                                       dependencies: [
+                                           threads,
+                                           tools_dependencies,
+                                           stdatomic_dependency
+                                       ])
+
+# Dynamic RTT-based bonded-leg muting (?rtt-drop=): a real two-leg bonded
+# sender must mute a leg whose RTT spikes over the ceiling, reroute payload to
+# the healthy leg, restore on recovery, and never black out the stream.
+test_rtt_mute_bonding = executable('test_rtt_mute_bonding',
+                                   'test_rtt_mute_bonding.c',
+                                   extra_sources,
+                                   include_directories: inc,
+                                   link_with: librist,
+                                   dependencies: [
+                                       threads,
+                                       tools_dependencies,
+                                       stdatomic_dependency
+                                   ])
+
+# issue #188 coverage: receiver-caller socket rebind on session
+# silence (plaintext + shared-PSK; SRP uses listener-side path).
+test_caller_socket_rebind = executable('test_caller_socket_rebind',
+                                       'test_caller_socket_rebind.c',
+                                       extra_sources,
+                                       include_directories: inc,
+                                       link_with: librist,
+                                       dependencies: [
+                                           threads,
+                                           tools_dependencies,
+                                           stdatomic_dependency
+                                       ])
+
+test_eap_authenticator_restart = executable('test_eap_authenticator_restart',
+                                       'test_eap_authenticator_restart.c',
+                                       extra_sources,
+                                       include_directories: inc,
+                                       link_with: librist,
+                                       dependencies: [
+                                           threads,
+                                           tools_dependencies,
+                                           stdatomic_dependency
+                                       ])
+
+
+test_oob_read = executable('test_oob_read',
+                           'test_oob_read.c',
+                           extra_sources,
+                           include_directories: inc,
+                           link_with: librist,
+                           dependencies: [
+                               threads,
+                               tools_dependencies,
+                               stdatomic_dependency
+                           ])
+
 
 ###Sender restart test (bug fix verification)
 test('Sender restart test', test_sender_restart, args: ['5'], suite: ['regression', 'sender'])
 
+###Out-of-band polling read (rist_oob_read) round-trip
+test('OOB polling read Main profile', test_oob_read,
+     args: ['1', 'rist://@127.0.0.1:8190', 'rist://127.0.0.1:8190'],
+     suite: ['regression', 'oob'], timeout: 60)
+test('OOB polling read Advanced profile', test_oob_read,
+     args: ['2', 'rist://@127.0.0.1:8192', 'rist://127.0.0.1:8192'],
+     suite: ['regression', 'oob'], timeout: 60)
+
+###issue #188 NAT source-port rebind recovery
+test('NAT port rebind cname re-association (plaintext gate refuses)', test_nat_port_rebind,
+     suite: ['regression', 'nat'], timeout: 90)
+test('NAT port rebind cname re-association (psk gate refuses)', test_nat_port_rebind,
+     args: ['psk'], suite: ['regression', 'nat'], timeout: 90)
+test('Receiver caller socket rebind on silence (plaintext)', test_caller_socket_rebind,
+     suite: ['regression', 'nat'], timeout: 90)
+test('Receiver caller socket rebind on silence (psk)', test_caller_socket_rebind,
+     args: ['psk'], suite: ['regression', 'nat'], timeout: 90)
+# PSK cname forgery must not take over an existing peer record.
+test('NAT rebind PSK cname hijack is refused', test_psk_cname_hijack,
+     suite: ['regression', 'nat', 'security'], timeout: 90)
+# Two bonded same-cname paths must stay distinct and not rebind.
+test('Multipath same-cname paths stay distinct (psk)', test_multipath_cname,
+     suite: ['regression', 'nat', 'multipath'], timeout: 90)
+# RTT-based bonded-leg auto-mute: mute on spike, reroute, restore, guard.
+test('Bonded leg auto-mutes on RTT spike and recovers', test_rtt_mute_bonding,
+     suite: ['regression', 'multipath'], timeout: 120)
+if have_srp
+	# Positive path: an authenticated SRP caller IS migrated onto the
+	# new source tuple after a NAT source-port rebind.
+	test('NAT port rebind cname re-association (srp migration)', test_nat_port_rebind,
+	     args: ['srp'], suite: ['regression', 'nat', 'srp'], timeout: 120)
+	# Two bonded SRP paths with the SAME username/password + cname must
+	# stay distinct even though the SRP gate lets re-association fire.
+	test('Multipath same-cname paths stay distinct (srp)', test_multipath_cname,
+	     args: ['srp'], suite: ['regression', 'nat', 'multipath', 'srp'], timeout: 120)
+	# One bonded SRP leg rebinds mid-stream while the other stays alive.
+	test('Multipath one leg rebinds mid-stream (srp)', test_multipath_leg_rebind,
+	     suite: ['regression', 'nat', 'multipath', 'srp'], timeout: 120)
+	# Regression for the EAP-SRP no-rebind bug: an SRP caller whose
+	# listener restarts (all session state lost) must reset EAP and
+	# re-authenticate on the fresh socket by itself, with no operator
+	# intervention.  Before the fix the SRP caller was killed and stayed
+	# idle forever.
+	test('Receiver caller socket rebind on silence (srp)', test_caller_socket_rebind,
+	     args: ['srp'], suite: ['regression', 'nat', 'srp'], timeout: 120)
+	# Regression for the EAP-SRP re-auth lockout after an *authenticator*
+	# (listener/hub) restart: the fresh authenticator re-challenges with
+	# IDENTITY, but a caller parked in EAP SUCCESS refused it forever, so the
+	# hub sat in "Waiting for EAP" and carried 0 packets.  Distinct from the
+	# silence rebind above (the authenticator is NOT silent here); recovery
+	# must come from the identity-request re-auth path.
+	test('EAP-SRP caller re-auth after authenticator restart (srp)', test_eap_authenticator_restart,
+	     suite: ['regression', 'srp'], timeout: 120)
+	# Regression for the bonded EAP-SRP sender-leg flap bug (issue #224).
+	# A bonded caller's leg is silenced (100% loss both ways) with its
+	# interface left UP, so its miface-bound socket persists on the same
+	# source tuple; the listener purges the timed-out leg while the other
+	# leg keeps the bond alive.  When the loss clears the caller must reset
+	# EAP and re-authenticate the leg on its own -- before the fix it
+	# stayed wedged in stale EAP SUCCESS forever.  This needs real
+	# interfaces + tc packet loss (a loopback leg has no miface binding and
+	# self-heals via a new-port handshake, hiding the bug), so it runs only
+	# on Linux as root with netns/tc and cleanly SKIPs (exit 77) otherwise.
+	if get_option('built_tools')
+		test('Bonded SRP leg re-authenticates after a same-tuple flap (srp, netns)',
+		     find_program('test_bonded_leg_flap_netns.sh'),
+		     args: [ristsender_exe, ristreceiver_exe],
+		     suite: ['netns', 'nat', 'multipath', 'srp'], timeout: 120)
+		# Companion: a sub-grace stall must NOT re-auth. Same topology, but a
+		# short silence (under the buffer-derived grace) must ride through on
+		# the existing session instead of tearing down and re-handshaking.
+		test('Bonded SRP leg rides through a sub-grace stall without re-auth (srp, netns)',
+		     find_program('test_bonded_leg_stall_grace_netns.sh'),
+		     args: [ristsender_exe, ristreceiver_exe],
+		     suite: ['netns', 'nat', 'multipath', 'srp'], timeout: 120)
+		# A leg muted for high RTT plus its only sibling stalled for silence
+		# must not leave the balancer with zero carriers: the receiver must
+		# keep getting data on the reinstated leg instead of starving.
+		test('Bonded muted+stalled split keeps a carrier (srp, netns)',
+		     find_program('test_bonded_carrier_never_starved_netns.sh'),
+		     args: [ristsender_exe, ristreceiver_exe],
+		     suite: ['netns', 'nat', 'multipath', 'srp'], timeout: 120)
+	endif
+endif
+
+###?profile= URL override tests (rist_*_create profile != URL profile)
+test('?profile=2 URL overrides Main to Advanced',
+     test_send_receive,
+     args: ['1', 'rist://@127.0.0.1:7080?profile=2', 'rist://127.0.0.1:7080?profile=2', '0'],
+     suite: ['url-profile', 'advanced', 'unicast', 'server'])
+test('?profile=2 URL overrides Main to Advanced + 10% loss',
+     test_send_receive,
+     args: ['1', 'rist://@127.0.0.1:7082?profile=2&rtt-max=10&rtt-min=1', 'rist://127.0.0.1:7082?profile=2&rtt-max=10&rtt-min=1', '10'],
+     suite: ['url-profile', 'advanced', 'unicast', 'server'])
+test('?profile=1 URL overrides Advanced to Main',
+     test_send_receive,
+     args: ['2', 'rist://@127.0.0.1:7084?profile=1', 'rist://127.0.0.1:7084?profile=1', '0'],
+     suite: ['url-profile', 'main', 'unicast', 'server'])
+test('?profile=2 URL overrides Simple to Advanced',
+     test_send_receive,
+     args: ['0', 'rist://@127.0.0.1:7086?profile=2', 'rist://127.0.0.1:7086?profile=2', '0'],
+     suite: ['url-profile', 'advanced', 'unicast', 'server'])
+
+###Cross-profile interop (TR-06-3 Section 9): mismatched sender/receiver profiles
+### on one flow. Exercises the Advanced sender's Main-Profile fallback (sends
+### Main-conformant media until the peer advertises I=1) and the Advanced
+### receiver's mid-stream framing-transition reset.
+test('Interop - Advanced sender to Main receiver',
+     test_send_receive,
+     args: ['1', 'rist://@127.0.0.1:7090?profile=1', 'rist://127.0.0.1:7090?profile=2', '0'],
+     suite: ['interop', 'advanced', 'main', 'unicast'])
+test('Interop - Advanced sender to Main receiver + 10% loss',
+     test_send_receive,
+     args: ['1', 'rist://@127.0.0.1:7092?profile=1&rtt-max=10&rtt-min=1', 'rist://127.0.0.1:7092?profile=2&rtt-max=10&rtt-min=1', '10'],
+     suite: ['interop', 'advanced', 'main', 'unicast'])
+test('Interop - Main sender to Advanced receiver',
+     test_send_receive,
+     args: ['2', 'rist://@127.0.0.1:7094?profile=2', 'rist://127.0.0.1:7094?profile=1', '0'],
+     suite: ['interop', 'advanced', 'main', 'unicast'])
+test('Interop - Main sender to Advanced receiver + 10% loss',
+     test_send_receive,
+     args: ['2', 'rist://@127.0.0.1:7096?profile=2&rtt-max=10&rtt-min=1', 'rist://127.0.0.1:7096?profile=1&rtt-max=10&rtt-min=1', '10'],
+     suite: ['interop', 'advanced', 'main', 'unicast'])
+
 ###Reflector tests
-test('Reflector functionality', test_reflector, suite: ['main', 'reflector'])
+test('Reflector functionality', test_reflector, suite: ['main', 'reflector'], timeout: 120)
 
 ###Simple profile tests
 #Unicast

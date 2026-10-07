@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#define LIBRIST_INTERNAL 1
 #include "rist-private.h"
 #include "log-private.h"
 #include "udp-private.h"
@@ -236,7 +237,13 @@ void rist_receiver_data_block_free(struct rist_data_block **const block)
 
 void rist_receiver_data_block_free2(struct rist_data_block **block)
 {
+	/* free(NULL)-style no-op: *block may already be NULL on the data_fd
+	 * delivery path (free_data_block nulls it). Mirror its guard. */
+	if (block == NULL)
+		return;
 	struct rist_data_block *b = *block;
+	if (b == NULL)
+		return;
 	if (b->ref != NULL)
 		free_data_block(block);
 }
@@ -412,7 +419,7 @@ int rist_sender_create(struct rist_ctx **_ctx, enum rist_profile profile,
 		if (RIST_UNLIKELY(!ctx->sender_retry_queue))
 		{
 			rist_log_priv(&ctx->common, RIST_LOG_ERROR, "Could not create sender retry buffer of size %u MB, OOM\n",
-						  (unsigned)(RIST_SERVER_QUEUE_BUFFERS * sizeof(ctx->sender_retry_queue[0])) / 1000000);
+						  (unsigned)(RIST_RETRY_QUEUE_BUFFERS * sizeof(ctx->sender_retry_queue[0])) / 1000000);
 			ret = -1;
 			goto free_ctx_and_ret;
 		}
@@ -423,7 +430,33 @@ int rist_sender_create(struct rist_ctx **_ctx, enum rist_profile profile,
 	}
 
 	ctx->sender_queue_delete_index = 1;
-	ctx->sender_queue_max = RIST_SERVER_QUEUE_BUFFERS;
+	/* Advanced uses the (runtime-tunable) configured capacity; Simple/Main
+	 * keep the default ring. Heap-allocated so the size can be tuned via
+	 * rist_recovery_depth_set() before rist_start(). */
+	ctx->sender_queue_max = (ctx->common.profile == RIST_PROFILE_ADVANCED)
+			? ctx->common.recovery_queue_max : RIST_SERVER_QUEUE_BUFFERS;
+	ctx->sender_queue = calloc(ctx->sender_queue_max, sizeof(*ctx->sender_queue));
+	ctx->seq_index = calloc(ctx->sender_queue_max, sizeof(*ctx->seq_index));
+	if (RIST_UNLIKELY(!ctx->sender_queue || !ctx->seq_index))
+	{
+		rist_log_priv(&ctx->common, RIST_LOG_ERROR,
+					  "Could not allocate sender recovery ring (%zu entries), OOM\n",
+					  ctx->sender_queue_max);
+		ret = -1;
+		goto free_ctx_and_ret;
+	}
+	/* Advanced sender keeps a parallel 16-bit-RTP retransmit index so a
+	 * peer that negotiated down to Main (which NACKs in the RTP domain) can
+	 * still be served. Main/Simple senders index by RTP directly already. */
+	if (ctx->common.profile == RIST_PROFILE_ADVANCED) {
+		ctx->seq_rtp_index = calloc((size_t)UINT16_MAX + 1, sizeof(*ctx->seq_rtp_index));
+		if (RIST_UNLIKELY(!ctx->seq_rtp_index)) {
+			rist_log_priv(&ctx->common, RIST_LOG_ERROR,
+						  "Could not allocate sender RTP recovery index, OOM\n");
+			ret = -1;
+			goto free_ctx_and_ret;
+		}
+	}
 	atomic_init(&ctx->sender_queue_write_index, 1);
 	atomic_init(&ctx->sender_queue_read_index, 0);
 
@@ -477,6 +510,12 @@ int rist_sender_create(struct rist_ctx **_ctx, enum rist_profile profile,
 
 	// Failed!
 free_ctx_and_ret:
+	if (ctx) {
+		free(ctx->sender_retry_queue);
+		free(ctx->sender_queue);
+		free(ctx->seq_index);
+		free(ctx->seq_rtp_index);
+	}
 	free(ctx);
 	free(rist_ctx);
 	return ret;
@@ -687,18 +726,36 @@ int rist_sender_data_write(struct rist_ctx *rist_ctx, const struct rist_data_blo
 /* Shared OOB functions -> Tunneled IP packets within GRE */
 int rist_oob_read(struct rist_ctx *ctx, const struct rist_oob_block **oob_block)
 {
-	RIST_MARK_UNUSED(oob_block);
 	if (!ctx)
 	{
 		rist_log_priv3(RIST_LOG_ERROR, "ctx is null on rist_oob_read call!\n");
+		return -1;
+	}
+	if (!oob_block)
+	{
+		rist_log_priv3(RIST_LOG_ERROR, "oob_block is null on rist_oob_read call!\n");
 		return -1;
 	}
 	struct rist_common_ctx *cctx = rist_struct_get_common(ctx);
 	if (!cctx)
 		return -1;
 
-	rist_log_priv(cctx, RIST_LOG_ERROR, "rist_receiver_oob_read not implemented!\n");
-	return 0;
+	*oob_block = NULL;
+
+	if (!cctx->oob_data_enabled)
+	{
+		rist_log_priv(cctx, RIST_LOG_ERROR,
+				"rist_oob_read called but oob data is not enabled; call rist_oob_callback_set first\n");
+		return -1;
+	}
+	if (cctx->oob_data_callback)
+	{
+		rist_log_priv(cctx, RIST_LOG_ERROR,
+				"rist_oob_read cannot be used while an oob callback is installed\n");
+		return -1;
+	}
+
+	return rist_oob_dequeue_rx(cctx, oob_block);
 }
 
 int rist_oob_write(struct rist_ctx *ctx, const struct rist_oob_block *oob_block)
@@ -758,6 +815,9 @@ int rist_oob_callback_set(struct rist_ctx *ctx,
 	cctx->oob_data_callback_argument = arg;
 	cctx->oob_queue_write_index = 0;
 	cctx->oob_queue_read_index = 0;
+	cctx->oob_rx_queue_write_index = 0;
+	cctx->oob_rx_queue_read_index = 0;
+	cctx->oob_rx_current = NULL;
 
 	return 0;
 }
@@ -778,6 +838,112 @@ int rist_recovery_rtt_multiplier_set(struct rist_ctx *ctx, int multiplier)
 	if (!cctx)
 		return -1;
 	return rist_recovery_rtt_multiplier_set_internal(cctx, multiplier);
+}
+
+/* Translate a recovery-depth exponent into ring capacity in packets
+ * (65536 << depth), clamped to [MIN, MAX] and to the platform maximum
+ * (rist_recovery_depth_platform_max) so the result always fits size_t.
+ * Returned as uint64_t so the arithmetic is exact regardless of size_t width. */
+static uint64_t rist_recovery_depth_to_packets(int depth)
+{
+	if (depth < RIST_RECOVERY_DEPTH_MIN)
+		depth = RIST_RECOVERY_DEPTH_MIN;
+	if (depth > RIST_RECOVERY_DEPTH_MAX)
+		depth = RIST_RECOVERY_DEPTH_MAX;
+	int platform_max = rist_recovery_depth_platform_max();
+	if (depth > platform_max)
+		depth = platform_max;
+	return (uint64_t)UINT16_SIZE << depth;
+}
+
+/* Resize the context recovery ring to `packets` (already a power of two in
+ * [UINT16_SIZE, 2^32]). The caller MUST guarantee rist_start() has not
+ * completed, so the sender ring can be reallocated with no data in flight.
+ * Returns 0 on success, -2 on OOM / size unrepresentable on this platform. */
+static int rist_recovery_depth_apply(struct rist_ctx *ctx, struct rist_common_ctx *cctx, uint64_t packets)
+{
+	if (packets > (uint64_t)(SIZE_MAX / (sizeof(struct rist_buffer *) + sizeof(uint32_t)))) {
+		rist_log_priv(cctx, RIST_LOG_ERROR,
+			"Recovery depth too large to allocate on this platform (%llu packets)\n",
+			(unsigned long long)packets);
+		return -2;
+	}
+	size_t want = (size_t)packets;
+
+	if (cctx->profile != RIST_PROFILE_ADVANCED) {
+		cctx->recovery_queue_max = want;
+		rist_log_priv(cctx, RIST_LOG_INFO,
+			"Recovery depth request stored (%zu packets); only the Advanced "
+			"profile uses it (Simple/Main are 16-bit, capped at %u packets).\n",
+			want, (unsigned)UINT16_SIZE);
+		return 0;
+	}
+
+	/* The receiver allocates its ring per-flow and reads recovery_queue_max
+	 * directly, so nothing more to do there. The sender allocates its ring
+	 * at create time, so resize it now - safe because rist_start() has not
+	 * run yet and no data is flowing. On OOM the old ring (and
+	 * recovery_queue_max) is left untouched. */
+	if (ctx->mode == RIST_SENDER_MODE && ctx->sender_ctx) {
+		struct rist_sender *sender = ctx->sender_ctx;
+		if (sender->sender_queue_max != want) {
+			struct rist_buffer **nq = calloc(want, sizeof(*nq));
+			uint32_t *ni = calloc(want, sizeof(*ni));
+			if (!nq || !ni) {
+				free(nq);
+				free(ni);
+				rist_log_priv(cctx, RIST_LOG_ERROR,
+					"OOM resizing sender recovery ring to %zu packets\n", want);
+				return -2;
+			}
+			free(sender->sender_queue);
+			free(sender->seq_index);
+			sender->sender_queue = nq;
+			sender->seq_index = ni;
+			sender->sender_queue_max = want;
+			sender->sender_queue_delete_index = 1;
+			atomic_store_explicit(&sender->sender_queue_write_index, 1, memory_order_release);
+			atomic_store_explicit(&sender->sender_queue_read_index, 0, memory_order_release);
+		}
+	}
+
+	cctx->recovery_queue_max = want;
+	rist_log_priv(cctx, RIST_LOG_INFO,
+		"Advanced recovery buffer set to %zu packets (NACK window ~%zu packets, "
+		"~%zu MB of index arrays per context)\n",
+		want, want / 2,
+		(want * (sizeof(struct rist_buffer *) + sizeof(uint32_t))) / (1024 * 1024));
+	return 0;
+}
+
+int rist_recovery_depth_set(struct rist_ctx *ctx, uint8_t depth)
+{
+	struct rist_common_ctx *cctx = rist_struct_get_common(ctx);
+	if (!cctx)
+		return -1;
+
+	if (atomic_load_explicit(&cctx->startup_complete, memory_order_acquire)) {
+		rist_log_priv(cctx, RIST_LOG_ERROR,
+			"rist_recovery_depth_set must be called before rist_start()\n");
+		return -1;
+	}
+
+	if (depth > RIST_RECOVERY_DEPTH_MAX) {
+		rist_log_priv(cctx, RIST_LOG_WARN,
+			"recovery depth %u out of range, clamping to %u\n",
+			(unsigned)depth, (unsigned)RIST_RECOVERY_DEPTH_MAX);
+		depth = RIST_RECOVERY_DEPTH_MAX;
+	}
+
+	int platform_max = rist_recovery_depth_platform_max();
+	if (depth > platform_max) {
+		rist_log_priv(cctx, RIST_LOG_WARN,
+			"recovery depth %u exceeds what this platform can address, "
+			"capping to %d\n", (unsigned)depth, platform_max);
+		depth = platform_max;
+	}
+
+	return rist_recovery_depth_apply(ctx, cctx, rist_recovery_depth_to_packets(depth));
 }
 
 int rist_auth_handler_set(struct rist_ctx *ctx,
@@ -809,15 +975,17 @@ int rist_stats_free(const struct rist_stats *stats_container)
 
 uint32_t rist_peer_get_id(const struct rist_peer *peer)
 {
+    if (!peer)
+        return 0;
     return peer->adv_peer_id;
 }
 
 uint32_t rist_peer_get_cname(const struct rist_peer *peer, const char **cname)
 {
-	if (peer)
+	if (peer && cname)
 	{
 		*cname = &peer->cname[0];
-		return (uint32_t)strnlen(*cname, RIST_MAX_STRING_SHORT);
+		return (uint32_t)strnlen(*cname, sizeof(peer->cname));
 	}
 	else
 		return 0;
@@ -842,7 +1010,7 @@ int rist_peer_update_secret(struct rist_peer *peer, const char* password) {
 	pthread_mutex_lock(&peer->peer_lock);
 	size_t password_len = strlen(password);
 	struct rist_key *inactive_key = (peer->key_rx_odd_active) ? &peer->key_tx : &peer->key_tx_odd;
-	rist_log_priv(get_cctx(peer), RIST_LOG_INFO, "Updating passphrase to %s\n", password);
+	rist_log_priv(get_cctx(peer), RIST_LOG_INFO, "Updating passphrase for peer #%u\n", peer->adv_peer_id);
 	_librist_crypto_psk_set_passphrase(inactive_key, (const uint8_t *)password, password_len);
 	struct rist_peer *child = peer->child;
 	while (child != NULL) {
@@ -869,6 +1037,7 @@ int rist_logging_settings_free(const struct rist_logging_settings **logging_sett
 int rist_logging_settings_free2(struct rist_logging_settings **logging_settings)
 {
 	if (*logging_settings) {
+		rist_logging_unset_global_if_matches(*logging_settings);
 		free((void *)*logging_settings);
 		*logging_settings = NULL;
 	}
@@ -915,9 +1084,9 @@ int rist_stats_callback_set(struct rist_ctx *ctx, int statsinterval, int (*stats
 		return -1;
 	}
 	struct rist_common_ctx *cctx = rist_struct_get_common(ctx);
-	pthread_mutex_lock(&cctx->stats_lock);
 	if (RIST_UNLIKELY(!cctx))
 		return -1;
+	pthread_mutex_lock(&cctx->stats_lock);
 
 	if (statsinterval != 0)
 	{
@@ -932,6 +1101,11 @@ int rist_stats_callback_set(struct rist_ctx *ctx, int statsinterval, int (*stats
 				f->stats_report_time = statsinterval * RIST_CLOCK;
 				f = f->next;
 			}
+		}
+		else if (ctx->mode == RIST_SENDER_MODE && ctx->sender_ctx)
+		{
+			/* sender loop reads its own copy, not the common one */
+			ctx->sender_ctx->stats_report_time = statsinterval * RIST_CLOCK;
 		}
 	}
 	pthread_mutex_unlock(&cctx->stats_lock);
@@ -962,6 +1136,8 @@ int rist_parse_udp_address2(const char *url, struct rist_udp_config **udp_config
 	{
 		// Default options on new struct (specific for udp url)
 		struct rist_udp_config *output_udp_config = calloc(1, sizeof(struct rist_udp_config));
+		if (!output_udp_config)
+			return -1;
 		output_udp_config->version = RIST_UDP_CONFIG_VERSION;
 		output_udp_config->stream_id = 0; // Accept all on receiver, auto-generate on sender
 		ret = parse_url_udp_options(url, output_udp_config);
@@ -978,11 +1154,11 @@ int rist_parse_udp_address2(const char *url, struct rist_udp_config **udp_config
 	return ret;
 }
 
-int rist_peer_config_defaults_set(struct rist_peer_config *peer_config)
+int rist_peer_config_defaults_set_versioned(struct rist_peer_config *peer_config, int version)
 {
 	if (peer_config)
 	{
-		peer_config->version = RIST_PEER_CONFIG_VERSION;
+		peer_config->version = version;
 		peer_config->virt_dst_port = RIST_DEFAULT_VIRT_DST_PORT;
 		peer_config->recovery_mode = RIST_DEFAULT_RECOVERY_MODE;
 		peer_config->recovery_maxbitrate = RIST_DEFAULT_RECOVERY_MAXBITRATE;
@@ -995,12 +1171,41 @@ int rist_peer_config_defaults_set(struct rist_peer_config *peer_config)
 		peer_config->congestion_control_mode = RIST_DEFAULT_CONGESTION_CONTROL_MODE;
 		peer_config->min_retries = RIST_DEFAULT_MIN_RETRIES;
 		peer_config->max_retries = RIST_DEFAULT_MAX_RETRIES;
-		peer_config->split_mode = LIBRIST_SPLIT_MODE_OFF;
-		peer_config->merge_mode = LIBRIST_MERGE_MODE_OFF;
+		if (version >= 1)
+		{
+			peer_config->split_mode = LIBRIST_SPLIT_MODE_OFF;
+			peer_config->merge_mode = LIBRIST_MERGE_MODE_OFF;
+		}
+		if (version >= 4)
+		{
+			peer_config->profile = RIST_DEFAULT_PROFILE;
+			peer_config->profile_set = 0;
+		}
+		if (version >= 5)
+		{
+			peer_config->recovery_priority = RIST_DEFAULT_RECOVERY_PRIORITY;
+			peer_config->recovery_depth = RIST_RECOVERY_DEPTH_DEFAULT;
+		}
+		if (version >= 6)
+		{
+			peer_config->rtt_drop = RIST_DEFAULT_RTT_DROP;
+			peer_config->rtt_restore = RIST_DEFAULT_RTT_RESTORE;
+			peer_config->rtt_drop_settle = RIST_DEFAULT_RTT_DROP_SETTLE;
+			peer_config->rtt_drop_trickle = RIST_DEFAULT_RTT_DROP_TRICKLE;
+		}
 		return 0;
 	}
 	else
 		return -1;
+}
+
+/* Legacy API wrapper symbol exported for ABI compatibility.
+ * Since pre-existing compiled binaries calling this function do not pass their
+ * struct size or compile-time version, we assume version 0 (baseline layout)
+ * to guarantee that we never write out-of-bounds on legacy client structures. */
+int rist_peer_config_defaults_set(struct rist_peer_config *peer_config)
+{
+	return rist_peer_config_defaults_set_versioned(peer_config, 0);
 }
 
 int rist_parse_address(const char *url, const struct rist_peer_config **peer_config)
@@ -1010,14 +1215,15 @@ int rist_parse_address(const char *url, const struct rist_peer_config **peer_con
 
 int rist_parse_address2(const char *url, struct rist_peer_config **peer_config)
 {
-
+	if (!url)
+		return -1;
 	char * url_local = strdup(url);
 	int ret = 0;
 	if (*peer_config == NULL)
 	{
 		// Default options on new struct (rist url)
 		struct rist_peer_config *output_peer_config = calloc(1, sizeof(struct rist_peer_config));
-		rist_peer_config_defaults_set(output_peer_config);
+		rist_peer_config_defaults_set_versioned(output_peer_config, RIST_PEER_CONFIG_VERSION);
 		ret = parse_url_options(url_local, output_peer_config);
 		*peer_config = output_peer_config;
 	}
@@ -1065,7 +1271,7 @@ static int rist_receiver_peer_create(struct rist_receiver *ctx,
 			return -1;
 		}
 
-		sprintf((char *)config->address, "%s:%d", p->url, p->local_port + 1);
+		snprintf((char *)config->address, sizeof(config->address), "%s:%d", p->url, p->local_port + 1);
 		p_rtcp = rist_receiver_peer_insert_local(ctx, config);
 		p_rtcp->peer_ssrc = p->peer_ssrc;
 		if (!p_rtcp)
@@ -1127,7 +1333,7 @@ static int rist_sender_peer_create(struct rist_sender *ctx,
 	// TODO: Validate config data (virt_dst_port != 0 for example)
 
 	newpeer->is_data = true;
-	if (config->weight > 0)
+	if (config->weight != RIST_PEER_WEIGHT_DUPLICATE)
 		newpeer->w_count = config->weight;
 	peer_append(newpeer);
 
@@ -1173,6 +1379,100 @@ static int rist_sender_peer_create(struct rist_sender *ctx,
 	return 0;
 }
 
+/* If config carries a ?profile= request (version >= 4 && profile_set),
+ * either apply it to the context (if unlocked and different) or refuse
+ * the peer (if locked and different).  Caller must hold peerlist_lock.
+ * Returns 0 on success/no-op, -1 on conflict (caller must abort). */
+static int apply_url_profile_override(struct rist_common_ctx *cctx,
+                                      const struct rist_peer_config *config)
+{
+	if (config->version < 4 || !config->profile_set)
+		return 0;
+	if (config->profile == cctx->profile)
+		return 0;
+	if (atomic_load_explicit(&cctx->profile_locked, memory_order_acquire)) {
+		rist_log_priv(cctx, RIST_LOG_WARN,
+			"?profile=%d in URL refused: context profile is locked to %d "
+			"(rist_start has run or a prior peer fixed the profile).\n",
+			(int)config->profile, (int)cctx->profile);
+		return -1;
+	}
+	enum rist_profile old = cctx->profile;
+	cctx->profile = config->profile;
+	if (config->profile == RIST_PROFILE_ADVANCED && old != RIST_PROFILE_ADVANCED)
+		init_advanced_state(cctx);
+	rist_log_priv(cctx, RIST_LOG_INFO,
+		"Context profile changed from %d to %d by ?profile= URL parameter\n",
+		(int)old, (int)config->profile);
+	return 0;
+}
+
+/* Latch the context-wide CBR output setting; a second request for a different
+ * value is refused rather than resolved. Applied after rist_start() too, since
+ * flows copy the value as they are created. Caller must hold peerlist_lock.
+ * Returns 0 on success or no-op, -1 on conflict. */
+static int set_cbr_output_locked(struct rist_common_ctx *cctx, bool want,
+                                 const char *origin)
+{
+	if (cctx->cbr_output_set) {
+		if (want == cctx->cbr_output)
+			return 0;
+		rist_log_priv(cctx, RIST_LOG_ERROR,
+			"CBR output pacing %d from %s refused: already set to %d, and a "
+			"context's outputs share one release schedule.\n",
+			want ? 1 : 0, origin, cctx->cbr_output ? 1 : 0);
+		return -1;
+	}
+
+	/* Latch even on a value equal to the default, else 0 then 1 both succeed. */
+	cctx->cbr_output_set = true;
+	if (want == cctx->cbr_output)
+		return 0;
+	cctx->cbr_output = want;
+	rist_log_priv(cctx, RIST_LOG_INFO,
+		"CBR output pacing %s by %s\n", want ? "enabled" : "disabled", origin);
+	return 0;
+}
+
+int rist_receiver_set_cbr_output(struct rist_ctx *rist_ctx, bool enable)
+{
+	if (RIST_UNLIKELY(!rist_ctx)) {
+		rist_log_priv3(RIST_LOG_ERROR,
+			"ctx is null on rist_receiver_set_cbr_output call!\n");
+		return -1;
+	}
+	if (RIST_UNLIKELY(rist_ctx->mode != RIST_RECEIVER_MODE ||
+	                  !rist_ctx->receiver_ctx)) {
+		rist_log_priv3(RIST_LOG_ERROR,
+			"rist_receiver_set_cbr_output: CTX not set up for receiving\n");
+		return -1;
+	}
+	struct rist_common_ctx *cctx = &rist_ctx->receiver_ctx->common;
+	pthread_mutex_lock(&cctx->peerlist_lock);
+	int ret = set_cbr_output_locked(cctx, enable, "rist_receiver_set_cbr_output()");
+	pthread_mutex_unlock(&cctx->peerlist_lock);
+	return ret;
+}
+
+/* If config carries a ?recovery-depth= request (version >= 5 and not
+ * DEFAULT), apply it to the context. Best-effort: ignored with a warning if
+ * rist_start has run (the sender ring cannot be resized with data in flight)
+ * since it must be set up front. Caller must hold peerlist_lock. Runs after
+ * apply_url_profile_override so a combined ?profile=2&recovery-depth=5
+ * URL sees the Advanced profile already in effect. */
+static void apply_url_recovery_depth(struct rist_common_ctx *cctx, struct rist_ctx *ctx,
+                                     const struct rist_peer_config *config)
+{
+	if (config->version < 5 || config->recovery_depth == RIST_RECOVERY_DEPTH_DEFAULT)
+		return;
+	if (atomic_load_explicit(&cctx->startup_complete, memory_order_acquire)) {
+		rist_log_priv(cctx, RIST_LOG_WARN,
+			"?recovery-depth in URL ignored: it must be set before rist_start().\n");
+		return;
+	}
+	rist_recovery_depth_apply(ctx, cctx, rist_recovery_depth_to_packets(config->recovery_depth));
+}
+
 int rist_peer_create(struct rist_ctx *ctx, struct rist_peer **peer, const struct rist_peer_config *config) {
 	if (!ctx) {
 		rist_log_priv3(RIST_LOG_ERROR, "rist_peer_create call with null ctx\n");
@@ -1183,21 +1483,33 @@ int rist_peer_create(struct rist_ctx *ctx, struct rist_peer **peer, const struct
 	if (ctx->mode == RIST_RECEIVER_MODE && ctx->receiver_ctx) {
 		cctx = &ctx->receiver_ctx->common;
 		pthread_mutex_lock(&cctx->peerlist_lock);
+		if (apply_url_profile_override(cctx, config) < 0) {
+			pthread_mutex_unlock(&cctx->peerlist_lock);
+			return -1;
+		}
+		apply_url_recovery_depth(cctx, ctx, config);
 		ret = rist_receiver_peer_create(ctx->receiver_ctx, peer, config);
 	}
 	else if (ctx->mode == RIST_SENDER_MODE && ctx->sender_ctx) {
 		cctx = &ctx->sender_ctx->common;
 		pthread_mutex_lock(&cctx->peerlist_lock);
+		if (apply_url_profile_override(cctx, config) < 0) {
+			pthread_mutex_unlock(&cctx->peerlist_lock);
+			return -1;
+		}
+		apply_url_recovery_depth(cctx, ctx, config);
 		ret  =rist_sender_peer_create(ctx->sender_ctx, peer, config);
 	}
 	else
 		return -1;
+	if (ret == 0)
+		atomic_store_explicit(&cctx->profile_locked, true, memory_order_release);
 	pthread_mutex_unlock(&cctx->peerlist_lock);
 	return ret;
 }
 
 int rist_peer_get_socket(struct rist_peer *peer, int *socket, int *socket_extra) {
-	if (socket == NULL)
+	if (peer == NULL || socket == NULL)
 		return -1;
 	if (peer->parent != NULL)
 		return -1;
@@ -1318,6 +1630,7 @@ static PTHREAD_START_FUNC(sender_data_fd_read_loop, arg)
 
 static int rist_sender_start(struct rist_sender *ctx)
 {
+	atomic_store_explicit(&ctx->common.profile_locked, true, memory_order_release);
 	pthread_mutex_lock(&ctx->mutex);
 	if (!ctx->protocol_running) {
 		if (rist_thread_create(&ctx->common, &ctx->sender_thread, NULL, sender_pthread_protocol, (void *)ctx) != 0)
@@ -1354,6 +1667,7 @@ unlock_failed:
 
 static int rist_receiver_start(struct rist_receiver *ctx)
 {
+	atomic_store_explicit(&ctx->common.profile_locked, true, memory_order_release);
 	pthread_mutex_lock(&ctx->mutex);
 	if (!ctx->protocol_running)
 	{

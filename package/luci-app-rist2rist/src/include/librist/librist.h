@@ -61,6 +61,39 @@ RIST_API int rist_jitter_max_set(struct rist_ctx *ctx, int t);
 RIST_API int rist_recovery_rtt_multiplier_set(struct rist_ctx *ctx, int multiplier);
 
 /**
+ * @brief Set the Advanced-profile recovery (retransmit) buffer depth
+ *
+ * Sizes the retransmission ring used by the Advanced profile. `depth` is the
+ * base-2 exponent of the ring size: the ring holds (65536 << depth) packets,
+ * i.e. 2^depth times the 16-bit base buffer. The addressable NACK window is
+ * roughly half the ring. Each step up doubles the buffer (and the RAM). This
+ * is equivalent to the ?recovery-depth= URL parameter (same numeric value).
+ *
+ * Depth sizing (ring capacity / approx NACK window):
+ *   0   (1x)      65536 / 32768 packets
+ *   3   (8x)     524288 / 262144 packets   (default, historical behavior)
+ *   6  (64x)    4194304 / 2097152 packets
+ *  16 (65536x)  4294967296 / 2147483648 packets  (full 32-bit seq space)
+ *
+ * Valid range is RIST_RECOVERY_DEPTH_MIN..RIST_RECOVERY_DEPTH_MAX (0..16);
+ * out-of-range values are clamped. Large depths are limited by available RAM
+ * and will fail to allocate.
+ *
+ * This ONLY affects the Advanced profile. Simple and Main are inherently
+ * 16-bit and remain capped at 65536 packets (32768-packet window) regardless
+ * of this setting.
+ *
+ * Must be called after rist_sender_create() / rist_receiver_create() and
+ * BEFORE rist_start().
+ *
+ * @param ctx   RIST context
+ * @param depth desired recovery-depth exponent (0..16)
+ * @return 0 on success, -1 on bad context or if called after rist_start(),
+ *         -2 on allocation failure
+ */
+RIST_API int rist_recovery_depth_set(struct rist_ctx *ctx, uint8_t depth);
+
+/**
  * @brief Starts the RIST sender or receiver
  *
  * After all the peers have been added, this function triggers

@@ -50,15 +50,15 @@
 pthread_mutex_t signal_lock;
 static int signalReceived = 0;
 static struct rist_logging_settings logging_settings = LOGGING_SETTINGS_INITIALIZER;
-enum rist_profile profile = RIST_PROFILE_MAIN;
+enum rist_profile profile = RIST_DEFAULT_PROFILE;
 static int peer_connected_count = 0;
 static int noflow_counter = 0;
 
 #if HAVE_PROMETHEUS_SUPPORT
 struct rist_prometheus_stats *prom_stats_ctx;
-bool prometheus_multipoint = false;
-bool prometheus_nocreated = false;
-bool prometheus_httpd = false;
+int prometheus_multipoint = 0;
+int prometheus_nocreated = 0;
+int prometheus_httpd = 0;
 bool enable_prometheus = false;
 char *prometheus_tags = NULL;
 uint16_t prometheus_port = 9100;
@@ -83,15 +83,16 @@ static struct option long_options[] = {
 #endif
 { "config",          required_argument, NULL, 'c' },
 { "session-timeout-exit",  no_argument, NULL, 'x' },
+{ "cbr-output",      required_argument, NULL, 5 },
 { "help",            no_argument,       NULL, 'h' },
 { "help-url",        no_argument,       NULL, 'u' },
 #if HAVE_PROMETHEUS_SUPPORT
 { "enable-metrics",  no_argument,       NULL, 'M' },
 { "metrics-tags",    required_argument, NULL, 1 },
-{ "metrics-multipoint",no_argument,     (int*)&prometheus_multipoint, true },
-{ "metrics-nocreated",no_argument,      (int*)&prometheus_nocreated, true },
+{ "metrics-multipoint",no_argument,     &prometheus_multipoint, 1 },
+{ "metrics-nocreated",no_argument,      &prometheus_nocreated, 1 },
 #if HAVE_LIBMICROHTTPD
-{ "metrics-http",    no_argument,      (int*)&prometheus_httpd, true },
+{ "metrics-http",    no_argument,      &prometheus_httpd, 1 },
 { "metrics-port",    required_argument, NULL, 2 },
 { "metrics-ip",      required_argument, NULL, 3 },
 #endif //HAVE_LIBMICROHTTPD
@@ -105,6 +106,7 @@ static struct option long_options[] = {
 const char help_str[] = "Usage: %s [OPTIONS] \nWhere OPTIONS are:\n"
 "       -i | --inputurl  rist://...             * | Comma separated list of input rist URLs                  |\n"
 "       -o | --outputurl udp://... or rtp://... * | Comma separated list of output udp or rtp URLs           |\n"
+"          | --cbr-output 0|1                     | Space the output at the stream rate (CBR consumers)     |\n"
 "                                                 | Use tun://@ to write udp data to a tun device defined    |\n"
 "                                                 | using the -t option                                      |\n"
 "       -b | --buffer value                       | Default buffer size for packet retransmissions           |\n"
@@ -212,7 +214,7 @@ static int cb_recv(void *arg, struct rist_data_block *b)
 		struct rist_udp_config *udp_config = callback_object->udp_config[i];
 		bool found_it = false;
 		int mux_mode = 0;
-		if (udp_config->version == 1)
+		if (udp_config->version >= 1)
 			mux_mode = udp_config->multiplex_mode;
 		// The stream-id on the udp url gets translated into the virtual destination port of the GRE tunnel
 		// and we match on that. The other two muxing modes are not spec compliant and are only
@@ -265,6 +267,12 @@ static int cb_recv(void *arg, struct rist_data_block *b)
 					// for now, forward it all
 					// use output_udp_config->mux_filter
 					size_t ipheader_bytes = sizeof(struct ipheader) + sizeof(struct udpheader);
+					if (b->payload_len < ipheader_bytes) {
+						rist_log(&logging_settings, RIST_LOG_ERROR,
+							"Short ipv4-mux payload (%zu < %zu), dropping\n",
+							b->payload_len, ipheader_bytes);
+						continue;
+					}
 					payload = (uint8_t *)b->payload;
 					payload += ipheader_bytes;
 					payload_len = b->payload_len - ipheader_bytes;
@@ -346,8 +354,8 @@ static int rist_validate_tun_data(uint8_t *buffer, ssize_t buffer_len)
 		protocol = (int) ip->iph_protocol;
 		payload_len = (ssize_t)be16toh(ip->iph_len);
 		if (payload_len != buffer_len) {
-			rist_log(&logging_settings, RIST_LOG_INFO, "Malformed ipv4 packet %d != %d\n",
-				payload_len != buffer_len);
+			rist_log(&logging_settings, RIST_LOG_INFO, "Malformed ipv4 packet %zd != %zd\n",
+				payload_len, buffer_len);
 			return -1;
 		}
 	}
@@ -499,6 +507,7 @@ int main(int argc, char *argv[])
 	const struct rist_peer_config *peer_input_config[MAX_INPUT_COUNT];
 	char *inputurl = NULL;
 	char *outputurl = NULL;
+	int cbr_output_cli = -1;   /* -1 = not asked for; URLs may still ask */
 	char *oobtun = NULL;
 	char *shared_secret = NULL;
 	int buffer = 0;
@@ -618,6 +627,14 @@ int main(int argc, char *argv[])
 			//prometheus IP long opt
 			prometheus_httpd = true;
 			prometheus_ip = strdup(optarg);
+			break;
+		case 5:
+			if (strcmp(optarg, "0") && strcmp(optarg, "1")) {
+				rist_log(&logging_settings, RIST_LOG_ERROR,
+					"Invalid --cbr-output '%s' (expected 0 or 1)\n", optarg);
+				exit(1);
+			}
+			cbr_output_cli = atoi(optarg);
 			break;
 		case 4:
 			//prometheus unix socket long opt
@@ -863,7 +880,7 @@ int main(int argc, char *argv[])
 		// Now parse the address 127.0.0.1:5000
 		char hostname[200] = {0};
 		int outputlisten;
-		uint16_t outputport;
+		uint16_t outputport = 0;
 		if (udpsocket_parse_url((void *)udp_config->address, hostname, 200, &outputport, &outputlisten) || !outputport || strlen(hostname) == 0) {
 			rist_log(&logging_settings, RIST_LOG_ERROR, "Could not parse output url %s\n", outputtoken);
 			goto next;
@@ -883,6 +900,19 @@ int main(int argc, char *argv[])
 
 next:
 		outputtoken = strtok_r(NULL, ",", &saveptr2);
+	}
+
+	/* Output pacing, from the command line and from any output URL asking for
+	 * it. Both go through the same setter, so a disagreement between them is
+	 * refused there rather than resolved differently here. */
+	if (cbr_output_cli >= 0 && rist_receiver_set_cbr_output(ctx, cbr_output_cli != 0) != 0)
+		exit(1);
+	for (size_t i = 0; i < MAX_OUTPUT_COUNT; i++) {
+		struct rist_udp_config *uc = callback_object.udp_config[i];
+		if (!uc || uc->version < 2 || !uc->cbr_output_set)
+			continue;
+		if (rist_receiver_set_cbr_output(ctx, uc->cbr_output != 0) != 0)
+			exit(1);
 	}
 
 	if (!atleast_one_socket_opened) {

@@ -102,9 +102,9 @@ struct rist_sender_args {
 
 #if HAVE_PROMETHEUS_SUPPORT
 struct rist_prometheus_stats *prom_stats_ctx;
-bool prometheus_multipoint = false;
-bool prometheus_nocreated = false;
-bool prometheus_httpd = false;
+int prometheus_multipoint = 0;
+int prometheus_nocreated = 0;
+int prometheus_httpd = 0;
 bool enable_prometheus = false;
 char *prometheus_tags = NULL;
 uint16_t prometheus_port = 9100;
@@ -136,10 +136,10 @@ static struct option long_options[] = {
 #if HAVE_PROMETHEUS_SUPPORT
 { "enable-metrics",  no_argument,       NULL, 'M' },
 { "metrics-tags",    required_argument, NULL, 1 },
-{ "metrics-multipoint",no_argument,     (int*)&prometheus_multipoint, true },
-{ "metrics-nocreated",no_argument,      (int*)&prometheus_nocreated, true },
+{ "metrics-multipoint",no_argument,     &prometheus_multipoint, 1 },
+{ "metrics-nocreated",no_argument,      &prometheus_nocreated, 1 },
 #if HAVE_LIBMICROHTTPD
-{ "metrics-http",    no_argument,      (int*)&prometheus_httpd, true },
+{ "metrics-http",    no_argument,      &prometheus_httpd, 1 },
 { "metrics-port",    required_argument, NULL, 2 },
 { "metrics-ip",      required_argument, NULL, 3 },
 #endif //HAVE_LIBMICROHTTPD
@@ -174,7 +174,11 @@ const char help_str[] = "Usage: %s [OPTIONS] \nWhere OPTIONS are:\n"
 "                                                 | 1 = only non udp data is accepted (default)              |\n"
 "                                                 | 2 = no data goes into or out of oob channel              |\n"
 "       -f | --fast-start value                   | Controls data output flow before handshake is completed  |\n"
-"       -c | --config name.yaml                   | YAML config file                                         |\n"
+"       -c | --config name.yaml                   | YAML config file                                         |\n";
+// Split into two string literals: a single literal must stay under the
+// C99 translation limit of 4095 chars (5.2.4.1).  The two parts are
+// printed back-to-back, so the help output is unchanged.
+const char help_str2[] =
 //"                                                 | -1 = hold data out and igmp source joins                 |\n"
 "                                                 |  0 = hold data out                                       |\n"
 "                                                 |  1 = start to send data immediately                      |\n"
@@ -264,7 +268,7 @@ static void input_udp_recv(struct evsocket_ctx *evctx, int fd, short revents, vo
 			data_block.seq = (uint64_t)(((uint16_t)rtp_hdr[2] << 8) | rtp_hdr[3]);
 			data_block.flags = RIST_DATA_FLAGS_USE_SEQ;
 		}
-		if (callback_object->udp_config->version == 1 && callback_object->udp_config->multiplex_mode == LIBRIST_MULTIPLEX_MODE_IPV4) {
+		if (callback_object->udp_config->version >= 1 && callback_object->udp_config->multiplex_mode == LIBRIST_MULTIPLEX_MODE_IPV4) {
 			data_block.virt_src_port = UINT16_MAX;
 			data_block.payload = recv_buf + offset;
 			data_block.payload_len = recv_bufsize - offset + ipheader_bytes;
@@ -274,7 +278,7 @@ static void input_udp_recv(struct evsocket_ctx *evctx, int fd, short revents, vo
 			// rtp header will not be stripped out in IPV4 mux mode
 			if (callback_object->udp_config->rtp && recv_bufsize > 12)
 				offset = 12; // TODO: check for header extensions and remove them as well
-			if (callback_object->udp_config->version == 1 && callback_object->udp_config->multiplex_mode == LIBRIST_MULTIPLEX_MODE_VIRT_SOURCE_PORT) {
+			if (callback_object->udp_config->version >= 1 && callback_object->udp_config->multiplex_mode == LIBRIST_MULTIPLEX_MODE_VIRT_SOURCE_PORT) {
 				data_block.virt_src_port = callback_object->udp_config->stream_id;
 			}
 			data_block.payload = recv_buf + offset + ipheader_bytes;
@@ -304,7 +308,7 @@ static void input_udp_sockerr(struct evsocket_ctx *evctx, int fd, short revents,
 
 static void usage(char *cmd)
 {
-	rist_log(&logging_settings, RIST_LOG_INFO, "%s\n%s version %s libRIST library: %s API version: %s\n", cmd, help_str, RISTSENDER_VERSION, librist_version(), librist_api_version());
+	rist_log(&logging_settings, RIST_LOG_INFO, "%s\n%s%s version %s libRIST library: %s API version: %s\n", cmd, help_str, help_str2, RISTSENDER_VERSION, librist_version(), librist_api_version());
 	exit(1);
 }
 
@@ -387,8 +391,8 @@ static int rist_validate_tun_data(uint8_t *buffer, ssize_t buffer_len)
 		protocol = (int) ip->iph_protocol;
 		payload_len = (ssize_t)be16toh(ip->iph_len);
 		if (payload_len != buffer_len) {
-			rist_log(&logging_settings, RIST_LOG_INFO, "Malformed ipv4 packet %d != %d\n",
-				payload_len != buffer_len);
+			rist_log(&logging_settings, RIST_LOG_INFO, "Malformed ipv4 packet %zd != %zd\n",
+				payload_len, buffer_len);
 			return -1;
 		}
 	}
@@ -710,7 +714,7 @@ int main(int argc, char *argv[])
 	int buffer_size = 0;
 	int encryption_type = 0;
 	int statsinterval = 1000;
-	enum rist_profile profile = RIST_PROFILE_MAIN;
+	enum rist_profile profile = RIST_DEFAULT_PROFILE;
 	enum rist_log_level loglevel = RIST_LOG_INFO;
 	bool npd = false;
 	int faststart = 0;
@@ -986,7 +990,7 @@ int main(int argc, char *argv[])
 
 		// Setup the output rist objects
 		if (rist_listens && i > 0) {
-			if (callback_object[0].udp_config->version == 1 && (callback_object[0].udp_config->multiplex_mode == LIBRIST_MULTIPLEX_MODE_VIRT_DESTINATION_PORT || udp_config->multiplex_mode == LIBRIST_MULTIPLEX_MODE_VIRT_DESTINATION_PORT)) {
+			if (callback_object[0].udp_config->version >= 1 && (callback_object[0].udp_config->multiplex_mode == LIBRIST_MULTIPLEX_MODE_VIRT_DESTINATION_PORT || udp_config->multiplex_mode == LIBRIST_MULTIPLEX_MODE_VIRT_DESTINATION_PORT)) {
 				rist_log(&logging_settings, RIST_LOG_ERROR, "Multiplexing is not allowed when any peer is in listening mode unless you enable non standard muxing on all inputs\n");
 				goto shutdown;
 			}
@@ -1035,7 +1039,7 @@ int main(int argc, char *argv[])
 			// This is a udp input, i.e. 127.0.0.1:5000
 			char hostname[200] = {0};
 			int inputlisten;
-			uint16_t inputport;
+			uint16_t inputport = 0;
 			if (udpsocket_parse_url((void *)udp_config->address, hostname, 200, &inputport, &inputlisten) || !inputport || strlen(hostname) == 0) {
 				rist_log(&logging_settings, RIST_LOG_ERROR, "Could not parse input url %s\n", inputtoken);
 				goto next;

@@ -53,18 +53,6 @@ uint64_t timestampNTP_RTC_u64(void) {
   return t;
 }
 
-uint32_t timestampRTP_u32(int advanced, uint64_t i_ntp) {
-  if (!advanced) {
-    i_ntp *= RTP_PTYPE_MPEGTS_CLOCKHZ;
-    i_ntp = i_ntp >> 32;
-    return (uint32_t)i_ntp;
-  } else {
-    // We just need the middle 32 bits, i.e. 65536Hz clock
-    i_ntp = i_ntp >> 16;
-    return (uint32_t)i_ntp;
-  }
-}
-
 uint64_t convertRTPtoNTP(uint8_t ptype, uint32_t time_extension,
                          uint32_t i_rtp) {
   uint64_t i_ntp;

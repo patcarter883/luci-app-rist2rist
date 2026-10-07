@@ -249,8 +249,9 @@ int udpsocket_open(uint16_t af)
 
 int udpsocket_set_optimal_buffer_size(int sd)
 {
-	uint32_t bufsize = UDPSOCKET_SOCK_BUFSIZE;
+	/* Request the OS-allowed maximum; the kernel clamps to net.core.rmem_max. */
 	uint32_t current_recvbuf = udpsocket_get_buffer_size(sd);
+	uint32_t bufsize = UDPSOCKET_SOCK_BUFSIZE_MAX;
 	if (current_recvbuf < bufsize){
 		setsockopt(sd, SOL_SOCKET, SO_RCVBUF, (char *)&bufsize, sizeof(uint32_t));
 		current_recvbuf = udpsocket_get_buffer_size(sd);
@@ -261,7 +262,8 @@ int udpsocket_set_optimal_buffer_size(int sd)
 		}
 #endif
 	}
-	if (current_recvbuf < bufsize){
+	/* A clamped result above the 1 MB floor is fine; only fall back below it. */
+	if (current_recvbuf < UDPSOCKET_SOCK_BUFSIZE){
 		// Settle for a smaller size
 		bufsize = UDPSOCKET_SOCK_BUFSIZE/5;
 		setsockopt(sd, SOL_SOCKET, SO_RCVBUF, (char *)&bufsize, sizeof(uint32_t));
@@ -272,18 +274,19 @@ int udpsocket_set_optimal_buffer_size(int sd)
 			current_recvbuf = udpsocket_get_buffer_size(sd);
 		}
 #endif
-	}
-	if (current_recvbuf < bufsize){
-		rist_log_priv3( RIST_LOG_ERROR, "Your UDP receive buffer is set < 200 kbytes (%"PRIu32") and the kernel denied our request for an increase. It's recommended to set your net.core.rmem_max setting to at least 200 kbyte for best results.", current_recvbuf);
-		return -1;
+		if (current_recvbuf < bufsize){
+			rist_log_priv3( RIST_LOG_ERROR, "Your UDP receive buffer is set < 200 kbytes (%"PRIu32") and the kernel denied our request for an increase. It's recommended to set your net.core.rmem_max setting to at least 200 kbyte for best results.", current_recvbuf);
+			return -1;
+		}
 	}
 	return 0;
 }
 
 int udpsocket_set_optimal_buffer_send_size(int sd)
 {
-	uint32_t bufsize = UDPSOCKET_SOCK_BUFSIZE;
+	/* Mirror the recv path: request the OS max, clamp to net.core.wmem_max. */
 	uint32_t current_sendbuf = udpsocket_get_buffer_send_size(sd);
+	uint32_t bufsize = UDPSOCKET_SOCK_BUFSIZE_MAX;
 	if (current_sendbuf < bufsize){
 		setsockopt(sd, SOL_SOCKET, SO_SNDBUF, (char *)&bufsize, sizeof(uint32_t));
 		current_sendbuf = udpsocket_get_buffer_send_size(sd);
@@ -294,7 +297,7 @@ int udpsocket_set_optimal_buffer_send_size(int sd)
 		}
 #endif
 	}
-	if (current_sendbuf < bufsize){
+	if (current_sendbuf < UDPSOCKET_SOCK_BUFSIZE){
 		// Settle for a smaller size
 		bufsize = UDPSOCKET_SOCK_BUFSIZE/5;
 		setsockopt(sd, SOL_SOCKET, SO_SNDBUF, (char *)&bufsize, sizeof(uint32_t));
@@ -305,10 +308,10 @@ int udpsocket_set_optimal_buffer_send_size(int sd)
 			current_sendbuf = udpsocket_get_buffer_send_size(sd);
 		}
 #endif
-	}
-	if (current_sendbuf < bufsize){
-		rist_log_priv3( RIST_LOG_ERROR, "Your UDP send buffer is set < 200 kbytes (%"PRIu32") and the kernel denied our request for an increase. It's recommended to set your net.core.rmem_max setting to at least 200 kbyte for best results.", current_sendbuf);
-		return -1;
+		if (current_sendbuf < bufsize){
+			rist_log_priv3( RIST_LOG_ERROR, "Your UDP send buffer is set < 200 kbytes (%"PRIu32") and the kernel denied our request for an increase. It's recommended to set your net.core.wmem_max setting to at least 200 kbyte for best results.", current_sendbuf);
+			return -1;
+		}
 	}
 	return 0;
 }

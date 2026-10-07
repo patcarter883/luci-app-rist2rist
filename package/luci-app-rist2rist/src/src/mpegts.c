@@ -77,8 +77,13 @@ int expand_null_packets(uint8_t payload_in[], uint8_t payload_out[], size_t *pay
 	size_t input_offset = 0;
 	for (int i = 0; i <= (int)ts_count-1; i++) {
 		if (CHECK_BIT(npd_bits, (6 - i)) == 0) {
-			if (input_offset + packet_size > orig_payload_len)
+			if (input_offset + packet_size > orig_payload_len) {
+				/* Failure mid-loop: restore the caller's length so the
+				 * error return can't be mistaken for a successful
+				 * expansion delivering unwritten scratch content. */
+				*payload_len = orig_payload_len;
 				return -1;
+			}
 			memcpy(&payload_out[offset], &payload_in[input_offset], packet_size);
 			input_offset += packet_size;
 		}

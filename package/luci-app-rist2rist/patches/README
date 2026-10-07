@@ -1,33 +1,48 @@
 librist source pin
 ==================
 
-`./src` is **pristine upstream librist** at:
+`./src` is **pristine upstream librist** at tag:
 
-    commit 6377b5c333a404e3bd7db789f1ba880d9abba07e
-    "Merge branch 'feature/prometheus-avg-buffer-time' into 'master'"
+    v0.2.20
     repo https://code.videolan.org/rist/librist.git
 
-It is the second parent of the merge commit (`813e68c`) in the fork
-`patricecarter`/`patcarter883`'s librist fork — i.e. the exact upstream tree the fork was
-based on. `src/` carries no `.git`: it is a plain vendored tree so it can be tracked by this
+`src/` carries no `.git`: it is a plain vendored tree so it can be tracked by this
 repository.
 
 Every open-broadcast change is a patch in this directory, applied to the copy in
-`$(PKG_BUILD_DIR)` by `Build/Prepare` (`$(Build/Patch)`, `PATCH_DIR` defaults to `./patches`):
+`$(PKG_BUILD_DIR)` by `Build/Prepare` (`$(Build/Patch)`, `PATCH_DIR` defaults to
+`./patches`):
 
 | patch | scope |
 |---|---|
-| `001-librist-receiver-fixes.patch` | Two upstream-quality librist bug fixes (not product-specific — worth upstreaming): **`src/rist-common.c`** replaces `assert(packet_time < next->packet_time)` in the retry-interpolation path with a clamp to preserve strict ordering (a VBR source, or a neighbour mismatch across a seq wrap, makes the CBR estimate land at/after the next packet time and used to SIGABRT the process); it also fixes `rist_peer_recv_wrap` so the receive loop runs at least once on Windows. **`src/udp.c`** stops double-counting data bandwidth — `rist_calculate_bitrate()` was called in the RTCP path *and* by its callers. |
-| `002-rist2rist-wan-telemetry.patch` | The open-broadcast feature and its hardening: the `rist2rist` proxy emits its **WAN-leg** link quality back to the encoder over **RIST OOB** (new `RIST_OOB_API_IP_IDENT_TELEMETRY` = 54322, `tools/oob_shared.[ch]` + `tools/rist2rist.c`) so the encoder drives adaptive bitrate through the bridge exactly as it does against a direct receiver. Includes this session's reliability fixes: a telemetry mutex (librist runs a separate sender and receiver protocol thread per context, so the telemetry globals *were* raced), SIGTERM handling (procd stops with SIGTERM; the `out:` cleanup never used to run), the hot-path `assert` replaced by a NULL check, the master relay loop's `ret < 0` backoff branch, and the stats-JSON dump moved INFO → DEBUG. |
+| `001-librist-receiver-fixes.patch` | Two upstream-quality librist bug fixes (not product-specific -- worth upstreaming): **`src/rist-common.c`** fixes `rist_peer_recv_wrap` so the receive loop runs at least once on Windows. **`src/udp.c`** stops double-counting data bandwidth -- `rist_calculate_bitrate()` was called in the RTCP path *and* by its callers. |
+| `002-rist2rist-wan-telemetry.patch` | The open-broadcast feature and its hardening: the `rist2rist` proxy emits its **WAN-leg** link quality back to the encoder over **RIST OOB** (new `RIST_OOB_API_IP_IDENT_TELEMETRY` = 54322, `tools/oob_shared.[ch]` + `tools/rist2rist.c`) so the encoder drives adaptive bitrate through the bridge exactly as it does against a direct receiver. Includes the reliability fixes: a telemetry mutex (librist runs a separate sender and receiver protocol thread per context, so the telemetry globals *were* raced), SIGTERM handling (procd stops with SIGTERM; the `out:` cleanup never used to run), the hot-path `assert` replaced by a NULL check, the master relay loop's `ret < 0` backoff branch, and the stats-JSON dump moved INFO -> DEBUG. |
+
+History
+-------
+
+The pin was previously an untagged master snapshot (commit `6377b5c`,
+"Merge branch 'feature/prometheus-avg-buffer-time' into 'master'", reporting
+itself as 0.2.18) -- the upstream tree the `patcarter883/librist` fork was based
+on. It moved to the v0.2.20 RELEASE for a reproducible, tagged base.
+
+`001` originally carried a third fix: replacing
+`assert(packet_time < next->packet_time)` in the retry-interpolation path with a
+clamp, to stop a VBR source SIGABRTing the process. **Upstream removed that
+assert**, so the hunk no longer applies and has been dropped -- the fix is now
+upstream's. If a future rebase reintroduces a FAILED hunk here, check whether
+upstream has adopted the fix before re-adding it.
 
 Regenerating
 ------------
 
-Only the patches named in `series` are applied — that is why this README is safe sitting here.
-Add a new patch to BOTH this directory and `series`, or it will be silently ignored.
+Only the patches named in `series` are applied -- that is why this README is safe
+sitting here. Add a new patch to BOTH this directory and `series`, or it will be
+silently ignored.
 
-Do **not** edit `./src` and commit the result — that reintroduces the untracked embedded-repo
-problem this layout exists to fix. Edit a scratch copy of librist, then regenerate:
+Do **not** edit `./src` and commit the result -- that reintroduces the untracked
+embedded-repo problem this layout exists to fix. Edit a scratch copy of librist,
+then regenerate:
 
     git -C <librist checkout> diff <base-commit> -- <files> > patches/00N-....patch
 

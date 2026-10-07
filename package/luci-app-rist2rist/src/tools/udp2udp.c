@@ -53,9 +53,9 @@ struct rist_callback_object {
 
 #if HAVE_PROMETHEUS_SUPPORT
 struct rist_prometheus_stats *prom_stats_ctx;
-bool prometheus_multipoint = false;
-bool prometheus_nocreated = false;
-bool prometheus_httpd = false;
+int prometheus_multipoint = 0;
+int prometheus_nocreated = 0;
+int prometheus_httpd = 0;
 bool enable_prometheus = false;
 char *prometheus_tags = NULL;
 uint16_t prometheus_port = 9100;
@@ -74,10 +74,10 @@ static struct option long_options[] = {
 #if HAVE_PROMETHEUS_SUPPORT
 { "enable-metrics",  no_argument,       NULL, 'M' },
 { "metrics-tags",    required_argument, NULL, 1 },
-{ "metrics-multipoint",no_argument,     (int*)&prometheus_multipoint, true },
-{ "metrics-nocreated",no_argument,      (int*)&prometheus_nocreated, true },
+{ "metrics-multipoint",no_argument,     &prometheus_multipoint, 1 },
+{ "metrics-nocreated",no_argument,      &prometheus_nocreated, 1 },
 #if HAVE_LIBMICROHTTPD
-{ "metrics-http",    no_argument,      (int*)&prometheus_httpd, true },
+{ "metrics-http",    no_argument,      &prometheus_httpd, 1 },
 { "metrics-port",    required_argument, NULL, 2 },
 { "metrics-ip",      required_argument, NULL, 3 },
 #endif //HAVE_LIBMICROHTTPD
@@ -367,7 +367,7 @@ int main(int argc, char *argv[])
 		evctx = evsocket_create();
 	char hostname[200] = {0};
 	int inputlisten;
-	uint16_t inputport;
+	uint16_t inputport = 0;
 	// First parse extra parameters (?miface=lo) and separate the address
 	// We are using the rist_parse_address function to create a config object that does not really
 	// belong to the udp output. We do this only to avoid writing another parser for the two url
@@ -432,7 +432,7 @@ int main(int argc, char *argv[])
 		memset(&hostname, 0, sizeof(hostname));
 
 		int outputlisten;
-		uint16_t outputport;
+		uint16_t outputport = 0;
 		if (udpsocket_parse_url((void *)output_udp_config->address, hostname, 200, &outputport, &outputlisten) || !outputport || strlen(hostname) == 0) {
 			rist_log(&logging_settings, RIST_LOG_ERROR, "Could not parse output url %s\n", outputtoken);
 			goto next;

@@ -37,10 +37,21 @@ struct rist_peer;
 #define RIST_DEFAULT_MIN_RETRIES (6)
 #define RIST_DEFAULT_MAX_RETRIES (20)
 #define RIST_DEFAULT_VERBOSE_LEVEL RIST_LOG_INFO
-#define RIST_DEFAULT_PROFILE RIST_PROFILE_MAIN
+#define RIST_DEFAULT_PROFILE RIST_PROFILE_ADVANCED
 #define RIST_DEFAULT_SESSION_TIMEOUT (2000)
 #define RIST_DEFAULT_KEEPALIVE_INTERVAL (1000)
 #define RIST_DEFAULT_TIMING_MODE RIST_TIMING_MODE_SOURCE
+#define RIST_DEFAULT_RECOVERY_PRIORITY (0)
+/* Dynamic RTT-based bonded-leg muting (sender). Disabled by default. */
+#define RIST_DEFAULT_RTT_DROP (0)           /* smoothed-RTT ceiling ms; 0 = disabled */
+#define RIST_DEFAULT_RTT_RESTORE (0)        /* restore low-water ms; 0 = derive (80% of drop) */
+#define RIST_DEFAULT_RTT_DROP_SETTLE (2000) /* dwell ms before a drop/restore transition */
+#define RIST_DEFAULT_RTT_DROP_TRICKLE (100) /* 1-in-N duplicate rate while muted (~1%, warm restore); 0 = hard mute */
+
+/* Special value for rist_peer_config.weight: a peer configured with this
+ * weight receives a duplicate of every packet instead of taking part in
+ * the weighted load-balancing rotation. */
+#define RIST_PEER_WEIGHT_DUPLICATE (0)
 
 enum rist_timing_mode
 {
@@ -77,7 +88,23 @@ enum librist_merge_mode
 	LIBRIST_MERGE_MODE_AUTO  = 2,
 };
 
-#define RIST_PEER_CONFIG_VERSION (3)
+#define RIST_PEER_CONFIG_VERSION (6)
+
+/* Advanced-profile recovery depth: the base-2 exponent of the retransmission
+ * ring size. The ring holds (65536 << depth) packets, i.e. 2^depth times the
+ * 16-bit base buffer (65536), and the addressable NACK window is roughly half
+ * the ring. Each step doubles the buffer:
+ *
+ *   depth  multiplier   ring packets   approx NACK window
+ *     0       1x            65536            32768
+ *     3       8x           524288           262144   (default, legacy behavior)
+ *     6      64x          4194304          2097152
+ *    16   65536x      4294967296       2147483648   (full 32-bit seq space)
+ *
+ * Simple/Main are inherently 16-bit and ignore this setting. */
+#define RIST_RECOVERY_DEPTH_MIN     (0)
+#define RIST_RECOVERY_DEPTH_DEFAULT (3)   /* 8x the 16-bit base = legacy default */
+#define RIST_RECOVERY_DEPTH_MAX     (16)  /* full 32-bit sequence space */
 
 struct rist_peer_config
 {
@@ -99,6 +126,8 @@ struct rist_peer_config
 
 	/* Recovery options */
 	enum rist_recovery_mode recovery_mode;
+	/* Ceiling on payload plus retransmissions, not on payload alone. 0 means
+	 * unset, not unlimited, and is replaced with the default. */
 	uint32_t recovery_maxbitrate; /* kbps */
 	uint32_t recovery_maxbitrate_return; /* kbps */
 	uint32_t recovery_length_min; /* ms */
@@ -107,7 +136,7 @@ struct rist_peer_config
 	uint32_t recovery_rtt_min; /* ms */
 	uint32_t recovery_rtt_max; /* ms */
 
-	/* Load balancing weight (use 0 for duplication) */
+	/* Load balancing weight (use RIST_PEER_WEIGHT_DUPLICATE for duplication) */
 	uint32_t weight;
 
 	/* Encryption */
@@ -168,14 +197,65 @@ struct rist_peer_config
 	uint16_t local_port;
 
 	int srp_compat_legacy;    /* 0 = RFC 5054 PAD (default), 1 = pre-0.2.16 unpadded */
+
+	/* Wire profile parsed from ?profile=.  Test profile_set first:
+	 * profile == RIST_PROFILE_SIMPLE on a zero-initialised config is
+	 * indistinguishable from "value not provided". */
+	enum rist_profile profile;
+	int profile_set;
+
+	/* Retransmission (NACK) routing preference for the receiver.
+	 * When a flow is carried by more than one RTCP-capable peer, the
+	 * receiver sends each NACK to the eligible peer with the highest
+	 * recovery_priority (ties broken by lowest measured RTT).  0
+	 * (default) preserves the legacy behaviour of selecting the
+	 * lowest-RTT eligible peer regardless of priority.  Set this >0 on
+	 * the peer that holds the retransmission buffer when a lower-RTT
+	 * peer carrying the same flow cannot answer NACKs (e.g. a
+	 * duplicate/relay feed with no retransmit cache). */
+	uint32_t recovery_priority;
+
+	/* Advanced-profile recovery depth (?recovery-depth= URL knob): base-2
+	 * exponent of the retransmission ring size, RIST_RECOVERY_DEPTH_MIN..MAX.
+	 * Defaults to RIST_RECOVERY_DEPTH_DEFAULT. Only meaningful on the Advanced
+	 * profile and only before rist_start(). Version 5+. */
+	uint8_t recovery_depth;
+
+	/* Dynamic RTT-based bonded-leg muting (sender, Version 6+). A leg whose
+	 * smoothed RTT holds above rtt_drop for rtt_drop_settle is pulled from the
+	 * payload rotation (retransmits reroute to a healthy leg) and rejoins once
+	 * it holds below rtt_restore for a longer dwell (quick to drop, slow to
+	 * rejoin). The last healthy leg is never muted. All ms; 0 disables. */
+	uint32_t rtt_drop;         /* smoothed-RTT ceiling; 0 = disabled */
+	uint32_t rtt_restore;      /* restore low-water; 0 = derive as 80% of rtt_drop */
+	uint32_t rtt_drop_settle;  /* dwell before muting (rejoin waits longer) */
+	uint32_t rtt_drop_trickle; /* 1-in-N redundant duplicate on a muted leg; 0 = hard mute */
 };
+
+/**
+ * @brief Populate a preallocated peer_config structure with library default values (versioned)
+ *
+ * @return 0 on success or non-zero on error.
+ */
+RIST_API int rist_peer_config_defaults_set_versioned(struct rist_peer_config *peer_config, int version);
 
 /**
  * @brief Populate a preallocated peer_config structure with library default values
  *
  * @return 0 on success or non-zero on error.
  */
+#ifdef LIBRIST_INTERNAL
 RIST_API int rist_peer_config_defaults_set(struct rist_peer_config *peer_config);
+#else
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L)
+static inline int rist_peer_config_defaults_set(struct rist_peer_config *peer_config) {
+	return rist_peer_config_defaults_set_versioned(peer_config, RIST_PEER_CONFIG_VERSION);
+}
+#else
+#define rist_peer_config_defaults_set(peer_config) \
+	rist_peer_config_defaults_set_versioned((peer_config), RIST_PEER_CONFIG_VERSION)
+#endif
+#endif
 
 /**
  * @brief Parses rist url for peer config data (encryption, compression, etc)
@@ -204,6 +284,11 @@ RIST_API int rist_peer_config_free2(struct rist_peer_config **peer_config);
  * @brief Add a peer to the RIST session
  *
  * One sender can send data to multiple peers.
+ *
+ * If config->profile_set is non-zero (version >= 4), the call may
+ * change the context wire profile to config->profile when invoked
+ * before rist_start() and before any other peer has fixed it.  Once
+ * fixed, any later call whose ?profile= disagrees returns -1.
  *
  * @param ctx RIST context
  * @param[out] peer Store the new peer pointer

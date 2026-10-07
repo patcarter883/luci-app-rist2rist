@@ -10,6 +10,16 @@
 
 #include "common/attributes.h"
 #include <stdint.h>
+#include <stddef.h>
+
+/* Best-effort wipe of transient key material that a compiler will not elide.
+ * Shared by the PSK and EAP v4 crypto paths. */
+static inline void _librist_crypto_secure_zero(void *p, size_t n)
+{
+	volatile unsigned char *v = (volatile unsigned char *)p;
+	while (n--)
+		*v++ = 0;
+}
 
 RIST_PRIV uint64_t rist_siphash(uint64_t birthtime, uint32_t seq, const char *phrase);
 

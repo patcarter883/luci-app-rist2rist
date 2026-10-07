@@ -28,7 +28,7 @@ extern "C" {
 
 /* Track PROTOCOL and API changes */
 #define RIST_PEER_UDPSOCKET_VERSION (0)
-#define RIST_UDP_CONFIG_VERSION (1)
+#define RIST_UDP_CONFIG_VERSION (2)
 
 /* Error Codes */
 #define RIST_ERR_MALLOC -1
@@ -112,6 +112,10 @@ struct rist_udp_config
 	uint32_t multicast_ttl;
 	/* SSM source address for IGMPv3 source-specific multicast (empty = ASM) */
 	char multicast_source[RIST_MAX_STRING_LONG];
+	/* version 2: ?cbr-output=, context-wide, so a caller reading it off several
+	 * URLs must reject disagreement. _set separates "0" from "not asked". */
+	int cbr_output;
+	int cbr_output_set;
 };
 
 #ifdef __cplusplus
