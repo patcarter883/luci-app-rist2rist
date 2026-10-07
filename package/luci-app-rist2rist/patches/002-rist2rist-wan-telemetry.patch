@@ -1,5 +1,5 @@
 diff --git a/tools/oob_shared.c b/tools/oob_shared.c
-index a260256..c77e17d 100644
+index 62167b4..529be38 100644
 --- a/tools/oob_shared.c
 +++ b/tools/oob_shared.c
 @@ -63,9 +63,9 @@ int oob_build_api_payload(uint16_t *buffer, char *sourceip, char *destip, char *
@@ -15,7 +15,7 @@ index a260256..c77e17d 100644
  	// extra buffer delay and no packet recovery.
  	struct ipheader *ip = (struct ipheader *) buffer;
  	// unassigned protocol 252 used for API communication, api_id (54321 to identify this API message type)
-@@ -80,6 +80,22 @@ int oob_build_api_payload(uint16_t *buffer, char *sourceip, char *destip, char *
+@@ -78,6 +78,22 @@ int oob_build_api_payload(uint16_t *buffer, char *sourceip, char *destip, char *
  	return total_len;
  }
  

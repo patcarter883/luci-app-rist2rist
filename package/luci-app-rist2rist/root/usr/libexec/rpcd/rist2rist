@@ -97,7 +97,7 @@ method_get_config() {
 	local listen_url profile out_profile managed claimed
 	local enabled verbose_log loglevel
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
-	local telemetry_enabled telemetry_target outputs uplinks token_hash
+	local outputs uplinks token_hash
 
 	config_load "$CONFIG"
 
@@ -113,8 +113,6 @@ method_get_config() {
 	config_get      rtt_min           main rtt_min
 	config_get      rtt_max           main rtt_max
 	config_get      reorder_buffer    main reorder_buffer
-	config_get_bool telemetry_enabled main telemetry_enabled 0
-	config_get      telemetry_target  main telemetry_target
 	config_get      token_hash        main pair_token_hash
 
 	# Claimed is derived from the token existing, not tracked separately -- one
@@ -137,9 +135,6 @@ method_get_config() {
 	printf '"recovery":{"buffer_min":"%s","buffer_max":"%s","rtt_min":"%s","rtt_max":"%s","reorder_buffer":"%s"},' \
 		"$(json_str "$buffer_min")" "$(json_str "$buffer_max")" \
 		"$(json_str "$rtt_min")" "$(json_str "$rtt_max")" "$(json_str "$reorder_buffer")"
-	printf '"telemetry":{"enabled":%s,"target":"%s"},' \
-		"$([ "$telemetry_enabled" = "1" ] && echo true || echo false)" \
-		"$(json_str "$telemetry_target")"
 	printf '"outputs":[%s],' "${outputs%,}"
 	printf '"uplinks":[%s]' "${uplinks%,}"
 	printf '}'
@@ -317,7 +312,6 @@ apply_config() {
 	local allowed="$1" j=0 present=""
 	local listen_url profile out_profile enabled
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
-	local telemetry_enabled telemetry_target
 	local i addr sec
 
 	body_has_secret_key && { err secret_field "the request contains a secret-bearing field"; return 1; }
@@ -347,14 +341,6 @@ apply_config() {
 	[ -n "$rtt_max" ] && uci set "$CONFIG.main.rtt_max=$rtt_max"
 	reorder_buffer=$(jget '@.recovery.reorder_buffer')
 	[ -n "$reorder_buffer" ] && uci set "$CONFIG.main.reorder_buffer=$reorder_buffer"
-
-	telemetry_enabled=$(jget '@.telemetry.enabled')
-	[ -n "$telemetry_enabled" ] && uci set "$CONFIG.main.telemetry_enabled=$([ "$telemetry_enabled" = "true" ] && echo 1 || echo 0)"
-	telemetry_target=$(jget '@.telemetry.target')
-	if [ -n "$telemetry_target" ]; then
-		url_ok "$telemetry_target" telemetry_target || return 1
-		uci set "$CONFIG.main.telemetry_target=$telemetry_target"
-	fi
 
 	# Outputs, if the body mentions them at all: replace the set WHOLESALE. A
 	# partial edit could leave a stale destination active, which is worse than
@@ -408,7 +394,7 @@ case "$1" in
 			case "$2" in
 				status)     method_status ;;
 				get_config) method_get_config ;;
-				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery telemetry target buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address" ;;
+				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address" ;;
 				reconcile)  require_managed && apply_config "listen_url outputs address" ;;
 				reload)     method_reload ;;
 				release)    method_release ;;

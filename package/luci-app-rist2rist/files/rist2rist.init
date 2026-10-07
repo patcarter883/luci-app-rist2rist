@@ -234,13 +234,12 @@ start_service() {
     config_load 'rist2rist'
     local enabled listen_url verbose_log loglevel profile out_profile
     local buffer_min buffer_max rtt_min rtt_max reorder_buffer rq
-    local telemetry_enabled telemetry_target
     config_get_bool enabled 'main' 'enabled' 0
     config_get listen_url 'main' 'listen_url'
     config_get_bool verbose_log 'main' 'verbose_log' 0
     # RIST receive profile: 0=simple, 1=main, 2=advanced. Default to advanced —
-    # the encoder sends RIST_PROFILE_ADVANCED and the OOB telemetry channel only
-    # exists in main/advanced, so a simple-profile listener never authenticates.
+    # the encoder sends RIST_PROFILE_ADVANCED and the OOB channel only exists in
+    # main/advanced, so a simple-profile listener never authenticates.
     config_get profile 'main' 'profile' 2
     # Output (downstream) profile, independent of the receive profile. Default to
     # advanced to match an advanced-profile downstream receiver.
@@ -253,14 +252,6 @@ start_service() {
     config_get rtt_min 'main' 'rtt_min' 40
     config_get rtt_max 'main' 'rtt_max' 500
     config_get reorder_buffer 'main' 'reorder_buffer' 30
-    # Telemetry: push the OUTPUT (-o, WAN-leg) sender statistics to a stats
-    # consumer (the encoder's adaptive-bitrate listener) via rist2rist
-    # remote-logging (UDP). Replaces the RIST OOB feedback the proxy cannot relay
-    # across its two independent sessions. telemetry_target = "IP:PORT" of the
-    # consumer; configurable, never hardcoded.
-    config_get_bool telemetry_enabled 'main' 'telemetry_enabled' 0
-    config_get telemetry_target 'main' 'telemetry_target' ''
-
     if [ "$enabled" -eq 0 ]; then
         # A disabled bridge must stop advertising itself, or encoders keep
         # discovering a box that will never relay.
@@ -296,10 +287,9 @@ start_service() {
     config_foreach append_output_url 'destination'
     [ -z "$OUTPUT_URLS" ] && return
 
-    # librist emits the periodic statistics block only at INFO (6), so force
-    # verbose logging whenever telemetry is on. The consumer filters the stream
-    # for the "sender-stats" line and ignores the rest.
-    if [ "$verbose_log" -eq 1 ] || { [ "$telemetry_enabled" -eq 1 ] && [ -n "$telemetry_target" ]; }; then
+    # librist emits the periodic statistics block only at INFO (6); verbose_log
+    # turns it on for debugging.
+    if [ "$verbose_log" -eq 1 ]; then
         loglevel=6
     else
         loglevel=4
@@ -312,11 +302,6 @@ start_service() {
     procd_append_param command -p "$profile"
     procd_append_param command -P "$out_profile"
     procd_append_param command -v "$loglevel"
-    # Stats push (1 Hz) to the configured telemetry target.
-    if [ "$telemetry_enabled" -eq 1 ] && [ -n "$telemetry_target" ]; then
-        procd_append_param command -S 1000
-        procd_append_param command -r "$telemetry_target"
-    fi
     procd_set_param stdout 1
     procd_set_param stderr 1
     # throttle(5) + threshold(3600): at most one restart every 5 s, and stop after

@@ -16,7 +16,7 @@ Every open-broadcast change is a patch in this directory, applied to the copy in
 | patch | scope |
 |---|---|
 | `001-librist-receiver-fixes.patch` | Two upstream-quality librist bug fixes (not product-specific -- worth upstreaming): **`src/rist-common.c`** fixes `rist_peer_recv_wrap` so the receive loop runs at least once on Windows. **`src/udp.c`** stops double-counting data bandwidth -- `rist_calculate_bitrate()` was called in the RTCP path *and* by its callers. |
-| `002-rist2rist-wan-telemetry.patch` | The open-broadcast feature and its hardening: the `rist2rist` proxy emits its **WAN-leg** link quality back to the encoder over **RIST OOB** (new `RIST_OOB_API_IP_IDENT_TELEMETRY` = 54322, `tools/oob_shared.[ch]` + `tools/rist2rist.c`) so the encoder drives adaptive bitrate through the bridge exactly as it does against a direct receiver. Includes the reliability fixes: a telemetry mutex (librist runs a separate sender and receiver protocol thread per context, so the telemetry globals *were* raced), SIGTERM handling (procd stops with SIGTERM; the `out:` cleanup never used to run), the hot-path `assert` replaced by a NULL check, the master relay loop's `ret < 0` backoff branch, and the stats-JSON dump moved INFO -> DEBUG. |
+| `002-rist2rist-wan-telemetry.patch` | The open-broadcast feature and its hardening: the `rist2rist` proxy emits its **WAN-leg** link quality back to the encoder over **RIST OOB** (`RIST_OOB_API_IP_IDENT_TELEMETRY` = 54322, `tools/oob_shared.[ch]` + `tools/rist2rist.c`) -- this is what the encoder's `bitrate_source::remote_oob` adaptive-bitrate source consumes, so it is REQUIRED when the encoder sends through this bridge. Includes: a telemetry mutex (libRIST runs a separate sender and receiver protocol thread per context, so the telemetry globals *were* raced), SIGTERM handling, the hot-path `assert` replaced by a NULL check, the master relay loop's `ret < 0` backoff, the mixed-profile `--out-profile` support, and the stats-JSON dump moved INFO -> DEBUG. |
 
 History
 -------
@@ -49,3 +49,15 @@ then regenerate:
 Verify a patch still applies and reproduces the intended tree before committing it:
 
     patch -p1 --dry-run -d <pristine copy> < patches/00N-....patch
+
+The WAN-telemetry feature this patch originally carried (a `wan_telemetry_t` struct written back to
+the encoder over RIST OOB as ident 54322, for observing per-leg quality while debugging the bonded
+balancing) has been REMOVED -- it was debug scaffolding, and its only consumer was the encoder's
+`rist_oob_cb`. The UCI `telemetry_enabled` / `telemetry_target` options, the LuCI "Enable WAN Stats
+Telemetry" controls and the rpcd `telemetry` field went with it.
+
+NOTE: the ROUTER-SIDE telemetry config (`telemetry_enabled` / `telemetry_target` in UCI, the LuCI
+"Enable WAN Stats Telemetry" controls, and the rpcd `telemetry` field) has been REMOVED. That was a
+rist2rist remote-logging (`-r`) push of its logs/stats to an external UDP collector, used only while
+debugging the multi-WAN bonding. It is NOT the same thing as the RIST OOB back-channel above, which
+stays. The `rtt_hysteresis` UCI option went too -- nothing ever read it.

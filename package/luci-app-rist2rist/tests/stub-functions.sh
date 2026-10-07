@@ -53,8 +53,6 @@ STUB_main_buffer_max="16000"
 STUB_main_rtt_min="100"
 STUB_main_rtt_max="980"
 STUB_main_reorder_buffer="20"
-STUB_main_telemetry_enabled=1
-STUB_main_telemetry_target="192.0.2.10:9999"
 
 # Destinations are ADDRESS ONLY -- the cloud POP for the session. The uplinks they
 # are bonded across live in the separate uplink sections below and are deliberately

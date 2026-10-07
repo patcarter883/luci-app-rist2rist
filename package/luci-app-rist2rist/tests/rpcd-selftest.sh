@@ -183,7 +183,6 @@ out=$(run 1 get_config "$(tb '{}')")
 check "get_config: enabled is a JSON bool" "$out" "d['enabled'] is True"
 check "get_config: listen_url carried" "$out" "d['listen_url'] == 'rist://0.0.0.0:5000'"
 check "get_config: recovery block present" "$out" "d['recovery']['reorder_buffer'] == '20'"
-check "get_config: telemetry target carried" "$out" "d['telemetry']['target'] == '192.0.2.10:9999'"
 check "get_config: both destinations emitted" "$out" "len(d['outputs']) == 2"
 check "get_config: a destination is ADDRESS ONLY" "$out" \
 	"d['outputs'][1]['address'] == '198.51.100.7:5000' and 'interface' not in d['outputs'][1] and 'weight' not in d['outputs'][1]"

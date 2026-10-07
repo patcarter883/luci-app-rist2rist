@@ -95,11 +95,11 @@ return view.extend({
 		}, 5);
 
 		m = new form.Map('rist2rist',
-			_('RIST Multi-Path Engine & Telemetry Bridge'),
+			_('RIST Multi-Path Engine'),
 			_('Manages multi-WAN stream replication using librist socket-level interface binding. Status shifts on WAN legs are analyzed and injected backward into the local LAN segment via RIST Out-of-Band (OOB) control blocks to achieve dynamic, reactive encoder bitrate adaptation.'));
 
 		// -------------------------------------------------------------
-		// GLOBAL INGEST & LAN TELEMETRY CONFIGURATION
+		// GLOBAL INGEST CONFIGURATION
 		// -------------------------------------------------------------
 		s = m.section(form.TypedSection, 'rist2rist', _('Local Ingest Settings (LAN Receiver)'));
 		s.anonymous = true;
@@ -115,7 +115,7 @@ return view.extend({
 
 		o = s.option(form.ListValue, 'profile', _('RIST Receive Profile'),
 			_('Must match the encoder. The encoder sends Advanced, and the OOB ' +
-			  'telemetry backpressure channel only exists in Main/Advanced — a ' +
+			  'channel only exists in Main/Advanced — a ' +
 			  'Simple-profile listener will never authenticate the feed.'));
 		o.value('0', _('Simple'));
 		o.value('1', _('Main'));
@@ -170,21 +170,6 @@ return view.extend({
 			_('Enable info-level logging to /tmp/rist2rist.log. Leave off in normal operation to reduce log volume.'));
 		o.default = o.disabled;
 		o.rmempty = false;
-
-		o = s.option(form.Flag, 'telemetry_enabled', _('Enable WAN Stats Telemetry'),
-			_('Push the WAN-leg (output) RIST sender statistics — quality, RTT and ' +
-			  'retransmits — to the encoder\'s adaptive-bitrate listener via ' +
-			  'remote-logging UDP (1 Hz). Replaces the legacy RIST OOB feedback, ' +
-			  'which cannot cross the proxy\'s two independent sessions. Forces ' +
-			  'info-level logging while enabled.'));
-		o.default = o.disabled;
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'telemetry_target', _('Telemetry Target (IP:PORT)'),
-			_('Address of the stats consumer — the encoder host and its proxy-stats ' +
-			  'UDP listen port, e.g. 192.168.1.10:9999. Required when telemetry is enabled.'));
-		o.placeholder = '192.168.1.10:9999';
-		o.depends('telemetry_enabled', '1');
 
 		// -------------------------------------------------------------
 		// LOCAL WAN UPLINKS -- the bonding legs.
