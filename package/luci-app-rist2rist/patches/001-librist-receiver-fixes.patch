@@ -1,0 +1,41 @@
+diff --git a/src/rist-common.c b/src/rist-common.c
+index 8866fee..a0d653f 100755
+--- a/src/rist-common.c
++++ b/src/rist-common.c
+@@ -3124,12 +3124,15 @@ static bool try_caller_socket_rebind(struct rist_peer *peer, uint64_t now)
+ }
+ 
+ static void rist_peer_recv_wrap(struct evsocket_ctx *evctx, int fd, short revents, void *arg) {
++	#ifdef _WIN32
++	bool again = false;
++	#else
+ 	bool again = true;
+-	while (true) {
++	#endif
++	rist_peer_recv(evctx, fd, revents, arg, &again);
++	do {
+ 		rist_peer_recv(evctx, fd, revents, arg, &again);
+-		if (!again)
+-			return;
+-	}
++	} while(again);
+ }
+ 
+ static void rist_new_connection(struct rist_peer *peer, struct rist_peer *p, uint32_t flow_id) {
+diff --git a/src/udp.c b/src/udp.c
+index ff7634a..cbb4eb9 100755
+--- a/src/udp.c
++++ b/src/udp.c
+@@ -197,8 +197,10 @@ adv_out:
+ 			if (ts_null_bytes)
+ 				p->stats_sender_instant.ts_null++;
+ 			p->stats_receiver_instant.sent_rtcp++;
+-			rist_calculate_bitrate((size_t)ret, &p->bw);
+-			rist_calculate_bitrate(ts_null_bytes, &p->ts_nulls_bw);
++			/* Bandwidth accounting is handled by callers:
++			 * rist_send_common_rtcp counts new data into p->bw, and
++			 * the retry path counts retransmissions into retry_bw.
++			 * Counting here too doubles the data bandwidth stat. */
+ 		}
+ 		return (size_t)ret;
+ 	}

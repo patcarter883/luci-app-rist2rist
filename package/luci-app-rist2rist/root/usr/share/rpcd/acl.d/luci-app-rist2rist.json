@@ -1,0 +1,35 @@
+{
+	"luci-app-rist2rist": {
+		"description": "Grant UCI, ubus, and file access for rist2rist",
+		"read": {
+			"ubus": {
+				"service": [ "list" ],
+				"rist2rist": [ "status", "get_config", "claim" ]
+			},
+			"uci": [ "rist2rist" ],
+			"file": {
+				"/sbin/logread": [ "exec" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"rist2rist": [ "set_config", "reconcile", "reload", "release" ]
+			},
+			"uci": [ "rist2rist" ]
+		}
+	},
+
+	"unauthenticated": {
+		"description": "rist2rist control for a LAN client holding the bridge's pair token. rpcd's exec interface does not identify the caller, so the plugin verifies the token itself: every method except 'claim' is refused without it, and 'claim' is refused unless the bridge is virgin. Keep this list in step with the plugin's dispatcher.",
+		"read": {
+			"ubus": {
+				"rist2rist": [ "status", "get_config", "claim" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"rist2rist": [ "set_config", "reconcile", "reload", "release" ]
+			}
+		}
+	}
+}
