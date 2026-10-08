@@ -1,0 +1,62 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Pat Carter
+#
+# The bridge's control endpoint, on its own uhttpd instance.
+#
+# It exists so the endpoint answers at http://<lan-ip>:<api_port>/ubus -- the URL
+# the encoder builds from the advertised api_port (source/bridge/ubus.cpp appends
+# "/ubus"). LuCI's listener cannot serve that path: its ubus plugin denies every
+# call on this image, and its docroot must not become executable. So this
+# instance has its own docroot holding exactly one file -- the narrowing shim --
+# and maps NO ubus plugin at all, which is what keeps the endpoint from exposing
+# objects beyond rist2rist.
+#
+# LAN-only by design: it binds the br-lan address, so it never answers on the WAN.
+#
+# procd owns it, so it starts at boot and is restartable -- nothing here is a
+# hand-run listener that an upgrade would lose.
+
+START=95
+USE_PROCD=1
+
+PROG=/usr/sbin/uhttpd
+API_PORT_DEFAULT=8080
+
+api_port() {
+	local port
+	port="$(uci -q get rist2rist.main.api_port 2>/dev/null)"
+	case "$port" in
+		''|*[!0-9]*) port="$API_PORT_DEFAULT" ;;
+	esac
+	echo "$port"
+}
+
+lan_ip() {
+	local ip
+	ip="$(ip -4 addr show br-lan 2>/dev/null |
+		sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)"
+	echo "$ip"
+}
+
+start_service() {
+	local ip port
+	ip="$(lan_ip)"
+	port="$(api_port)"
+
+	if [ -z "$ip" ]; then
+		# A WAN-only or not-yet-configured box has no LAN endpoint to serve;
+		# saying so beats a listener that silently answers nowhere.
+		logger -t obr-bridge-api "br-lan has no address; the bridge API is not served"
+		return 1
+	fi
+
+	procd_open_instance
+	procd_set_param command "$PROG" -f \
+		-h /www-bridge \
+		-x / \
+		-p "${ip}:${port}" \
+		-t 60 -T 30
+	procd_set_param respawn
+	procd_close_instance
+}

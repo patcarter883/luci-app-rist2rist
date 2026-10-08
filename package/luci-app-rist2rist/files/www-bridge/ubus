@@ -1,0 +1,77 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Pat Carter
+#
+# The bridge control endpoint: ubus JSON-RPC, NARROWED to the rist2rist object.
+#
+# Why this shim exists rather than uhttpd's own /ubus mapping: uhttpd's ubus
+# plugin authenticates every call through ubus session.access, and on this image
+# that check denies every call -- a valid root session included -- so a bridge
+# call made through LuCI's listener can never succeed. uhttpd's -a flag does make
+# the calls work, but it disables the check for EVERY object on that listener,
+# which would let anyone on the LAN call uci/network/reboot just to reach this
+# one object. This shim speaks the same envelope for rist2rist ONLY and refuses
+# everything else, so the endpoint can never reconfigure the router. The plugin
+# still demands the pair token for itself, and rpcd still applies its own ACL on
+# its own socket.
+#
+# The envelope is the one the encoder already sends (source/bridge/ubus.cpp):
+#   {"jsonrpc":"2.0","id":1,"method":"call","params":[<sid>,"rist2rist","get_config",{...}]}
+
+reply() { # reply <id> <result-json>
+	printf 'Status: 200 OK\r\nContent-Type: application/json\r\n\r\n'
+	printf '{"jsonrpc":"2.0","id":%s,"result":[0,%s]}\n' "$1" "$2"
+}
+
+fail() { # fail <id> <code> <message-as-a-json-string>
+	# The message arrives already quoted: building JSON with printf is the whole
+	# job here, and a refusal that says nothing costs whoever debugs it an hour.
+	printf 'Status: 200 OK\r\nContent-Type: application/json\r\n\r\n'
+	printf '{"jsonrpc":"2.0","id":%s,"error":{"code":%s,"message":%s}}\n' "$1" "$2" "$3"
+}
+
+BODY="$(cat)"
+
+if ! command -v jsonfilter >/dev/null 2>&1; then
+	fail 1 -32000 '"jsonfilter is unavailable"'
+	exit 0
+fi
+
+ID="$(printf '%s' "$BODY" | jsonfilter -e '@.id' 2>/dev/null)"
+case "$ID" in ''|*[!0-9]*) ID=1 ;; esac
+
+OBJ="$(printf '%s' "$BODY" | jsonfilter -e '@.params[1]' 2>/dev/null)"
+METHOD="$(printf '%s' "$BODY" | jsonfilter -e '@.params[2]' 2>/dev/null)"
+
+# The whitelist IS the security boundary: this endpoint exists to serve one
+# object, so anything else is refused here rather than by rpcd.
+if [ "$OBJ" != "rist2rist" ]; then
+	fail "$ID" -32601 '"unknown object"'
+	exit 0
+fi
+case "$METHOD" in
+	status|get_config|claim|set_config|reconcile|reload|release) ;;
+	*)
+		fail "$ID" -32601 '"unknown method"'
+		exit 0
+		;;
+esac
+
+# params[3] is the method's own argument object and is passed through unchanged;
+# jsonfilter prints it back as JSON, which is exactly what `ubus call` wants.
+ARGS="$(printf '%s' "$BODY" | jsonfilter -e '@.params[3]' 2>/dev/null)"
+case "$ARGS" in ''|'null') ARGS='{}' ;; esac
+
+RESULT="$(ubus call rist2rist "$METHOD" "$ARGS" 2>&1)"
+
+# `ubus call` prints the result JSON, or a plain diagnostic line on failure. A
+# plugin-level refusal (token_required, already_claimed) is a SUCCESSFUL call
+# carrying ok:false, and must be passed through untouched -- that is the answer
+# the encoder's decide() reads.
+case "$RESULT" in
+	'{'*) reply "$ID" "$RESULT" ;;
+	*)
+		logger -t obr-bridge-api "ubus call rist2rist $METHOD failed"
+		fail "$ID" -32000 '"the bridge is unreachable"'
+		;;
+esac

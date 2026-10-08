@@ -1,0 +1,180 @@
+#ifndef LIBRIST_STATS_H
+#define LIBRIST_STATS_H
+
+#include "common.h"
+#include "headers.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+struct rist_stats_sender_peer
+{
+	/* cname */
+	char cname[RIST_MAX_STRING_SHORT];
+	/* internal peer id */
+	uint32_t peer_id;
+	/* avg bandwidth calculation */
+	size_t bandwidth;
+	/* bandwidth devoted to retries */
+	size_t retry_bandwidth;
+	/* num sent packets */
+	uint64_t sent;
+	/* num received packets */
+	uint64_t received;
+	/* retransmitted packets */
+	uint64_t retransmitted;
+	/* quality: Q = (sent * 100.0) / sent + bloat_skipped + bandwidth_skipped + retransmit_skipped + retransmitted */
+	double quality;
+	/* current RTT */
+	uint32_t rtt;
+	/* total bytes sent (payload + overhead) */
+	uint64_t sent_bytes;
+	/* total bytes retransmitted */
+	uint64_t retransmitted_bytes;
+	/* context profile (enum rist_profile: 0 simple, 1 main, 2 advanced) */
+	uint8_t profile;
+	/* Non-zero when Advanced framing is active on the wire. An Advanced
+	 * context uses Main framing until the peer advertises Advanced support
+	 * (TR-06-3 Section 9), so profile alone does not imply Advanced framing. */
+	uint8_t advanced_active;
+	/* Non-zero while this bonded leg is currently muted by RTT auto-mute
+	 * (?rtt-drop=): its unique payload is diverted to the healthier legs. */
+	uint8_t rtt_muted;
+	/* Cumulative number of RTT-triggered mute events on this leg. */
+	uint32_t rtt_mute_events;
+};
+
+struct rist_stats_receiver_peer
+{
+	/* internal peer id */
+	uint32_t peer_id;
+	/* num received packets */
+	uint64_t received_data;
+	/* num received rtcp packets */
+	uint32_t received_rtcp;
+	/* sent rtcp packets */
+	uint32_t sent_rtcp;
+	/* current RTT */
+	uint64_t rtt;
+	/* average RTT */
+	double avg_rtt;
+	/* current bandwidth */
+	size_t bandwidth;
+	/* average bandwidth */
+	size_t avg_bandwidth;
+	/* total data bytes received from this peer */
+	uint64_t received_bytes;
+};
+
+struct rist_stats_receiver_flow
+{
+	/* peer count */
+	uint32_t peer_count;
+	/* combined peer cnames */
+	char cname[RIST_MAX_STRING_LONG];
+	/* flow id (set by senders) */
+	uint32_t flow_id;
+	/* flow status */
+	int status;
+	/* avg bandwidth calculation */
+	size_t bandwidth;
+	/* bandwidth devoted to retries */
+	size_t retry_bandwidth;
+	/* num sent packets */
+	uint64_t sent;
+	/* num received packets */
+	uint64_t received;
+	/* missing, including reordered */
+	uint32_t missing;
+	/* reordered */
+	uint32_t reordered;
+	/* total recovered */
+	uint32_t recovered;
+	/* recovered on the first retry */
+	uint32_t recovered_one_retry;
+	/* lost packets */
+	uint32_t lost;
+	/* quality: Q = (received * 100.0) / received + missing */
+	double quality;
+	/* packet inter-arrival time (microseconds) */
+	uint64_t min_inter_packet_spacing;
+	uint64_t cur_inter_packet_spacing;
+	uint64_t max_inter_packet_spacing;
+	/* avg rtt all non dead peers */
+	uint32_t rtt;
+	/* peers */
+	struct rist_stats_receiver_peer *peers;
+	/* average buffer duration in milliseconds (dynamic RIST receiver buffer fill level) */
+	uint64_t avg_buffer_time;
+	/* total data bytes received (payload only, excluding headers) */
+	uint64_t received_bytes;
+	/* context profile (enum rist_profile: 0 simple, 1 main, 2 advanced) */
+	uint8_t profile;
+	/* on-wire sequence-number width: 16 (Simple/Main framing) or 32
+	 * (Advanced framing). A flow reads 16 until the source upgrades framing. */
+	uint8_t seq_bits;
+	/* non-zero when Advanced framing is active on this flow (Advanced context
+	 * on 32-bit framing); reads 0 when an Advanced context stays on Main
+	 * framing and for Main/Simple contexts. */
+	uint8_t advanced_active;
+};
+
+enum rist_stats_type
+{
+	RIST_STATS_SENDER_PEER,
+	RIST_STATS_RECEIVER_FLOW
+};
+
+#define RIST_STATS_VERSION (3)
+#define RIST_SENDER_STATS_VERSION (0)
+
+struct rist_stats
+{
+	uint32_t json_size;
+	char *stats_json;
+	uint16_t version;
+	enum rist_stats_type stats_type;
+	union {
+		struct rist_stats_sender_peer sender_peer;
+		struct rist_stats_receiver_flow receiver_flow;
+	} stats;
+};
+
+/**
+ * @brief Set callback for receiving stats structs
+ *
+ * @param ctx RIST context
+ * @param statsinterval interval between stats reporting
+ * @param stats_cb Callback function that will be called. The json char pointer must be free()'d when you are finished.
+ * @param arg extra arguments for callback function
+ */
+RIST_API int rist_stats_callback_set(struct rist_ctx *ctx, int statsinterval, int (*stats_cb)(void *arg, const struct rist_stats *stats_container), void *arg);
+
+/**
+ * @brief Set callback for receiving sender stats json
+ *
+ * @param ctx RIST context
+ * @param statsinterval interval between stats reporting
+ * @param stats_cb Callback function that will be called. The json char pointer must NOT be free()'d when you are finished.
+ * @param arg extra arguments for callback function
+ */
+RIST_API int rist_sender_stats_callback_set(struct rist_ctx *ctx, int statsinterval, int (*stats_cb)(void *arg, uint16_t version, char *stats_json, uint32_t json_size), void *arg);
+
+/**
+ * @brief Free the rist_stats structure memory allocations
+ *
+ * @return 0 on success or non-zero on error.
+ */
+RIST_API int rist_stats_free(const struct rist_stats *stats_container);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+#endif /* LIBRIST_STATS_H */

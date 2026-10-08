@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Minimal jsonfilter test double for the rist2rist rpcd selftest.
+
+Supports the subset the plugin uses: @.a.b, @.outputs[N].key and @.a.*.b.
+Prints a scalar, or JSON for a list/dict. Exits 1 when the path is absent, which
+is how the real jsonfilter signals "not present" too.
+"""
+import sys
+import json
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    expr = args[args.index("-e") + 1] if "-e" in args else None
+
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        data = {}
+
+    if expr is None:
+        print(json.dumps(data))
+        return 0
+
+    path = expr.strip().lstrip("@").lstrip(".")
+    cur = data
+    if path:
+        for tok in path.split("."):
+            name, idx = tok, None
+            if "[" in tok:
+                name, rest = tok.split("[", 1)
+                raw_idx = rest.rstrip("]")
+                idx = None if raw_idx == "*" else int(raw_idx)
+            if name == "*":
+                if not isinstance(cur, dict):
+                    return 1
+                cur = list(cur.values())
+                continue
+            if name:
+                if not isinstance(cur, dict) or name not in cur:
+                    return 1
+                cur = cur[name]
+            if idx is not None:
+                if not isinstance(cur, list) or idx >= len(cur):
+                    return 1
+                cur = cur[idx]
+
+    if isinstance(cur, (dict, list)):
+        print(json.dumps(cur))
+    elif cur is True:
+        print("true")
+    elif cur is False:
+        print("false")
+    elif cur is None:
+        return 1
+    else:
+        print(cur)
+    return 0
+
+
+sys.exit(main())

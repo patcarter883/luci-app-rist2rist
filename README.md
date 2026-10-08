@@ -19,6 +19,36 @@ Bonded links present as **multiple RIST peers on one session port** — the
 `miface`-per-WAN outputs of `rist2rist` all target the same receiver
 `host:port`. Every RIST hop runs `timing-mode=0` (SOURCE).
 
+## Control API
+
+The bridge is configured over ubus by the encoder through a **narrowed CGI
+shim**, not by exposing ubus itself:
+
+- `/www-bridge/ubus` forwards **only** the `rist2rist` object, so the endpoint
+  cannot reconfigure anything else on the router. Its own procd-managed uhttpd
+  instance (`/etc/init.d/obr-bridge-api`) serves it on the LAN at `api_port`
+  (default 8080). This is deliberately **not** `uhttpd -a`, which disables the
+  JSON-RPC session check for every ubus object reachable on that port.
+- The advertised port comes from `rist2rist.main.api_port`. Advertising LuCI's
+  port 80 instead sends clients to a `/ubus` mapping that cannot serve these
+  calls.
+- A claim token gates state-changing calls. It is minted from
+  `head -c 32 /dev/urandom | hexdump …` rather than `base64`, which a stock
+  OpenWrt userland does not ship.
+
+The package postinst also restarts `rist2rist` when it is enabled — without
+that, an upgrade brings the box back up with the relay stopped.
+
+## RIST recovery window
+
+Every RIST URL this package builds carries `bandwidth=` (Kbps) on **both** the
+listen and the output leg. The libRIST default of 100000 assumes a 100 Mbit/s
+link, which makes a 5000 ms buffer exceed the Advanced-profile NACK window
+(~47492 packets against 32768): the tail is unrecoverable and the daemon warns
+on every start. `maxbitrate` (default 20000 kbit/s) keeps the same buffer inside
+the window. The URL parameter is `bandwidth` — `recovery-maxbitrate` is the
+*library*-level name and the URL parser rejects it outright.
+
 ## Licensing
 
 - The **LuCI application** (JS view, UCI schema, init script, packaging) is

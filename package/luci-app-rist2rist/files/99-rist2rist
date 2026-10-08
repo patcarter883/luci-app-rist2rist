@@ -1,0 +1,37 @@
+#!/bin/sh
+# /etc/hotplug.d/iface/99-rist2rist
+#
+# The output legs of rist2rist bind a WAN interface (miface=). A leg whose
+# interface is absent is skipped by rist2rist.init rather than fed to the binary,
+# because librist exits(1) on a bind failure and procd would crash-loop. That
+# guard means the service does NOT start while a modem is unplugged -- correct,
+# but it also means nothing brings it up again when the modem returns.
+#
+# This hook closes that loop: on ifup of an interface a destination names, reload
+# the service so the leg is rebuilt. Cheap, idempotent, and it keeps the
+# "absent modem" case a non-event instead of an operator intervention.
+#
+# Only interfaces actually referenced by a destination trigger a reload, so an
+# unrelated interface coming up does not bounce a running stream.
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ -n "$INTERFACE" ] || exit 0
+
+. /lib/functions.sh
+
+config_load rist2rist
+config_get_bool enabled main enabled 0
+[ "$enabled" -eq 1 ] || exit 0
+
+# Is this interface one of the configured output legs?
+match=0
+check_destination() {
+    local cfg="$1" iface
+    config_get iface "$cfg" 'interface'
+    [ "$iface" = "$INTERFACE" ] && match=1
+}
+config_foreach check_destination 'destination'
+[ "$match" -eq 1 ] || exit 0
+
+logger -t rist2rist "interface ${INTERFACE} came up: reloading to pick up its output leg"
+/etc/init.d/rist2rist reload

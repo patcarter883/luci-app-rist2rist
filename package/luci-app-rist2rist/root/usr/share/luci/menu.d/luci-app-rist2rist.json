@@ -1,0 +1,13 @@
+{
+	"admin/services/rist2rist": {
+		"title": "RIST Proxy",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "rist2rist"
+		},
+		"depends": {
+			"acl": [ "luci-app-rist2rist" ]
+		}
+	}
+}
