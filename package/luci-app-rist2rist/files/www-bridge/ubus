@@ -50,7 +50,7 @@ if [ "$OBJ" != "rist2rist" ]; then
 	exit 0
 fi
 case "$METHOD" in
-	status|get_config|claim|set_config|reconcile|reload|release) ;;
+	status|get_config|claim|set_config|set_link_secret|reconcile|reload|release) ;;
 	*)
 		fail "$ID" -32601 '"unknown method"'
 		exit 0

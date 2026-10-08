@@ -74,15 +74,21 @@ virgin()     { export STUB_DESTINATIONS=0; }
 configured() { unset STUB_DESTINATIONS 2>/dev/null || true; }
 
 # run <managed 0|1> <method> [body] -- the exported state above is inherited.
+# LINK_SECRET_FILE is redirected into the sandbox: the real path is /etc, and a
+# test must never write there.
 run() {
 	if [ -n "${3:-}" ]; then
 		printf '%s' "$3" | env UCI_STUB_LOG="$tmp/uci" STUB_MAIN_MANAGED="$1" \
 			FUNCTIONS_SH="$stub" RELOAD_CMD="$here/bin/reload-stub" \
-			RELOAD_STUB_LOG="$tmp/reload" sh "$plugin" call "$2" || true
+			RELOAD_STUB_LOG="$tmp/reload" LINK_SECRET_FILE="$tmp/link_secret" \
+			PROC_ROOT="$tmp/proc" \
+			sh "$plugin" call "$2" || true
 	else
 		env UCI_STUB_LOG="$tmp/uci" STUB_MAIN_MANAGED="$1" \
 			FUNCTIONS_SH="$stub" RELOAD_CMD="$here/bin/reload-stub" \
-			RELOAD_STUB_LOG="$tmp/reload" sh "$plugin" call "$2" </dev/null || true
+			RELOAD_STUB_LOG="$tmp/reload" LINK_SECRET_FILE="$tmp/link_secret" \
+			PROC_ROOT="$tmp/proc" \
+			sh "$plugin" call "$2" </dev/null || true
 	fi
 }
 
@@ -322,6 +328,88 @@ check_log "release commits" "$tmp/uci" "commit rist2rist"
 out=$(run 1 release '{"token":"not-the-token"}')
 check "release without a valid token is refused" "$out" \
 	"d['ok'] is False and d['error'] == 'bad_token'"
+
+echo
+echo "-- link secret (write-only) --"
+
+configured; claimed
+rm -f "$tmp"/uci* "$tmp/link_secret"
+
+out=$(run 1 set_link_secret "$(tb '{"link_secret":"s3cret-abcdefghij"}')")
+check "a valid link secret is accepted" "$out" \
+	"d['ok'] is True and d['link_secret_set'] is True"
+check "the acknowledgement never echoes the secret" "$out" "'s3cret' not in json.dumps(d)"
+
+if [ -f "$tmp/link_secret" ]; then
+	if [ "$(stat -c %a "$tmp/link_secret")" = "600" ]; then
+		echo "  OK   the secret is stored with mode 600"
+	else
+		echo "  FAIL the secret file mode is $(stat -c %a "$tmp/link_secret"), expected 600"
+		fails=$((fails + 1))
+	fi
+	if [ "$(cat "$tmp/link_secret")" = "s3cret-abcdefghij" ]; then
+		echo "  OK   the secret file holds exactly the secret"
+	else
+		echo "  FAIL the secret file content is wrong"
+		fails=$((fails + 1))
+	fi
+else
+	echo "  FAIL the secret file was not written"
+	fails=$((fails + 1))
+fi
+
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config reports only THAT a secret is set" "$out" "d['link_secret_set'] is True"
+check "get_config never contains the secret" "$out" "'s3cret' not in json.dumps(d)"
+
+# status reports the daemon's real argv from the kernel, and that argv now
+# carries the output URL -- so a READ method must not hand the key back. The ubus
+# double reports a fixed pid; the crafted cmdline is that process's argv.
+mkdir -p "$tmp/proc/4242"
+printf 'rist2rist\000-i\000rist://@0.0.0.0:5000\000-o\000rist://receiver:5000?bandwidth=20000&secret=s3cret-abcdefghij\000' \
+	> "$tmp/proc/4242/cmdline"
+out=$(run 1 status "$(tb '{}')")
+check "status reports the running command line" "$out" \
+	"d['running'] is True and 'receiver:5000' in d['argv']"
+check "status redacts the secret's value" "$out" "'secret=REDACTED' in d['argv']"
+check "status never contains the secret" "$out" "'s3cret' not in json.dumps(d)"
+
+out=$(run 1 set_link_secret "$(tb '{"link_secret":"short"}')")
+check "an implausibly short secret is refused" "$out" \
+	"d['ok'] is False and d['error'] == 'bad_link_secret'"
+
+out=$(run 1 set_link_secret "$(tb '{"link_secret":"bad secret with spaces"}')")
+check "a secret with unsafe characters is refused" "$out" \
+	"d['ok'] is False and d['error'] == 'bad_link_secret'"
+
+out=$(run 1 set_link_secret "$(tb '{"link_secret":"goodsecret123","aes_type":"256"}')")
+check "a secret cannot smuggle fields past the whitelist" "$out" \
+	"d['ok'] is False and d['error'] == 'unknown_field'"
+
+out=$(run 1 set_config "$(tb '{"link_secret":"goodsecret123"}')")
+check "set_config does not accept a link secret" "$out" \
+	"d['ok'] is False and d['error'] == 'unknown_field'"
+
+out=$(run 1 set_config "$(tb '{"secret":"goodsecret123"}')")
+check "set_config still refuses a secret-bearing URL field" "$out" \
+	"d['ok'] is False and d['error'] == 'secret_field'"
+
+out=$(run 0 set_link_secret "$(tb '{"link_secret":"goodsecret123"}')")
+check "an unmanaged bridge refuses a link secret" "$out" \
+	"d['ok'] is False and d['error'] == 'unmanaged'"
+
+out=$(run 1 set_link_secret '{"link_secret":"goodsecret123"}')
+check "a link secret without a token is refused" "$out" \
+	"d['ok'] is False and d['error'] == 'token_required'"
+
+out=$(run 1 set_link_secret "$(tb '{"link_secret":""}')")
+check "an empty secret clears it" "$out" "d['ok'] is True and d['link_secret_set'] is False"
+if [ -f "$tmp/link_secret" ]; then
+	echo "  FAIL the cleared secret file still exists"
+	fails=$((fails + 1))
+else
+	echo "  OK   clearing removes the secret file"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then
