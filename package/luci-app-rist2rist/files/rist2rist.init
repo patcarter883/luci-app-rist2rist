@@ -216,6 +216,29 @@ append_output_url() {
     query="timing-mode=0"
     [ -n "$OUTPUT_RECOVERY" ] && query="${query}&${OUTPUT_RECOVERY}"
 
+    # The session's RIST passphrase, installed write-only through the control API
+    # (set_link_secret) and stored 0600. It goes on the OUTPUT leg ONLY: the
+    # encoder->bridge hop is a LAN link, and putting the key on the listen leg
+    # would require every sender on that LAN -- the rig, the portal's own tests --
+    # to carry the session's key as well.
+    #
+    # aes-type is not a secret, so it is a plain uci option that LuCI can show.
+    # libRIST takes 128 or 256 here, matching its -e / aes-type.
+    #
+    # The value must never reach a log: the plugin redacts it in `status`, and
+    # 003-rist2rist-redact-secret-in-url-log.patch redacts it in the daemon's own
+    # Outurl line. Only argv carries it in the clear, and argv is root-readable --
+    # libRIST offers no file-based passphrase.
+    local psk secret_file aes
+    secret_file=/etc/rist2rist.link_secret
+    if [ -s "$secret_file" ] && [ -r "$secret_file" ]; then
+        psk=$(head -n 1 "$secret_file")
+        if [ -n "$psk" ]; then
+            config_get aes 'main' 'psk_aes' 256
+            query="${query}&secret=${psk}&aes-type=${aes}"
+        fi
+    fi
+
     if [ "$UPLINK_CONFIGURED" -eq 0 ]; then
         # No uplinks declared: this bridge is not bonding, so send over the default
         # route. A single-WAN box needs no uplink list, and requiring one would be
