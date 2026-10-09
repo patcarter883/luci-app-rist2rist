@@ -537,7 +537,7 @@ shape_configure() { # shape_configure <iface> <kbps> -> echoes the kbps written
 # wrong reading for a leg that carried its rate and merely bloated. <best> empty
 # means no leg measured, so no weight is derivable and every weight is null.
 legs_json() { # legs_json <best-kbps|empty>
-	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj sh sc sq sl s_if s_v c_if c_k b_if b_v budget
+	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj sh sc sq sl s_if s_v c_if c_k c_half b_if b_v budget
 
 	while IFS='|' read -r iface state kbps at fak q lr fr; do
 		[ -n "$iface" ] || continue
@@ -830,9 +830,16 @@ SHAPER_EOF
 			# stopping at the shaper's rate confirms it, climbing past it says
 			# it is not engaging, stopping well below says it is too tight. The
 			# budget is left alone so the ramp can climb and find where it bites.
+			# The ramp has to START BELOW the shaper and climb through it, or it
+			# fails on its own first step and confirms nothing: the tool's floor
+			# is 500 kbit/s, which is already over a 450 shaper, and the shaped
+			# run came back with measured 0. Half the shaper is a rate the link
+			# has been measured to carry; the shaper is the ceiling, so the ramp
+			# stops where the shaper bites and its measured lands just under it.
+			c_half=$((c_kbps / 2))
 			j=$("$PROBE_CMD" "$c_if" -u "$endpoint" --psk-file "$pskfile" \
 				--state-file "${PROBE_STATE_DIR}/shaped-${c_if}.json" \
-				-j 2>/dev/null)
+				--floor-kbps "$c_half" --max-kbps "$c_kbps" -j 2>/dev/null)
 			ck=$(printf '%s' "$j" | jsonfilter -e '@.measured_kbps' 2>/dev/null)
 			cq=$(printf '%s' "$j" | jsonfilter -e '@.quality' 2>/dev/null)
 			ch=$(printf '%s' "$j" | jsonfilter -e '@.rtt_held' 2>/dev/null)

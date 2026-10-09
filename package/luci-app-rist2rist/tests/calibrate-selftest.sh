@@ -428,6 +428,8 @@ assert "and it runs after the shaper is put back, never before" \
 	"[ \"\$(printf '%s' \"\$argvlog\" | grep -n 'shaped-lo.json' | cut -d: -f1)\" -gt \"\$(printf '%s' \"\$argvlog\" | grep -n 'sqm start' | cut -d: -f1)\" ]"
 assert "it is the STANDARD test -- a ramp, not a held rate" \
 	"[ \"\$(printf '%s' \"\$argvlog\" | grep 'shaped-' | grep -c -- '-r ')\" = 0 ]"
+assert "the ramp starts BELOW the shaper, or it fails on its own first step" \
+	"printf '%s' \"\$argvlog\" | grep 'shaped-' | grep -q -- '--floor-kbps 225 --max-kbps 450'"
 assert "and the report says what the shaped leg then measured" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_measured_kbps\"]')\" = 2000 ]"
 assert "the budget the bridge will SEND with is the sum of the shapers" \
