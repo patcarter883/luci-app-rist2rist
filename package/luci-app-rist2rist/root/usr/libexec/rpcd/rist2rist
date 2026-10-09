@@ -609,11 +609,17 @@ CONFIRM_EOF
 		# raw figure the link has since gone below. Bands are named, not implied, so a
 		# report can be read without doing the arithmetic yourself.
 		sv=""
-		if [ -n "$sc" ] && [ -n "$sh" ] && [ "$sc" -ge 1 ] 2>/dev/null && [ "$sh" -ge 1 ] 2>/dev/null; then
-			if [ "$sc" -gt $((sh * 125 / 100)) ]; then
-				sv=not_shaping
-			elif [ "$sc" -lt $((sh * 75 / 100)) ]; then
+		if [ -n "$sc" ] && [ -n "$sfa" ] && [ "$sh" -ge 1 ] 2>/dev/null && [ "$sfa" -ge 1 ] 2>/dev/null; then
+			# The BREAK point is the comparison, NOT the last clean step. The ramp
+			# steps in 1.5x jumps, so the clean step below the shaper is always well
+			# under it -- comparing THAT to the shaper reports a working shaper as too
+			# tight. Observed on the bridge: held 505, broke at 675 against a 675
+			# shaper, i.e. the shaper was the binding constraint exactly, and the old
+			# comparison called it too_tight. Where the ramp BROKE is where it bit.
+			if [ "$sfa" -lt "$sh" ]; then
 				sv=too_tight
+			elif [ "$sfa" -gt $((sh * 150 / 100)) ]; then
+				sv=not_shaping
 			else
 				sv=confirmed
 			fi

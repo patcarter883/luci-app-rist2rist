@@ -497,12 +497,15 @@ echo
 echo "-- a shaped leg that holds its shaper is confirmed --"
 rm -f "$tmp/shaped"/*
 PROBE_lo_KBPS=450
+PROBE_lo_FAILED_AT=450
 PROBE_wwan1_KBPS=0
 PROBE_wwan1_RC=3
-export PROBE_wwan1_RC
+export PROBE_wwan1_RC PROBE_lo_FAILED_AT
 out=$(run_cal)
-assert "the shaped leg's own ceiling against the shaper is the whole verdict" \
+assert "breaking AT the shaper is a confirmation, not a complaint" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_verdict\"]')\" = confirmed ]"
+assert "and breaking BELOW the shaper is not -- the link is worse than measured" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_failed_at_kbps\"]')\" = 450 ]"
 unset PROBE_wwan1_RC
 
 echo
