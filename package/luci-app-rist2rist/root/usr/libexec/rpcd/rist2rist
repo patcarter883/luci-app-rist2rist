@@ -474,7 +474,13 @@ method_calibrate() {
 		return 0
 	fi
 
-	legs=$(wan_links)
+	# `wan_links_present`, NOT `wan_links`: the resolver lists every CONFIGURED WAN,
+	# including one whose device is absent (`wwan0` on this box), and only the present
+	# set is what the init actually bonds. Measuring an absent leg would spend probe
+	# bytes on a link that is not there, and -- because it cannot answer -- would make
+	# the aggregate `partial` and refuse a weight even when the one real leg measured
+	# perfectly. It would also write a weight for a leg that is never bonded.
+	legs=$(wan_links_present)
 	if [ -z "$legs" ]; then
 		err probe_no_legs "no WAN link is present to measure"
 		return 0

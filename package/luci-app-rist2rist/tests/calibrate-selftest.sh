@@ -25,9 +25,13 @@ trap 'rm -rf "$tmp"' EXIT
 TOKEN='test-token-abcdefghijklmnop'
 TOKEN_HASH=$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)
 
-# The two present legs this box has, in the resolver's order.
+# The resolver exposes TWO answers, as the real one does: `wan_links` is every
+# CONFIGURED WAN and `wan_links_present` the ones actually there. wwan0 is the box's
+# configured-but-absent leg (`NO_DEVICE`), so it must be in the first and NOT the
+# second -- the exact shape that made calibrate probe a modem that was not attached.
 cat > "$tmp/wan.sh" <<'WAN'
-wan_links() { echo lo; echo wwan1; }
+wan_links() { echo wwan0; echo lo; echo wwan1; }
+wan_links_present() { echo lo; echo wwan1; }
 WAN
 
 # The probe double. PROBE_<iface>_KBPS is that leg's carried rate and
@@ -163,6 +167,23 @@ assert "the slow leg is floored at 1, not rounded to 0" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][1][\"weight\"]')\" = 1 ]"
 assert "NO leg is ever weighted 0 (weight 0 means DUPLICATE, not unused)" \
 	"! printf '%s' \"\$(cat \"\$UCI_STUB_LOG\")\" | grep -qE 'weight=0( |$)'"
+
+# ---------------------------------------------------------------------------
+echo
+echo "-- an ABSENT leg (configured, no device) is not measured and not weighted --"
+PROBE_lo_KBPS=2000
+PROBE_wwan1_KBPS=500
+out=$(run_cal)
+log=$(cat "$UCI_STUB_LOG")
+
+assert "only the PRESENT legs are reported -- the absent one is not in the array" \
+	"[ \"\$(field \"\$out\" 'sorted(L[\"interface\"] for L in d[\"legs\"])')\" = \"['lo', 'wwan1']\" ]"
+assert "the absent leg is never probed" \
+	"! printf '%s' \"\$(cat \"\$PROBE_ARGV_LOG\")\" | grep -q wwan0"
+assert "and no weight is written for a leg that will never be bonded" \
+	"! printf '%s' \"\$log\" | grep -q wwan0"
+assert "an absent leg cannot poison the aggregate (it is not in it to fail)" \
+	"[ \"\$(field \"\$out\" 'd[\"aggregate_state\"]')\" = ok ]"
 
 # ---------------------------------------------------------------------------
 echo
