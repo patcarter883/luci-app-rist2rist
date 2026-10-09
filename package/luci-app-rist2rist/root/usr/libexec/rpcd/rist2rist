@@ -609,7 +609,8 @@ CONFIRM_EOF
 		# raw figure the link has since gone below. Bands are named, not implied, so a
 		# report can be read without doing the arithmetic yourself.
 		sv=""
-		if [ -n "$sc" ] && [ -n "$sfa" ] && [ "$sh" -ge 1 ] 2>/dev/null && [ "$sfa" -ge 1 ] 2>/dev/null; then
+		if [ -n "$sc" ] && [ "$sh" -ge 1 ] 2>/dev/null; then
+		if [ -n "$sfa" ] && [ "$sfa" -ge 1 ] 2>/dev/null; then
 			# The BREAK point is the comparison, NOT the last clean step. The ramp
 			# steps in 1.5x jumps, so the clean step below the shaper is always well
 			# under it -- comparing THAT to the shaper reports a working shaper as too
@@ -623,6 +624,15 @@ CONFIRM_EOF
 			else
 				sv=confirmed
 			fi
+		else
+			# The ramp never broke: it climbed to its ceiling and every step was clean.
+			# Its ceiling IS the shaper (the ramp is capped there), so the shaper did not
+			# limit the link -- a finding about the setting, not a value we failed to
+			# compute. Left as null it read as though the confirmation had not run, which
+			# is what a report from the bridge showed: ramp clean to 675 against a 675
+			# shaper, and no verdict at all.
+			sv=not_shaping
+		fi
 		fi
 		# An unset verdict is null, not a hole: a field with no value takes the whole
 		# report with it, so a caller loses the calibration rather than one field.

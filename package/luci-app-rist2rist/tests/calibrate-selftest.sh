@@ -509,6 +509,24 @@ assert "and breaking BELOW the shaper is not -- the link is worse than measured"
 unset PROBE_wwan1_RC
 
 echo
+echo "-- a shaped ramp that never breaks is a finding, not a missing value --"
+# The ramp is capped at the shaper, so a run that climbs to that ceiling with every
+# step clean means the shaper did not limit the link. That has to be REPORTED: as
+# null it reads as though the confirmation never ran. Seen on the bridge.
+rm -f "$tmp/shaped"/*
+PROBE_lo_KBPS=450
+PROBE_wwan1_KBPS=0
+PROBE_wwan1_RC=3
+unset PROBE_lo_FAILED_AT
+export PROBE_wwan1_RC
+out=$(run_cal)
+assert "a ramp that runs clean to its ceiling means the shaper is not holding" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_verdict\"]')\" = not_shaping ]"
+assert "and no break point is invented for a ramp that did not break" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_failed_at_kbps\"]')\" = None ]"
+unset PROBE_wwan1_RC
+
+echo
 echo "-- a leg that did NOT measure is never shaped from a guess --"
 rm -f "$tmp/shaped"/*
 PROBE_lo_KBPS=2000
