@@ -397,6 +397,55 @@ rm -f "$tmp/shaped"/*
 
 # ---------------------------------------------------------------------------
 echo
+echo "-- the shaper is SET from the measurement, and the setting is confirmed --"
+# Measure -> configure -> VERIFY. A shaper set from nothing is a guess, and a
+# setting that was never tested is an assumption: the legs are measured raw, the
+# shaper is written from those measurements, and then each shaped leg is held at
+# the rate it was just set to, with the shaper up, to see whether the link does
+# what the numbers say.
+touch "$tmp/shaped/ifb4wwan1"
+STUB_SQM_QUEUES="lo wwan1"
+export STUB_SQM_QUEUES
+PROBE_lo_KBPS=2000
+PROBE_wwan1_KBPS=500
+out=$(run_cal)
+log=$(cat "$UCI_STUB_LOG")
+argvlog=$(cat "$PROBE_ARGV_LOG")
+
+assert "each measured leg's own queue is set, at the measured capacity less the margin" \
+	"printf '%s' \"\$log\" | grep -q 'set sqm.@queue\[0\].upload=1800' && printf '%s' \"\$log\" | grep -q 'set sqm.@queue\[1\].upload=450'"
+assert "the queue is found by INTERFACE, so a leg is never shaped on another leg's queue" \
+	"printf '%s' \"\$log\" | grep -q 'set sqm.@queue\[1\].upload=450'"
+assert "the shaper change is committed, separately from the bridge's own config" \
+	"printf '%s' \"\$log\" | grep -q 'commit sqm'"
+assert "the report says what each leg was shaped to" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaper_kbps\"]')\" = 1800 ]"
+assert "and the other leg's, from its own measurement" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][1][\"shaper_kbps\"]')\" = 450 ]"
+assert "the confirmation runs WITH the shaper up, at the rate just set" \
+	"printf '%s' \"\$argvlog\" | grep -q -- '-r 450'"
+assert "and it runs after the shaper is put back, never before" \
+	"[ \"\$(printf '%s' \"\$argvlog\" | grep -n -- '-r 450' | cut -d: -f1)\" -gt \"\$(printf '%s' \"\$argvlog\" | grep -n 'sqm start' | cut -d: -f1)\" ]"
+
+echo
+echo "-- a leg that did NOT measure is never shaped from a guess --"
+rm -f "$tmp/shaped"/*
+PROBE_lo_KBPS=2000
+PROBE_wwan1_KBPS=0
+PROBE_wwan1_RC=3
+export PROBE_wwan1_RC
+out=$(run_cal)
+log=$(cat "$UCI_STUB_LOG")
+assert "the measured leg is shaped" \
+	"printf '%s' \"\$log\" | grep -q 'set sqm.@queue\[0\].upload=1800'"
+assert "the leg that carried nothing gets NO shaper value" \
+	"! printf '%s' \"\$log\" | grep -q 'set sqm.@queue\[1\].upload'"
+assert "and the report says so rather than inventing one" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][1][\"shaper_kbps\"]')\" = None ]"
+unset PROBE_wwan1_RC
+
+# ---------------------------------------------------------------------------
+echo
 if [ "$fails" -eq 0 ]; then
 	echo "ALL PASS"
 else

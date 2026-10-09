@@ -24,7 +24,7 @@ diff -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
 diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-probe.c
 --- a/tools/rist2rist-probe.c	1970-01-01 10:00:00.000000000 +1000
 +++ b/tools/rist2rist-probe.c	2026-10-09 18:26:22.795775280 +1100
-@@ -0,0 +1,1181 @@
+@@ -0,0 +1,1205 @@
 +/*
 + * rist2rist-probe -- a standalone, operator-runnable ACTIVE probe of ONE WAN leg.
 + * SPDX-License-Identifier: AGPL-3.0-or-later
@@ -563,6 +563,12 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +	 * (0.00 and null) whatever it had actually done. */
 +	int failed_on_rtt;
 +	int failed_on_quality;
++	/* Did the path HOLD its latency under load? A ramp can fail on it, and a HELD
++	 * run must be able to answer it too -- that is how a configured shaper is
++	 * confirmed: hold the shaped rate and see whether the RTT stays flat. One
++	 * definition of the criterion, so the two can never disagree.
++	 * -1 unknown (no usable sample), 0 risen, 1 held. */
++	int rtt_held;
 +	unsigned long long skipped_pkts;   /* refused retransmissions, all reasons */
 +};
 +
@@ -602,6 +608,12 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +	fprintf(out, ",\"failed_on_rtt\":%s,\"failed_on_quality\":%s",
 +		r->failed_on_rtt ? "true" : "false",
 +		r->failed_on_quality ? "true" : "false");
++	/* The latency verdict, answerable by a HELD run as well as a ramp -- the
++	 * confirmation a configured shaper gets. */
++	if (r->rtt_held < 0)
++		fprintf(out, ",\"rtt_held\":null");
++	else
++		fprintf(out, ",\"rtt_held\":%s", r->rtt_held ? "true" : "false");
 +	fprintf(out, ",\"quality\":%.2f,\"advanced_framing\":%s,\"sent_packets\":%llu,"
 +		"\"retransmitted_packets\":%llu",
 +		r->quality, r->advanced ? "true" : "false",
@@ -749,6 +761,7 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +	memset(&res, 0, sizeof(res));
 +	res.baseline_rtt_ms = -1.0;
 +	res.loaded_rtt_ms = -1.0;
++	res.rtt_held = -1;
 +
 +	while ((opt = getopt_long(argc, argv, "u:e:r:jh", longopts, NULL)) != -1) {
 +		switch (opt) {
@@ -1048,6 +1061,13 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +		res.carried_kbps = fixed_rate;
 +		res.loaded_rtt_ms = rtt_max > 0.0 ? rtt_max : -1.0;
 +		res.quality = q;
++		/* The latency verdict for a HELD rate. This is what CONFIRMS a shaper:
++		 * hold the rate it was configured to and see whether the path still
++		 * bloats. A ramp cannot answer it -- behind a working shaper a ramp has
++		 * no loss to stop it and climbs to its ceiling. */
++		if (res.baseline_rtt_ms > 0.0 && rtt_max > 0.0)
++			res.rtt_held = !(rtt_max >
++				res.baseline_rtt_ms * (1.0 + rise_pct / 100.0));
 +	} else {
 +		/* ---- phase 2: ramp until the leg stops carrying it ----------- */
 +		double rate_f = (double)floor_kbps;
@@ -1068,19 +1088,23 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +			}
 +			q = qsnap_quality(&snap);
 +
-+			/* A step is CLEAN while latency has not risen materially above idle
-+			 * and librist's quality has not started to degrade. When RTT is
-+			 * unknown the quality signal alone decides -- the probe must not
-+			 * call a leg good because a number was missing. */
-+			clean = 1;
++			/* The verdict is LOSS, because that is what "the leg carries this
++			 * rate" means -- and what a weight and a shaper are derived from.
++			 *
++			 * A latency rise does NOT stop the ramp. It is reported instead
++			 * (failed_on_rtt, and the step's loaded RTT), because it is the signal
++			 * the SHAPER answers: a rate that bloats the path is fixed by shaping
++			 * below it, not by refusing to measure it. Failing on latency made a
++			 * leg that carried its rate at 100% quality report NO capacity -- and
++			 * so derive no weight and no shaper -- on exactly the legs that most
++			 * need shaping. */
 +			rose_rtt = 0;
 +			if (res.baseline_rtt_ms > 0.0 && rtt_max > 0.0 &&
-+			    rtt_max > res.baseline_rtt_ms * (1.0 + rise_pct / 100.0)) {
-+				clean = 0;
-+				rose_rtt = 1;
-+			}
-+			if (q < quality_floor)
-+				clean = 0;
++			    rtt_max > res.baseline_rtt_ms * (1.0 + rise_pct / 100.0))
++				rose_rtt = 1;   /* reported, not fatal */
++			if (res.baseline_rtt_ms > 0.0 && rtt_max > 0.0)
++				res.rtt_held = !rose_rtt;
++			clean = (q >= quality_floor);
 +
 +			if (!clean) {
 +				res.failed_kbps = (unsigned long long)rate_f;

@@ -134,6 +134,12 @@ redact_url() { # redact_url <text>
 # The shaper's service. Overridable so the off-device suite can supply one.
 SQM_INIT="${SQM_INIT:-/etc/init.d/sqm}"
 
+# A shaper is set to the measured usable capacity less this margin. It has to BE
+# the bottleneck: shaping AT the capacity still lets the link's own queue fill at
+# the top of every burst, and shaping ABOVE it -- what an untouched 8 Mbit shaper
+# is on a 500 kbit/s leg -- never engages at all.
+CAPACITY_MARGIN_PCT="${CAPACITY_MARGIN_PCT:-90}"
+
 err() { # err <code> <message> [legs-json] [shaper]
 	local extra=""
 	[ -n "$3" ] && extra="$extra,\"legs\":[$3]"
@@ -224,6 +230,12 @@ measure_field_json() { # measure_field_json <leg-index-or-empty> <field> <str|nu
 		*)   printf '%s' "$v" ;;
 	esac
 }
+
+# "interface shaper-kbps quality held" lines for the CONFIRMATION run each shaped
+# leg got, and "interface value" lines for what was applied. Reported, so the
+# result says what the box was actually configured to.
+SHAPER_SET=""
+CONFIRMED=""
 
 # config_foreach callback: record a `config uplink` section as "section interface
 # weight" lines, collected ONCE per get_config. config_foreach runs its callback
@@ -486,13 +498,42 @@ shape_resume() { # shape_resume "<cleared ifaces>" -> echoes "" / restored / res
 	printf '%s' "restored"
 }
 
+sqm_queue_for() { # sqm_queue_for <iface> -> echoes the sqm queue's index, or ""
+	local i=0 iface
+
+	while :; do
+		iface=$(uci -q get "sqm.@queue[$i]" 2>/dev/null | head -1)
+		[ -n "$iface" ] || break
+		[ "$iface" = "$1" ] && { printf '%s' "$i"; return 0; }
+		i=$((i + 1))
+	done
+	printf '%s' ""
+}
+
+# Configure the shaper a leg was measured to need: its own SQM queue, set to the
+# measured usable capacity less the margin. The queue for a leg is the one whose
+# `interface` IS that leg -- a box with no queue for it is simply not shaped on
+# that leg, and inventing one would be a second opinion about the network config.
+shape_configure() { # shape_configure <iface> <kbps> -> echoes the kbps written
+	local iface="$1" kbps="$2" want q
+
+	[ -n "$kbps" ] || { printf '%s' ""; return 0; }
+	[ -x "$SQM_INIT" ] || { printf '%s' ""; return 0; }
+	want=$((kbps * CAPACITY_MARGIN_PCT / 100))
+	[ "$want" -ge 1 ] || { printf '%s' ""; return 0; }
+	q=$(sqm_queue_for "$iface")
+	[ -n "$q" ] || { printf '%s' ""; return 0; }
+	uci -q set "sqm.@queue[$q].upload=$want" || { printf '%s' ""; return 0; }
+	printf '%s' "$want"
+}
+
 # The per-leg report, built ONCE and used by BOTH exits. A calibration that
 # derives no weight still has to say, per leg, WHY -- otherwise the caller sees
 # only "measured nothing", which reads as a dead link, and that is exactly the
 # wrong reading for a leg that carried its rate and merely bloated. <best> empty
 # means no leg measured, so no weight is derivable and every weight is null.
 legs_json() { # legs_json <best-kbps|empty>
-	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj
+	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj sh sq sl s_if s_v c_if c_q c_h
 
 	while IFS='|' read -r iface state kbps at fak q lr fr; do
 		[ -n "$iface" ] || continue
@@ -502,12 +543,24 @@ legs_json() { # legs_json <best-kbps|empty>
 			[ "$w" -lt 1 ] && w=1
 		fi
 		[ -n "$w" ] && wj="$w" || wj=null
+		sh=""; sq=""; sl=""
+		while read -r s_if s_v; do
+			[ "$s_if" = "$iface" ] && { sh="$s_v"; break; }
+		done <<SHAPER_EOF
+$SHAPER_SET
+SHAPER_EOF
+		while IFS='|' read -r c_if c_q c_h; do
+			[ "$c_if" = "$iface" ] && { sq="$c_q"; sl="$c_h"; break; }
+		done <<CONFIRM_EOF
+$CONFIRMED
+CONFIRM_EOF
 		[ "$first" -eq 1 ] || out="$out,"
 		first=0
-		out="$out$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"measured_at":%s,"failed_at_kbps":%s,"failed_on_rtt":%s,"quality":%s,"loaded_rtt_ms":%s}' \
-			"$(json_str "$iface")" "$state" "$wj" "${kbps:-null}" \
+		out="$out$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"shaper_kbps":%s,"measured_at":%s,"failed_at_kbps":%s,"failed_on_rtt":%s,"quality":%s,"loaded_rtt_ms":%s,"shaped_quality":%s,"shaped_held":%s}' \
+			"$(json_str "$iface")" "$state" "$wj" "${kbps:-null}" "${sh:-null}" \
 			"$(measure_json_str "$at")" "${fak:-null}" "${fr:-null}" \
-			"${q:-null}" "${lr:-null}")"
+			"${q:-null}" "${lr:-null}" "${sq:-null}" \
+			"${sl:-null}")"
 	done <<LEGS_EOF
 $measured
 LEGS_EOF
@@ -626,12 +679,9 @@ method_calibrate() {
 $legs
 WAN_LINKS_EOF
 
-	# Put the shaper back as soon as the last probe has finished -- the derivation
-	# below needs no traffic -- and say how it was left.
-	if [ -n "$cleared" ]; then
-		shaper=$(shape_resume "$cleared")
-		trap - EXIT INT TERM
-	fi
+	# The shaper is NOT resumed here: the derivation below sets a NEW value for it,
+	# and bringing it back first would restore the old one -- leaving the box shaped
+	# to a rate this run just measured as wrong.
 
 	# ---- pass 2: derive, from ALL legs at once -------------------------------
 	#
@@ -647,6 +697,10 @@ $measured
 MEASURED_EOF
 
 	if [ -z "$best" ]; then
+		# Nothing measured means nothing to shape to, so the shaper goes back on the
+		# value it already had -- and it still goes back, on this path too.
+		[ -n "$cleared" ] && shaper=$(shape_resume "$cleared")
+		[ -n "$cleared" ] && trap - EXIT INT TERM
 		err calibration_measured_nothing "no leg produced a usable rate; no weight was derived and the previous ones are left as they were" "$(legs_json '')" "$shaper"
 		return 0
 	fi
@@ -720,11 +774,47 @@ SEC_EOF
 			uci -q delete "$CONFIG.${sec}.measured_at"
 		fi
 
+		# The measurement sets the SHAPER too. Measuring a leg is only worth
+		# doing if the result shapes it, and this is the value the operator's
+		# latency depends on. Only a leg that actually MEASURED gets one -- a
+		# shaper is not something to guess at, and a leg that carried nothing
+		# has no capacity to shape to.
+		sv=$(shape_configure "$iface" "$kbps")
+		[ -n "$sv" ] && SHAPER_SET="${SHAPER_SET}${iface} ${sv}
+"
+
 	done <<MEASURED_EOF
 $measured
 MEASURED_EOF
 
+	[ -n "$SHAPER_SET" ] && uci -q commit sqm
 	uci -q commit "$CONFIG"
+
+	# Now the shaper goes back on -- with the value just derived, not the old one.
+	[ -n "$cleared" ] && shaper=$(shape_resume "$cleared")
+	[ -n "$cleared" ] && trap - EXIT INT TERM
+
+	# ---- confirm: re-measure each shaped leg WITH the shaper up ---------------
+	# A configured shaper that was never tested is an assumption. Hold each shaped
+	# leg at the rate it was just set to, with the shaper in place, and read back
+	# whether the path held its latency and what quality it carried. That is the
+	# difference between "the numbers were applied" and "the link does what the
+	# numbers say" -- and it is the ONE criterion, taken from the tool, not a
+	# second opinion computed here.
+	if [ -n "$SHAPER_SET" ]; then
+		while read -r c_if c_kbps; do
+			[ -n "$c_if" ] || continue
+			j=$("$PROBE_CMD" "$c_if" -u "$endpoint" --psk-file "$pskfile" \
+				--state-file "${PROBE_STATE_DIR}/shaped-${c_if}.json" \
+				-r "$c_kbps" -j 2>/dev/null)
+			cq=$(printf '%s' "$j" | jsonfilter -e '@.quality' 2>/dev/null)
+			ch=$(printf '%s' "$j" | jsonfilter -e '@.rtt_held' 2>/dev/null)
+			CONFIRMED="${CONFIRMED}${c_if}|${cq:-}|${ch:-}
+"
+		done <<SHAPER_EOF
+$SHAPER_SET
+SHAPER_EOF
+	fi
 
 	printf '{"ok":true,"endpoint":"%s","scale":%s,"aggregate_kbps":%s,"aggregate_state":"%s","legs":[%s],"shaper":"%s"}\n' \
 		"$(json_str "$endpoint")" "$CAPACITY_WEIGHT_SCALE" "$agg" "$agg_state" "$(legs_json "$best")" \
