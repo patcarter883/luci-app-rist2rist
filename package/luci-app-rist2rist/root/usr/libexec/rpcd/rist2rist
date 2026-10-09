@@ -440,7 +440,7 @@ method_wan_status() {
 # never measured", so a leg is never silently dropped from the array, and a leg
 # that refused never hands back figures to shape from.
 method_calibrate() {
-	local endpoint pskfile svc pid legs iface j rc state first=1
+	local endpoint pskfile legs iface j rc state first=1
 	local statefile kbps at measured best total n_legs n_meas agg agg_state
 	local w sec s have hw sec_out out
 
@@ -457,17 +457,14 @@ method_calibrate() {
 		return 0
 	fi
 
-	# A session running? Refuse. Same source of truth as method_status: procd.
-	if command -v ubus >/dev/null 2>&1; then
-		svc=$(ubus call service list '{"name":"rist2rist"}' 2>/dev/null)
-	fi
-	if [ -n "$svc" ] && command -v jsonfilter >/dev/null 2>&1; then
-		pid=$(printf '%s' "$svc" | jsonfilter -e '@.rist2rist.instances.*.pid' 2>/dev/null | head -n 1)
-	fi
-	if [ -n "$pid" ]; then
-		err probe_refused "refusing to calibrate while a session is running: the probe would steal capacity from the stream it is meant to measure"
-		return 0
-	fi
+	# NO pre-check here for "a session is running". The obvious one -- is the
+	# service up? -- is WRONG: the bridge daemon runs whenever the service is
+	# enabled, idle or not, so it would refuse every calibration on a healthy box.
+	# The only honest signal is traffic on the leg, which is exactly what the tool's
+	# own guard measures (a 2 s sample against --guard-kbps, well above the ~8 kbit/s
+	# of keepalive trickle an idle modem carries). That guard stays the ONE
+	# definition of "the link is busy"; this method reports the tool's refusal as a
+	# per-leg `refused` state rather than inventing a second, wrong answer.
 
 	# The leg set is the SHARED resolver's, exactly as the init and get_config use
 	# -- never a second answer to "what are this box's WAN links". Every present

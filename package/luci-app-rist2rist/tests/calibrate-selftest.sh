@@ -166,6 +166,31 @@ assert "NO leg is ever weighted 0 (weight 0 means DUPLICATE, not unused)" \
 
 # ---------------------------------------------------------------------------
 echo
+echo "-- a RUNNING bridge daemon must not block calibration --"
+# The daemon runs whenever the service is enabled, idle or not, so using its pid as
+# "a session is running" refuses every calibration on a healthy box. This is the
+# shape the off-device suite originally missed: PROC_ROOT unset meant no pid, so the
+# bug could not show. The honest signal is traffic on the leg, and that is the
+# tool's own guard.
+mkdir -p "$tmp/proc/4242"
+printf '/usr/bin/rist2rist\0' > "$tmp/proc/4242/cmdline"
+PROC_ROOT="$tmp/proc"
+export PROC_ROOT
+PROBE_lo_KBPS=2000
+PROBE_wwan1_KBPS=500
+out=$(run_cal)
+log=$(cat "$UCI_STUB_LOG")
+
+assert "a running service does NOT refuse the calibration" \
+	"printf '%s' \"\$out\" | grep -q '\"ok\":true'"
+assert "and the legs are still measured through it" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"state\"]')\" = ok ]"
+assert "so the weights are still derived" \
+	"printf '%s' \"\$log\" | grep -q 'set rist2rist.up_a.weight=100'"
+unset PROC_ROOT
+
+# ---------------------------------------------------------------------------
+echo
 echo "-- the credential path: an upgraded bridge may have no such option at all --"
 # A package upgrade does NOT overwrite an existing /etc/config, so probe_psk_file
 # can be ABSENT on a real bridge. config_get would then return "" and the probe
