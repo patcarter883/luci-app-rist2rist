@@ -131,8 +131,10 @@ redact_url() { # redact_url <text>
 	printf '%s' "$1" | sed -E 's/(secret=)[^&"[:space:]]*/\1REDACTED/g'
 }
 
-err() { # err <code> <message>
-	printf '{"ok":false,"error":"%s","message":"%s"}\n' "$1" "$(json_str "$2")"
+err() { # err <code> <message> [legs-json]
+	local extra=""
+	[ -n "$3" ] && extra=",\"legs\":[$3]"
+	printf '{"ok":false,"error":"%s","message":"%s"%s}\n' "$1" "$(json_str "$2")" "$extra"
 }
 
 # ======================================================================
@@ -439,6 +441,34 @@ method_wan_status() {
 # failed: a caller must be able to tell "no clean rate on wwan1" from "wwan1 was
 # never measured", so a leg is never silently dropped from the array, and a leg
 # that refused never hands back figures to shape from.
+# The per-leg report, built ONCE and used by BOTH exits. A calibration that
+# derives no weight still has to say, per leg, WHY -- otherwise the caller sees
+# only "measured nothing", which reads as a dead link, and that is exactly the
+# wrong reading for a leg that carried its rate and merely bloated. <best> empty
+# means no leg measured, so no weight is derivable and every weight is null.
+legs_json() { # legs_json <best-kbps|empty>
+	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj
+
+	while IFS='|' read -r iface state kbps at fak q lr fr; do
+		[ -n "$iface" ] || continue
+		w=""
+		if [ -n "$kbps" ] && [ -n "$best" ]; then
+			w=$((kbps * CAPACITY_WEIGHT_SCALE / best))
+			[ "$w" -lt 1 ] && w=1
+		fi
+		[ -n "$w" ] && wj="$w" || wj=null
+		[ "$first" -eq 1 ] || out="$out,"
+		first=0
+		out="$out$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"measured_at":%s,"failed_at_kbps":%s,"failed_on_rtt":%s,"quality":%s,"loaded_rtt_ms":%s}' \
+			"$(json_str "$iface")" "$state" "$wj" "${kbps:-null}" \
+			"$(measure_json_str "$at")" "${fak:-null}" "${fr:-null}" \
+			"${q:-null}" "${lr:-null}")"
+	done <<LEGS_EOF
+$measured
+LEGS_EOF
+	printf '%s' "$out"
+}
+
 method_calibrate() {
 	local endpoint pskfile legs iface j rc state first=1
 	local statefile kbps at measured best total n_legs n_meas agg agg_state
@@ -511,13 +541,18 @@ method_calibrate() {
 			3) state=refused ;;
 			*) state=failed ;;
 		esac
-		kbps=""; at=""
-		if [ "$state" = "ok" ] && [ -n "$j" ] && \
-		   printf '%s' "$j" | jsonfilter -e '@' >/dev/null 2>&1; then
+		# The probe's JSON is the record of what the run actually DID, and it is
+		# there whether or not the run produced a rate. Read the diagnostic fields
+		# too: on a run that derives nothing they are the only thing that says why,
+		# and why is the difference between a saturated leg and a dead one.
+		kbps=""; at=""; fak=""; q=""; lr=""; fr=""
+		if [ -n "$j" ] && printf '%s' "$j" | jsonfilter -e '@' >/dev/null 2>&1; then
 			kbps=$(printf '%s' "$j" | jsonfilter -e '@.measured_kbps' 2>/dev/null)
 			at=$(printf '%s' "$j" | jsonfilter -e '@.measured_at' 2>/dev/null)
-		else
-			state=${state}
+			fak=$(printf '%s' "$j" | jsonfilter -e '@.failed_at_kbps' 2>/dev/null)
+			q=$(printf '%s' "$j" | jsonfilter -e '@.quality' 2>/dev/null)
+			lr=$(printf '%s' "$j" | jsonfilter -e '@.loaded_rtt_ms' 2>/dev/null)
+			fr=$(printf '%s' "$j" | jsonfilter -e '@.failed_on_rtt' 2>/dev/null)
 		fi
 		# 0 is NOT a measurement. A leg that carried nothing has already refused
 		# (the tool's MIN_LEG_BYTES guard, exit 1) -- reporting 0 as a rate would
@@ -534,7 +569,7 @@ method_calibrate() {
 		# `|`-delimited, NOT space-delimited: read() collapses runs of IFS
 		# whitespace, so a leg with no rate would promote the timestamp into its
 		# kbps field and the arithmetic would run on a date string.
-		measured="${measured}${iface}|${state}|${kbps}|${at}
+		measured="${measured}${iface}|${state}|${kbps}|${at}|${fak}|${q}|${lr}|${fr}
 "
 	done <<WAN_LINKS_EOF
 $legs
@@ -546,7 +581,7 @@ WAN_LINKS_EOF
 	# computed from one leg alone: it is a ratio, and the fastest measured leg
 	# defines the scale.
 	best=""
-	while IFS='|' read -r iface state kbps at; do
+	while IFS='|' read -r iface state kbps at fak q lr fr; do
 		[ -n "$kbps" ] || continue
 		if [ -z "$best" ] || [ "$kbps" -gt "$best" ]; then best="$kbps"; fi
 	done <<MEASURED_EOF
@@ -554,7 +589,7 @@ $measured
 MEASURED_EOF
 
 	if [ -z "$best" ]; then
-		err calibration_measured_nothing "no leg produced a usable rate; no weight was derived and the previous ones are left as they were"
+		err calibration_measured_nothing "no leg produced a usable rate; no weight was derived and the previous ones are left as they were" "$(legs_json '')"
 		return 0
 	fi
 
@@ -564,7 +599,7 @@ MEASURED_EOF
 	# unreadable" instead of reading both as a number.
 	n_meas=0
 	total=0
-	while IFS='|' read -r iface state kbps at; do
+	while IFS='|' read -r iface state kbps at fak q lr fr; do
 		[ -n "$kbps" ] || continue
 		n_meas=$((n_meas + 1))
 		total=$((total + kbps))
@@ -589,9 +624,7 @@ MEASURED_EOF
 	# all, so libRIST's own default stands -- writing one would assert a share no
 	# measurement supports, and the default is already >= 1, so DT-29's invariant
 	# holds either way.
-	out=""
-	first=1
-	while IFS='|' read -r iface state kbps at; do
+	while IFS='|' read -r iface state kbps at fak q lr fr; do
 		[ -n "$iface" ] || continue
 		w=""
 		if [ -n "$kbps" ]; then
@@ -629,13 +662,6 @@ SEC_EOF
 			uci -q delete "$CONFIG.${sec}.measured_at"
 		fi
 
-		[ "$first" -eq 1 ] || out="$out,"
-		first=0
-		if [ -n "$w" ]; then wj="$w"; else wj=null; fi
-		sec_out=$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"measured_at":%s}' \
-			"$(json_str "$iface")" "$state" "$wj" \
-			"${kbps:-null}" "$(measure_json_str "$at")")
-		out="$out$sec_out"
 	done <<MEASURED_EOF
 $measured
 MEASURED_EOF
@@ -643,7 +669,7 @@ MEASURED_EOF
 	uci -q commit "$CONFIG"
 
 	printf '{"ok":true,"endpoint":"%s","scale":%s,"aggregate_kbps":%s,"aggregate_state":"%s","legs":[%s]}\n' \
-		"$(json_str "$endpoint")" "$CAPACITY_WEIGHT_SCALE" "$agg" "$agg_state" "$out"
+		"$(json_str "$endpoint")" "$CAPACITY_WEIGHT_SCALE" "$agg" "$agg_state" "$(legs_json "$best")"
 }
 
 # ======================================================================

@@ -45,8 +45,15 @@ eval "kbps=\${PROBE_${iface}_KBPS:-0}"
 eval "rc=\${PROBE_${iface}_RC:-0}"
 [ "$rc" -ne 0 ] && exit "$rc"
 printf '%s\n' "$*" >> "${PROBE_ARGV_LOG:-/dev/null}"
-printf '{"interface":"%s","measured_kbps":%s,"measured_at":"2026-10-09T00:00:00Z","quality":90}\n' \
-	"$iface" "$kbps"
+# The DIAGNOSTIC fields: why the ramp stopped and what the leg was doing.
+# MODELLED on the real tool's output, because a stub that emits only a rate cannot
+# catch a plugin that drops the reasons.
+eval "fr=\${PROBE_${iface}_FAILED_ON_RTT:-false}"
+eval "q=\${PROBE_${iface}_QUALITY:-90}"
+eval "lr=\${PROBE_${iface}_LOADED_RTT:-null}"
+eval "fak=\${PROBE_${iface}_FAILED_AT:-null}"
+printf '{"interface":"%s","measured_kbps":%s,"measured_at":"2026-10-09T00:00:00Z","quality":%s,"loaded_rtt_ms":%s,"failed_at_kbps":%s,"failed_on_rtt":%s}\n' \
+	"$iface" "$kbps" "$q" "$lr" "$fak" "$fr"
 PROBE
 chmod +x "$tmp/probe"
 
@@ -245,6 +252,40 @@ assert "and writes nothing at all -- no weight, no section, no commit" \
 	"[ -z \"\$log\" ]"
 
 unset PROBE_lo_RC PROBE_wwan1_RC
+
+# ---------------------------------------------------------------------------
+echo
+echo "-- a leg that carried its rate but could not hold its LATENCY still says why --"
+# The shape this bridge actually produced: the tool exits 0, reports
+# measured_kbps 0, quality 100.00, a loaded RTT far above idle, and
+# failed_on_rtt true. Reporting only "measured nothing" makes a leg that carried
+# every byte and merely bloated read as a leg that carried nothing -- the reading
+# that produced a wrong conclusion about this modem.
+PROBE_lo_KBPS=0
+PROBE_lo_FAILED_ON_RTT=true
+PROBE_lo_QUALITY=100.00
+PROBE_lo_LOADED_RTT=1114.0
+PROBE_lo_FAILED_AT=500
+PROBE_wwan1_RC=3
+export PROBE_lo_FAILED_ON_RTT PROBE_lo_QUALITY PROBE_lo_LOADED_RTT PROBE_lo_FAILED_AT
+out=$(run_cal)
+
+assert "the failed run still names every leg" \
+	"[ \"\$(field \"\$out\" '[L[\"interface\"] for L in d[\"legs\"]]')\" = \"['lo', 'wwan1']\" ]"
+assert "and says the leg stopped on LATENCY, not on quality" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"failed_on_rtt\"]')\" = True ]"
+assert "the failing step's quality is reported, never left at the initialiser" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"quality\"]')\" = 100.0 ]"
+assert "the loaded RTT is reported, not null" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"loaded_rtt_ms\"]')\" = 1114.0 ]"
+assert "and which rate broke it" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"failed_at_kbps\"]')\" = 500 ]"
+assert "no weight is derived from a leg that held no rate" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"weight\"]')\" = None ]"
+assert "and still nothing is written" \
+	"[ -z \"\$(cat \"\$UCI_STUB_LOG\")\" ]"
+
+unset PROBE_lo_FAILED_ON_RTT PROBE_lo_QUALITY PROBE_lo_LOADED_RTT PROBE_lo_FAILED_AT
 
 # ---------------------------------------------------------------------------
 echo
