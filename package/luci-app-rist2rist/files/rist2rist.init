@@ -309,7 +309,7 @@ WAN_PRESENT_EOF
 start_service() {
     config_load 'rist2rist'
     local enabled listen_url verbose_log loglevel profile out_profile
-    local buffer_min buffer_max rtt_min rtt_max reorder_buffer maxbitrate rq
+    local buffer_min buffer_max rtt_min rtt_max reorder_buffer maxbitrate rq measured_budget
     config_get_bool enabled 'main' 'enabled' 0
     config_get listen_url 'main' 'listen_url'
     config_get_bool verbose_log 'main' 'verbose_log' 0
@@ -338,6 +338,16 @@ start_service() {
     # unrecoverable and warning on every start. At 20000 kbit/s the same buffer is
     # ~9500 packets, comfortably inside the window.
     config_get maxbitrate 'main' 'maxbitrate' 20000
+    # The link determines the budget, so a MEASURED one wins over the default
+    # above. `bandwidth` has to sit above the stream rate and below the link, and
+    # calibrate writes what the links were actually measured to be, already
+    # trimmed by the shaping margin -- that is the figure the sender should run
+    # with. The default stays for a bridge that has never calibrated: it is a
+    # guess, and it is only defensible while nothing has been measured.
+    config_get measured_budget 'main' 'measured_budget_kbps'
+    if [ -n "$measured_budget" ] && [ "$measured_budget" -ge 1 ] 2>/dev/null; then
+        maxbitrate="$measured_budget"
+    fi
     if [ "$enabled" -eq 0 ]; then
         # A disabled bridge must stop advertising itself, or encoders keep
         # discovering a box that will never relay.

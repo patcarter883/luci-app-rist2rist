@@ -426,6 +426,10 @@ assert "the confirmation runs WITH the shaper up, at the rate just set" \
 	"printf '%s' \"\$argvlog\" | grep -q -- '-r 450'"
 assert "and it runs after the shaper is put back, never before" \
 	"[ \"\$(printf '%s' \"\$argvlog\" | grep -n -- '-r 450' | cut -d: -f1)\" -gt \"\$(printf '%s' \"\$argvlog\" | grep -n 'sqm start' | cut -d: -f1)\" ]"
+assert "the confirmation announces the SHAPER as its budget, not 1.5x the rate" \
+	"printf '%s' \"\$argvlog\" | grep -q -- '-r 450 --budget-kbps 450'"
+assert "the budget the bridge will SEND with is the sum of the shapers" \
+	"printf '%s' \"\$log\" | grep -q 'set rist2rist.main.measured_budget_kbps=2250'"
 
 echo
 echo "-- a leg that did NOT measure is never shaped from a guess --"

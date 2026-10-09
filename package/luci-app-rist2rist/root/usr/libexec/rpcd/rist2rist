@@ -537,7 +537,7 @@ shape_configure() { # shape_configure <iface> <kbps> -> echoes the kbps written
 # wrong reading for a leg that carried its rate and merely bloated. <best> empty
 # means no leg measured, so no weight is derivable and every weight is null.
 legs_json() { # legs_json <best-kbps|empty>
-	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj sh sq sl s_if s_v c_if c_q c_h
+	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj sh sq sl s_if s_v c_if c_q c_h b_if b_v budget
 
 	while IFS='|' read -r iface state kbps at fak q lr fr; do
 		[ -n "$iface" ] || continue
@@ -792,6 +792,18 @@ $measured
 MEASURED_EOF
 
 	[ -n "$SHAPER_SET" ] && uci -q commit sqm
+	# The budget the bridge SENDS with, derived from the link and from nothing
+	# else: the sum of what each leg's own shaper was just set to. `bandwidth=`
+	# has to sit above the stream rate and below the link, and this is the side
+	# of the link it can be read from -- the shaper IS the link, enforced.
+	budget=0
+	while read -r b_if b_v; do
+		[ -n "$b_if" ] || continue
+		budget=$((budget + b_v))
+	done <<SHAPER_EOF
+$SHAPER_SET
+SHAPER_EOF
+	[ "$budget" -ge 1 ] && uci -q set "$CONFIG.main.measured_budget_kbps=$budget"
 	uci -q commit "$CONFIG"
 
 	# Now the shaper goes back on -- with the value just derived, not the old one.
@@ -808,9 +820,12 @@ MEASURED_EOF
 	if [ -n "$SHAPER_SET" ]; then
 		while read -r c_if c_kbps; do
 			[ -n "$c_if" ] || continue
+			# --budget-kbps: this leg's shaper IS the link, so it is the budget.
+			# Without it the tool announces 1.5x the rate, which is ABOVE the
+			# shaper, and the qdisc then polices the probe's own traffic.
 			j=$("$PROBE_CMD" "$c_if" -u "$endpoint" --psk-file "$pskfile" \
 				--state-file "${PROBE_STATE_DIR}/shaped-${c_if}.json" \
-				-r "$c_kbps" -j 2>/dev/null)
+				-r "$c_kbps" --budget-kbps "$c_kbps" -j 2>/dev/null)
 			cq=$(printf '%s' "$j" | jsonfilter -e '@.quality' 2>/dev/null)
 			ch=$(printf '%s' "$j" | jsonfilter -e '@.rtt_held' 2>/dev/null)
 			CONFIRMED="${CONFIRMED}${c_if}|${cq:-}|${ch:-}

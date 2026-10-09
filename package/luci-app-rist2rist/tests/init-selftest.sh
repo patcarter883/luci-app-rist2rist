@@ -303,6 +303,34 @@ case "$STARTED_CHILD" in
     *)                              fail "query construction disturbed: -o='$STARTED_CHILD'" ;;
 esac
 
+# --- 9. the budget comes from the LINK, not from the default --------------------
+# The link determines the budget: `bandwidth` has to sit above the stream rate and
+# below the link, and calibrate records what the links were measured to be. The
+# built-in default is only for a bridge that has never calibrated.
+use_wan "$wanlib" "$one"
+STUB_UPLINK_COUNT=0
+STUB_DEST_COUNT=1
+STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
+STUB_main_measured_budget_kbps=450
+run_case
+case "$STARTED_CHILD" in
+    *"bandwidth=450"*)   pass "a MEASURED budget is what the sender runs with" ;;
+    *)                   fail "measured budget ignored: -o='$STARTED_CHILD'" ;;
+esac
+case "$STARTED_CHILD" in
+    *"bandwidth=20000"*) fail "the unmeasured default was used despite a measurement" ;;
+    *)                   pass "the unmeasured default is not used once measured" ;;
+esac
+
+# Nothing measured still has to START -- a bridge must come up before it is ever
+# calibrated, so the default stands until there is something real to replace it.
+unset STUB_main_measured_budget_kbps
+run_case
+case "$STARTED_CHILD" in
+    *"bandwidth=20000"*) pass "no measurement -> the default still starts the bridge" ;;
+    *)                   fail "unmeasured bridge lost its default: -o='$STARTED_CHILD'" ;;
+esac
+
 unset RIST2RIST_WAN_LIB WAN_LIB_NETWORK_FIXTURE WAN_LIB_SYSFS
 
 echo
