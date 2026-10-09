@@ -10,20 +10,27 @@ USE_PROCD=1
 OUTPUT_URLS=""
 OUTPUT_RECOVERY=""
 
-# WAN uplinks -- the local leg list every destination is fanned across.
+# WAN links -- the leg set every destination is fanned across (DT-27).
 #
 # The encoder supplies only WHERE the stream goes (the cloud POP the backplane
-# allocated for the session). WHICH physical links carry it, and their relative
-# weights, are this router's business and are configured locally as `config
-# uplink` sections. So the encoder never needs this router's modem names, and
-# adding or reweighting a link is a local act.
+# allocated for the session). WHICH physical links carry it is this router's
+# business, and the leg set is simply the WAN links the router HAS (resolved by
+# the shared resolver, see load_wan_lib below) -- NOT the `config uplink` set.
 #
-# UPLINK_CONFIGURED counts the uplinks the config declares; UPLINK_LEGS holds only
-# those whose interface is actually PRESENT, one "interface weight" per line. The
-# two differ exactly when a modem is unplugged, which is what lets an all-legs
-# -absent bridge be a non-event instead of a crash loop.
-UPLINK_CONFIGURED=0
-UPLINK_LEGS=""
+# `config uplink` is now ONLY an optional per-interface override: a section whose
+# interface resolves to one of those WAN links supplies that leg's `weight`. It can
+# never ADD a leg (the resolver is the sole source of the set), and a section for
+# an absent interface contributes nothing. UPLINK_WEIGHTS holds "interface weight"
+# lines for that lookup.
+UPLINK_WEIGHTS=""
+
+# This box's PRESENT WAN links (DT-27), one interface name per line, resolved once
+# per start_service. The output leg is bound to these: CAKE on OpenWrt runs through
+# an IFB (ifb4<iface>), so a leg sent UNBOUND over the default route is not the
+# interface the shaper shapes. Empty when the resolver is not installed or no WAN
+# link is present -- in which case the init keeps the unbound default-route send a
+# bench/dev box needs, rather than dropping the stream.
+WAN_PRESENT=""
 
 # The umdns service file this bridge publishes itself under (DT-19 discovery).
 MDNS_SERVICE_FILE="/etc/umdns/rist2rist.json"
@@ -151,44 +158,66 @@ append_url() {
     OUTPUT_URLS="${OUTPUT_URLS:+${OUTPUT_URLS},}${1}"
 }
 
-# config_foreach callback: record one uplink whose interface is actually present.
-#
-# A leg whose interface is absent CANNOT work, and passing miface= anyway is
-# actively harmful: librist fails SO_BINDTODEVICE, then fails to resolve the peer
-# host, and rist2rist.c calls exit(1) on "Could not add peer connector to sender"
-# (tools/rist2rist.c:212). procd then restarts it forever -- a crash loop that
-# buries the log and burns CPU for as long as the modem stays unplugged, which is
-# the NORMAL state on a bench with no modems attached. So treat it as "this leg is
-# not ready yet", skip it, and let a later reload pick it up (see the hotplug hook
-# that ships alongside this file).
-#
-# Test via /sys/class/net, the same idiom bridge_uid() above already uses, so
-# there is no dependence on ip(8)/ifconfig being present in the image.
+# config_foreach callback: record a `config uplink` section as an OPTIONAL weight
+# override (DT-27). This does NOT define the leg set -- the resolver does. A
+# section for an absent interface, or for an interface the resolver never returned,
+# is simply never looked up, so it can neither add a leg nor reach the binary.
 collect_uplink() {
     local cfg="$1" interface weight
     config_get interface "$cfg" 'interface'
     config_get weight "$cfg" 'weight'
-
     [ -z "$interface" ] && return
-
-    UPLINK_CONFIGURED=$((UPLINK_CONFIGURED + 1))
-
-    if [ ! -e "/sys/class/net/${interface}" ]; then
-        logger -t rist2rist "uplink '${cfg}': interface ${interface} is not present, skipping this leg"
-        return
-    fi
-
-    UPLINK_LEGS="${UPLINK_LEGS}${interface} ${weight}
+    UPLINK_WEIGHTS="${UPLINK_WEIGHTS}${interface} ${weight}
 "
 }
 
-# config_foreach callback: emit this destination once per PRESENT uplink, which is
-# what bonds it across every available WAN link.
+# uplink_weight_for <iface> -- the configured weight for a resolved WAN link, or
+# empty when no `config uplink` section names it (then the leg carries no weight).
+uplink_weight_for() {
+    local want="$1" iface weight
+    while read -r iface weight; do
+        [ "$iface" = "$want" ] || continue
+        printf '%s' "$weight"
+        return 0
+    done <<UPLINK_WEIGHTS_EOF
+$UPLINK_WEIGHTS
+UPLINK_WEIGHTS_EOF
+    return 0
+}
+
+# Source the shared WAN-link resolver (DT-27.3), installed to
+# /usr/lib/rist2rist/wan.sh. It defines wan_links()/wan_links_present() -- the ONE
+# definition of this box's WAN links, shared with the measurement helper.
+#
+# GUARDED: on a box with an older or partial install the file is absent, and this
+# returns non-zero. resolve_wan_present then yields nothing, and the caller falls
+# back to the unbound default-route send -- so a partial install cannot break the
+# stream.
+load_wan_lib() {
+    local lib
+    lib="${RIST2RIST_WAN_LIB:-/usr/lib/rist2rist/wan.sh}"
+    [ -r "$lib" ] || return 1
+    # shellcheck source=/dev/null
+    . "$lib" || return 1
+    return 0
+}
+
+# Resolve this box's PRESENT WAN links ONCE, before the destinations, so every
+# destination is bound over the same set. Read-only: it never writes config.
+resolve_wan_present() {
+    WAN_PRESENT=""
+    load_wan_lib || return 0
+    WAN_PRESENT="$(wan_links_present 2>/dev/null)"
+    return 0
+}
+
+# config_foreach callback: emit this destination once per PRESENT WAN link, which
+# is what bonds it across every available WAN link.
 #
 # The destination carries only an ADDRESS -- the cloud POP the encoder selected for
-# the session. WHICH links carry it, and their relative weights, are local
-# configuration and deliberately not the encoder's business, so the encoder never
-# has to know this router's modem names.
+# the session. The legs are the router's own WAN links (DT-27), resolved once by
+# resolve_wan_present; `config uplink` only supplies an optional per-leg weight.
+# The encoder therefore never has to know this router's modem names.
 append_output_url() {
     local cfg="$1"
     local address base query q url interface weight
@@ -239,31 +268,27 @@ append_output_url() {
         fi
     fi
 
-    if [ "$UPLINK_CONFIGURED" -eq 0 ]; then
-        # No uplinks declared: this bridge is not bonding, so send over the default
-        # route. A single-WAN box needs no uplink list, and requiring one would be
-        # a second place to state the same thing.
-        logger -t rist2rist "destination '${cfg}': no uplinks configured, sending via the default route"
-        append_url "$(with_query "$base" "$query")"
+    # The leg set is this box's PRESENT WAN links (DT-27) -- NOT the `config
+    # uplink` set, which is only an optional source of per-leg weights. Emit one
+    # output URL per present link; `miface=` binds it to the interface CAKE shapes.
+    if [ -n "$WAN_PRESENT" ]; then
+        while IFS= read -r interface; do
+            [ -n "$interface" ] || continue
+            q="${query}&miface=${interface}"
+            weight="$(uplink_weight_for "$interface")"
+            [ -n "$weight" ] && q="${q}&weight=${weight}"
+            append_url "$(with_query "$base" "$q")"
+        done <<WAN_PRESENT_EOF
+$WAN_PRESENT
+WAN_PRESENT_EOF
         return
     fi
 
-    if [ -z "$UPLINK_LEGS" ]; then
-        # Uplinks ARE declared but none is present -- every modem is unplugged.
-        # Emitting nothing is the correct answer: start_service then leaves the
-        # daemon stopped, which is a non-event rather than a crash loop.
-        logger -t rist2rist "destination '${cfg}': no uplink is present, nothing to send"
-        return
-    fi
-
-    while read -r interface weight; do
-        [ -n "$interface" ] || continue
-        q="${query}&miface=${interface}"
-        [ -n "$weight" ] && q="${q}&weight=${weight}"
-        append_url "$(with_query "$base" "$q")"
-    done <<UPLINK_LEGS_EOF
-$UPLINK_LEGS
-UPLINK_LEGS_EOF
+    # No PRESENT WAN link: a bench/dev box with no modem, or the resolver is not
+    # installed. Emit the leg UNBOUND over the default route so the stream is never
+    # lost -- an unshaped send is better than no send.
+    logger -t rist2rist "destination '${cfg}': no WAN link is present, sending via the default route"
+    append_url "$(with_query "$base" "$query")"
 }
 
 start_service() {
@@ -325,11 +350,12 @@ start_service() {
     # this string is what the output URL is built from.
     OUTPUT_RECOVERY="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}&bandwidth=${maxbitrate}"
 
-    # Resolve the local uplink list BEFORE the destinations: each destination is
-    # emitted once per PRESENT uplink, so the legs must be known first.
-    UPLINK_CONFIGURED=0
-    UPLINK_LEGS=""
+    # The leg set for every destination: this box's PRESENT WAN links (DT-27),
+    # independent of `config uplink` (which only supplies optional per-leg
+    # weights). Resolved once, so every destination reuses the same set. Read-only.
+    UPLINK_WEIGHTS=""
     config_foreach collect_uplink 'uplink'
+    resolve_wan_present
 
     OUTPUT_URLS=""
     config_foreach append_output_url 'destination'

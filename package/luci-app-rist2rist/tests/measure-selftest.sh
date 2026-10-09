@@ -25,8 +25,12 @@ set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
 measure="$here/../files/rist2rist-measure"
+wanlib="$here/../files/rist2rist-wan.sh"
 stub="$here/stub-functions.sh"
 fails=0
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 
 chmod +x "$here"/bin/* 2>/dev/null || true
 PATH="$here/bin:$PATH"
@@ -156,7 +160,8 @@ echo "rist2rist-measure: I/O shell (real /sys/class/net, stubbed tc/mmcli)"
 # other suites use. LIB_ONLY is cleared in the child: the helper must RUN here,
 # proving the default (run unless a test opts out) is what the harness relies on.
 run_measure() { # run_measure <TC_STUB_MODE>
-    env FUNCTIONS_SH="$stub" TC_STUB_MODE="$1" RIST2RIST_MEASURE_LIB_ONLY= sh "$measure"
+    env FUNCTIONS_SH="$stub" TC_STUB_MODE="$1" RIST2RIST_MEASURE_LIB_ONLY= \
+        RIST2RIST_WAN_LIB="$wanlib" sh "$measure"
 }
 
 out=$(run_measure cake); rc=$?
@@ -249,6 +254,163 @@ if [ -z "$sig" ]; then
 else
     fail "modem: got '$sig', expected empty"
 fi
+
+# ======================================================================
+# the shared WAN-link resolver (files/rist2rist-wan.sh, DT-27.3)
+# ======================================================================
+
+echo
+echo "rist2rist-wan.sh: the shared WAN-link resolver"
+
+# A fake netdev root: lo and wwan1 exist, wwan0 does not. Real /sys/class/net
+# cannot model wwan1 on a normal machine, and the resolver must be exercised with
+# an ABSENT WAN link (wwan0) alongside a present one.
+sysfs="$tmp/net"
+mkdir -p "$sysfs/lo" "$sysfs/wwan1"
+
+# A fixture answering `uci -q show network`. `wan6` is a dhcp WAN over eth9, so the
+# resolver must bind the BOARD netdev, not the logical section name. `lan` and
+# `loopback` are proto `static` and must fall out without the firewall.
+netfix="$tmp/network.show"
+cat > "$netfix" <<'EOF'
+network.loopback=interface
+network.loopback.device='lo'
+network.loopback.proto='static'
+network.lan=interface
+network.lan.device='br-lan'
+network.lan.proto='static'
+network.wwan0=interface
+network.wwan0.proto='modemmanager'
+network.wwan1=interface
+network.wwan1.device='/sys/devices/pci0000:00/0000:00:15.0/usb1/1-2'
+network.wwan1.proto='modemmanager'
+network.wan6=interface
+network.wan6.device='eth9'
+network.wan6.proto='dhcp'
+EOF
+
+WAN_LIB_NETWORK_FIXTURE="$netfix"
+WAN_LIB_SYSFS="$sysfs"
+export WAN_LIB_NETWORK_FIXTURE WAN_LIB_SYSFS
+# The stub's config_get reads $4 unguarded, which aborts under this suite's
+# `set -u` when a call omits the default. Use the set -u-safe form (as the init
+# selftest does) so the resolver's config_foreach path can be exercised in-shell.
+# The subprocess runs below are unaffected -- they have no `set -u`.
+config_get() { eval "$1=\"\${STUB_${2}_${3}:-${4:-}}\""; }
+# shellcheck source=/dev/null
+. "$wanlib"
+
+# has_line <text> <exact-line> -- 0 if the line occurs in text.
+has_line() { printf '%s\n' "$1" | grep -qxF "$2"; }
+# count_line <text> <exact-line> -- how many times the line occurs in text.
+count_line() { printf '%s\n' "$1" | grep -cxF "$2" || true; }
+
+links=$(wan_links)
+# The stub's declared uplinks are up_a=lo, up_b=wwan1 -- so wwan1 is BOTH declared
+# and a network WAN, and lo is a declared uplink with NO network section.
+if has_line "$links" lo && has_line "$links" wwan0 && has_line "$links" wwan1; then
+    pass "resolver: the union covers declared uplinks AND the router's WAN protos"
+else
+    fail "resolver: union incomplete: '$links'"
+fi
+if has_line "$links" eth9 && ! has_line "$links" wan6; then
+    pass "resolver: a section's device option is bound, not its logical name (wan6 -> eth9)"
+else
+    fail "resolver: device vs section name wrong: '$links'"
+fi
+# A modemmanager interface declares `device` as the modem's PHYSICAL PATH, not a
+# netdev (verbatim production shape, wwan1 above). Binding that path names a device
+# that cannot exist: it made wan_links_present EMPTY on the real box and silently
+# disabled the miface binding. The section name must win instead.
+if has_line "$links" wwan1 && ! printf '%s\n' "$links" | grep -q '/sys/devices'; then
+    pass "resolver: a path-like modemmanager device is NOT bound (the netdev is used)"
+else
+    fail "resolver: bound a device PATH instead of a netdev: '$links'"
+fi
+if [ "$(count_line "$links" wwan1)" = "1" ]; then
+    pass "resolver: uniqueness -- an interface in BOTH sets appears once"
+else
+    fail "resolver: wwan1 appears $(count_line "$links" wwan1) times"
+fi
+if has_line "$links" lan || has_line "$links" loopback || has_line "$links" br-lan; then
+    fail "resolver: proto filtering leaked lan/loopback: '$links'"
+else
+    pass "resolver: proto filtering excludes lan/loopback (static), no firewall consulted"
+fi
+if printf '%s\n' "$links" | grep -q '^$'; then
+    fail "resolver: output carries a blank line"
+else
+    pass "resolver: one name per line, no trailing blank line"
+fi
+
+# wan_links_present is the subset whose device EXISTS -- it must not invent wwan0
+# or eth9, and must keep the present lo and wwan1.
+present=$(wan_links_present)
+if [ "$present" = "lo
+wwan1" ]; then
+    pass "resolver: wan_links_present keeps only existing netdevs (lo, wwan1)"
+else
+    fail "resolver: wan_links_present gave '$present'"
+fi
+
+# Empty input -> empty output: no invented name, no fallback guess. (This last
+# check overrides config_foreach, so it runs AFTER every shell-level test above;
+# the DT-27 e2e checks below run the helper as a subprocess and are unaffected.)
+emptyfix="$tmp/empty.show"
+: > "$emptyfix"
+WAN_LIB_NETWORK_FIXTURE="$emptyfix"
+export WAN_LIB_NETWORK_FIXTURE
+config_foreach() { :; }
+empty=$(wan_links)
+if [ -z "$empty" ]; then
+    pass "resolver: empty input -> empty output (never a guessed name)"
+else
+    fail "resolver: empty input produced '$empty'"
+fi
+
+# ======================================================================
+# DT-27: measure EVERY WAN link on the router, not only the bonded legs
+# ======================================================================
+
+echo
+echo "rist2rist-measure: every WAN link on the router (DT-27)"
+
+# Production shape: the network declares wwan0 (absent) and wwan1 (present), while
+# `config uplink` (the stub) declares lo and wwan1. wwan0 is discoverable ONLY via
+# the network config, so this FAILS against the old `config uplink`-only
+# enumeration -- it is not a tautology.
+dt27_sysfs="$tmp/dt27net"
+mkdir -p "$dt27_sysfs/lo" "$dt27_sysfs/wwan1"
+dt27_net="$tmp/dt27-network.show"
+cat > "$dt27_net" <<'EOF'
+network.loopback.proto='static'
+network.wwan0.proto='modemmanager'
+network.wwan1.proto='modemmanager'
+EOF
+
+dt27_run() { # dt27_run <resolver-path> <network-fixture> <sysfs-root>
+    env FUNCTIONS_SH="$stub" TC_STUB_MODE=cake RIST2RIST_MEASURE_LIB_ONLY= \
+        RIST2RIST_WAN_LIB="$1" WAN_LIB_NETWORK_FIXTURE="$2" WAN_LIB_SYSFS="$3" \
+        sh "$measure"
+}
+
+out=$(dt27_run "$wanlib" "$dt27_net" "$dt27_sysfs")
+check "e2e DT-27: EVERY WAN link is enumerated (wwan0 exists only in network config)" "$out" \
+    "{l['interface'] for l in d['legs']} == {'lo','wwan1','wwan0'}"
+check "e2e DT-27: the absent WAN link reports present:false / state absent" "$out" \
+    "any(l['interface']=='wwan0' and l['present'] is False and l['state']=='absent' and l['shaped_kbps'] is None for l in d['legs'])"
+check "e2e DT-27: the present WAN link carries its measured fields" "$out" \
+    "any(l['interface']=='wwan1' and l['present'] is True and l['state']=='ok' and l['shaped_kbps']==8000 for l in d['legs'])"
+check "e2e DT-27: the union keeps a declared uplink with no network section (lo)" "$out" \
+    "any(l['interface']=='lo' and l['present'] is True for l in d['legs'])"
+check "e2e DT-27: the aggregate shapes only the present WAN links (lo + wwan1)" "$out" \
+    "d['aggregate']['state']=='ok' and d['aggregate']['shaped_kbps']==16000"
+
+# The resolver file missing (an older/partial install) must not crash and must not
+# invent a link: it falls back to the declared `config uplink` interfaces.
+out=$(dt27_run "$tmp/absent-resolver.sh" "$dt27_net" "$dt27_sysfs")
+check "e2e DT-27: a missing resolver falls back to the declared uplinks, no crash" "$out" \
+    "sorted(l['interface'] for l in d['legs']) == ['lo','wwan1']"
 
 echo
 if [ "$fails" -eq 0 ]; then

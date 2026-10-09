@@ -92,6 +92,12 @@ define Package/luci-app-rist2rist/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/rist2rist-measure $(1)/usr/sbin/rist2rist-measure
 
+	# Shared WAN-link resolver (DT-27.3): ONE definition of "this box's WAN links",
+	# SOURCED by both the init (to bind the output leg) and the measurement helper
+	# (to enumerate legs). Not executable -- it is sourced, so plain data mode.
+	$(INSTALL_DIR) $(1)/usr/lib/rist2rist
+	$(INSTALL_DATA) ./files/rist2rist-wan.sh $(1)/usr/lib/rist2rist/wan.sh
+
 	# The HTTP face of that same API. LuCI's uhttpd cannot serve it (its ubus
 	# plugin denies every call on this image) and uhttpd's -a would expose every
 	# ubus object on the LAN to reach this one, so the endpoint gets its own

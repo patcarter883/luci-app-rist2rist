@@ -3,24 +3,25 @@
 #
 #   sh tests/init-selftest.sh
 #
-# What this locks in:
+# What this locks in (DT-27 -- the operator's model):
 #
-#   1. A destination is fanned out across every uplink whose interface is
-#      PRESENT, one -o URL per leg. The destination itself carries only an
-#      address -- the cloud POP the encoder selected -- so the encoder never has
-#      to know this router's modem names.
-#   2. A leg whose interface is absent must NOT reach -o. Feeding
-#      miface=<absent-iface> to the binary makes librist fail the bind and the
-#      peer resolve, and rist2rist.c calls exit(1), which procd turns into an
-#      endless crash loop. An unplugged modem is the ordinary bench state, so it
-#      has to be a non-event.
-#   3. Uplinks declared but none present -> no output URLs at all -> the service
-#      is NOT started, rather than started and crash-looping.
-#   4. No uplinks declared at all -> send over the default route (a single-WAN box
-#      needs no uplink list).
+#   1. The leg set for every destination is THIS BOX's PRESENT WAN LINKS, resolved
+#      by the shared resolver (files/rist2rist-wan.sh), NOT the `config uplink`
+#      set. Each present link gets one -o URL bound with `miface=<iface>`, so CAKE
+#      (which runs through an IFB) actually shapes the stream.
+#   2. `config uplink` is only an OPTIONAL per-interface weight override: a section
+#      for a resolved interface supplies its `weight=`; it can NEVER add a leg, and
+#      a section for an absent interface contributes nothing.
+#   3. A WAN link that is ABSENT must NOT reach -o: feeding `miface=<absent>` to the
+#      binary makes librist fail the bind and the peer resolve, and rist2rist.c
+#      calls exit(1), which procd turns into an endless crash loop.
+#   4. No PRESENT WAN link (a bench box, or the resolver not installed) -> the URL
+#      is still emitted UNBOUND over the default route, plus a log line, so the
+#      stream is never lost.
 #
-# No stubbing of the interface test is needed: /sys/class/net is real, so `lo`
-# (present) and `wwan0` (absent on any normal machine) are the fixtures.
+# No stubbing of the interface test is needed: the resolver honours WAN_LIB_SYSFS
+# and WAN_LIB_NETWORK_FIXTURE, so a fake netdev root models "wwan1 present, wwan0
+# absent" exactly as production does (lo is real but is not a WAN here).
 #
 # The init is `#!/bin/sh /etc/rc.common` and defines its helpers at the top level,
 # so sourcing it defines them without running procd. config_* and logger are
@@ -30,7 +31,11 @@ set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
 init="$here/../files/rist2rist.init"
+wanlib="$here/../files/rist2rist-wan.sh"
 fails=0
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
@@ -93,8 +98,32 @@ uci() { echo "80"; }
 # shellcheck disable=SC1090
 . "$init"
 
+# ------------------------------------------------------------- fixtures -------
+# The leg set is the box's present WAN links (DT-27), so every case drives the
+# shared resolver through its documented test hooks.
+netfix="$tmp/network.show"
+cat > "$netfix" <<'EOF'
+network.loopback.proto='static'
+network.lan.proto='static'
+network.wwan0.proto='modemmanager'
+network.wwan1.device='/sys/devices/pci0000:00/0000:00:15.0/usb1/1-2'
+network.wwan1.proto='modemmanager'
+network.wwan2.proto='modemmanager'
+EOF
+one="$tmp/net-one";   mkdir -p "$one/wwan1"
+two="$tmp/net-two";   mkdir -p "$two/wwan1" "$two/wwan2"
+none="$tmp/net-none"; mkdir -p "$none"
+
+# use_wan <resolver-path> <netdev-root> -- point the resolver at its hooks.
+use_wan() {
+    RIST2RIST_WAN_LIB="$1"
+    WAN_LIB_NETWORK_FIXTURE="$netfix"
+    WAN_LIB_SYSFS="$2"
+    export RIST2RIST_WAN_LIB WAN_LIB_NETWORK_FIXTURE WAN_LIB_SYSFS
+}
+
 # ------------------------------------------------------------- the tests ------
-echo "rist2rist.init: destination fan-out across local uplinks"
+echo "rist2rist.init: the output leg set is the box's present WAN links (DT-27)"
 
 STUB_main_listen_url="rist://@0.0.0.0:5000"
 STUB_main_enabled="1"
@@ -110,26 +139,33 @@ run_case() {
 # how many occurrences of a needle are in the assembled -o list
 count_in_child() { printf '%s' "$STARTED_CHILD" | grep -o "$1" | wc -l | tr -d ' '; }
 
-# --- 1. one leg present, one absent -----------------------------------------
+# --- 1. primary path: one present WAN link, no config uplink -> one bound leg --
+# The production case: no `config uplink` (not bonding), but the router HAS a WAN
+# link. Exactly one URL, bound with miface=<the present link>, no weight.
+use_wan "$wanlib" "$one"
+STUB_UPLINK_COUNT=0
 STUB_DEST_COUNT=1
 STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
-STUB_UPLINK_COUNT=2
-STUB_UP_0_IFACE="wwan0"    # absent
-STUB_UP_0_WEIGHT="0"
-STUB_UP_1_IFACE="lo"       # present everywhere
-STUB_UP_1_WEIGHT="0"
 run_case
 if [ -z "$STARTED_CHILD" ]; then
-    fail "no leg reached -o although one uplink is present"
+    fail "no leg reached -o although a WAN link is present"
 else
     case "$STARTED_CHILD" in
-        *"miface=wwan0"*) fail "absent uplink reached the binary: -o='$STARTED_CHILD'" ;;
-        *"miface=lo"*)    pass "present uplink used, absent uplink dropped" ;;
-        *)                fail "present uplink missing from -o: -o='$STARTED_CHILD'" ;;
+        *"miface=wwan1"*) pass "a present WAN link is bound with miface=" ;;
+        *)                fail "present WAN link missing from -o: -o='$STARTED_CHILD'" ;;
     esac
     case "$STARTED_CHILD" in
-        *"weight=0"*) pass "weight carried onto the leg (0 = full duplicate)" ;;
-        *)            fail "weight lost: -o='$STARTED_CHILD'" ;;
+        *"miface=wwan0"*) fail "an ABSENT WAN link reached the binary" ;;
+        *)                pass "the absent WAN link is dropped" ;;
+    esac
+    if [ "$(count_in_child 'miface=')" = "1" ]; then
+        pass "exactly ONE output URL for one present WAN link"
+    else
+        fail "expected 1 leg, got $(count_in_child 'miface='): -o='$STARTED_CHILD'"
+    fi
+    case "$STARTED_CHILD" in
+        *"weight="*) fail "no config uplink -> the leg must carry no weight" ;;
+        *)           pass "no config uplink -> the leg carries no weight" ;;
     esac
     case "$STARTED_CHILD" in
         *"syd1-a.relay.example.net:5000"*) pass "destination address carried" ;;
@@ -137,73 +173,94 @@ else
     esac
 fi
 
-# --- 2. uplinks declared, none present -> nothing started --------------------
+# --- 2. config uplink supplies a weight, but never adds a leg ------------------
+# A section for the PRESENT interface supplies its weight; a section for the
+# ABSENT interface must contribute nothing at all.
+use_wan "$wanlib" "$one"
+STUB_UPLINK_COUNT=2
+STUB_UP_0_IFACE="wwan1"; STUB_UP_0_WEIGHT="3"   # present -> weight applies
+STUB_UP_1_IFACE="wwan0"; STUB_UP_1_WEIGHT="0"   # absent  -> ignored
 STUB_DEST_COUNT=1
 STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
-STUB_UPLINK_COUNT=2
-STUB_UP_0_IFACE="wwan0"
-STUB_UP_0_WEIGHT="0"
-STUB_UP_1_IFACE="wwan1"
-STUB_UP_1_WEIGHT="0"
 run_case
-if [ -z "$STARTED_CHILD" ]; then
-    pass "all uplinks absent -> service is NOT started (no crash loop)"
+if [ "$(count_in_child 'miface=')" = "1" ]; then
+    pass "a config uplink for an ABSENT interface adds no leg"
 else
-    fail "service started with every uplink absent: -o='$STARTED_CHILD'"
+    fail "config uplink added a leg: -o='$STARTED_CHILD'"
 fi
-case "$LOG" in
-    *"no uplink is present"*) pass "the reason is logged, not silent" ;;
-    *)                        fail "no explanation logged for an all-absent uplink set" ;;
+case "$STARTED_CHILD" in
+    *"miface=wwan1"*"weight=3"*) pass "a matching config uplink supplies the leg's weight" ;;
+    *)                           fail "weight override not applied: -o='$STARTED_CHILD'" ;;
+esac
+case "$STARTED_CHILD" in
+    *"miface=wwan0"*) fail "an absent interface's uplink reached the binary" ;;
+    *)                pass "an absent interface's uplink was not emitted" ;;
 esac
 
-# --- 3. no uplinks declared -> default route, unbound ------------------------
+# --- 3. two present WAN links -> two bound legs --------------------------------
+use_wan "$wanlib" "$two"
+STUB_UPLINK_COUNT=0
+STUB_DEST_COUNT=1
+STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
+run_case
+if [ "$(count_in_child 'miface=')" = "2" ]; then
+    pass "two present WAN links -> two bound output URLs"
+else
+    fail "expected 2 legs, got $(count_in_child 'miface='): -o='$STARTED_CHILD'"
+fi
+
+# --- 4. no PRESENT WAN link -> unbound default-route fallback ------------------
+use_wan "$wanlib" "$none"
 STUB_UPLINK_COUNT=0
 STUB_DEST_COUNT=1
 STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
 run_case
 case "$STARTED_CHILD" in
-    *"miface="*) fail "an unbound send should carry no miface: -o='$STARTED_CHILD'" ;;
-    *"syd1-a.relay.example.net:5000"*) pass "no uplinks: sent over the default route, unbound" ;;
-    *)                                 fail "no uplinks: the destination was dropped" ;;
+    *"miface="*) fail "no present WAN link must stay unbound: -o='$STARTED_CHILD'" ;;
+    *"syd1-a.relay.example.net:5000"*) pass "no present WAN link -> unbound default-route send" ;;
+    *)                                 fail "the destination was dropped with no present WAN link" ;;
 esac
 case "$LOG" in
-    *"no uplinks configured"*) pass "the default-route fallback is logged" ;;
-    *)                         fail "default-route fallback not logged" ;;
+    *"no WAN link is present"*) pass "the unbound fallback is logged" ;;
+    *)                          fail "unbound fallback not logged" ;;
 esac
 
-# --- 4. fan-out: 2 destinations x 2 present uplinks = 4 legs -----------------
-STUB_UPLINK_COUNT=2
-STUB_UP_0_IFACE="lo"
-STUB_UP_0_WEIGHT="0"
-STUB_UP_1_IFACE="lo"
-STUB_UP_1_WEIGHT="3"
+# --- 5. resolver not installed (older install) -> unbound fallback, no crash ---
+use_wan "$tmp/absent-resolver.sh" "$one"
+STUB_UPLINK_COUNT=0
+STUB_DEST_COUNT=1
+STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
+run_case
+case "$STARTED_CHILD" in
+    *"miface="*) fail "a missing resolver must keep the unbound behaviour" ;;
+    *"syd1-a.relay.example.net:5000"*) pass "missing resolver -> unbound fallback, no crash" ;;
+    *)                                 fail "destination dropped when the resolver is missing" ;;
+esac
+
+# --- 6. fan-out: 2 destinations x 2 present WAN links = 4 legs -----------------
+use_wan "$wanlib" "$two"
+STUB_UPLINK_COUNT=0
 STUB_DEST_COUNT=2
 STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
 STUB_DEST_1_ADDR="hvl1-a.relay.example.net:5000"
 run_case
-legs=$(count_in_child 'miface=')
-if [ "$legs" = "4" ]; then
-    pass "2 destinations x 2 present uplinks = 4 legs"
+if [ "$(count_in_child 'miface=')" = "4" ]; then
+    pass "2 destinations x 2 present WAN links = 4 legs"
 else
-    fail "expected 4 legs, got $legs: -o='$STARTED_CHILD'"
+    fail "expected 4 legs, got $(count_in_child 'miface='): -o='$STARTED_CHILD'"
 fi
 for a in syd1-a hvl1-a; do
     n=$(printf '%s' "$STARTED_CHILD" | grep -o "$a" | wc -l | tr -d ' ')
     if [ "$n" = "2" ]; then
-        pass "$a emitted once per uplink"
+        pass "$a emitted once per present WAN link"
     else
         fail "$a emitted $n times, expected 2"
     fi
 done
-case "$STARTED_CHILD" in
-    *"weight=3"*) pass "per-leg weight carried (load-balance)" ;;
-    *)            fail "per-leg weight lost in fan-out" ;;
-esac
 
-# --- 5. an empty address is skipped ------------------------------------------
-STUB_UPLINK_COUNT=1
-STUB_UP_0_IFACE="lo"
-STUB_UP_0_WEIGHT="0"
+# --- 7. an empty address is skipped -------------------------------------------
+use_wan "$wanlib" "$one"
+STUB_UPLINK_COUNT=0
 STUB_DEST_COUNT=1
 STUB_DEST_0_ADDR=""
 run_case
@@ -212,6 +269,20 @@ if [ -z "$STARTED_CHILD" ]; then
 else
     fail "an address-less destination produced a leg: -o='$STARTED_CHILD'"
 fi
+
+# --- 8. recovery / query construction is untouched -----------------------------
+# The leg rewrite must not disturb the query the leg is built from.
+use_wan "$wanlib" "$one"
+STUB_UPLINK_COUNT=0
+STUB_DEST_COUNT=1
+STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
+run_case
+case "$STARTED_CHILD" in
+    *"timing-mode=0"*"bandwidth="*) pass "the bound leg keeps timing-mode + bandwidth" ;;
+    *)                              fail "query construction disturbed: -o='$STARTED_CHILD'" ;;
+esac
+
+unset RIST2RIST_WAN_LIB WAN_LIB_NETWORK_FIXTURE WAN_LIB_SYSFS
 
 echo
 if [ "$fails" -eq 0 ]; then

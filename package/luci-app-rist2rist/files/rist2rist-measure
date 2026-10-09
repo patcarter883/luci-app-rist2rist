@@ -33,6 +33,21 @@ FUNCTIONS_SH=${FUNCTIONS_SH:-/lib/functions.sh}
 
 CONFIG=rist2rist
 
+# The shared WAN-link resolver (DT-27.3) -- the ONE definition of this box's WAN
+# links, also sourced by the init script. Absent (an older or partial install) is
+# NOT fatal: main falls back to the declared `config uplink` interfaces, so this
+# helper never crashes and never invents a link.
+WAN_LIB="${RIST2RIST_WAN_LIB:-/usr/lib/rist2rist/wan.sh}"
+WAN_LIB_LOADED=0
+if [ -r "$WAN_LIB" ]; then
+    # shellcheck source=/dev/null
+    . "$WAN_LIB" && WAN_LIB_LOADED=1
+fi
+
+# The netdev root. This is the SAME WAN_LIB_SYSFS override the resolver honours, so
+# a test can model a present or absent WAN link with no modem attached.
+WAN_SYSFS="${WAN_LIB_SYSFS:-/sys/class/net}"
+
 # ======================================================================
 # the pure core
 # ======================================================================
@@ -272,13 +287,15 @@ modem_signal() { # modem_signal <iface>
         | head -n 1
 }
 
-# config_foreach callback: gather one uplink leg.
-collect_leg() {
-    local cfg="$1" interface
-    config_get interface "$cfg" 'interface'
-    [ -z "$interface" ] && return 0
+# Gather one leg by INTERFACE NAME. (The per-leg body is unchanged from the old
+# config_foreach callback -- only WHICH interfaces it is called for changed: DT-27
+# measures this box's WAN links, not only the declared `config uplink` set, and
+# absence is a property of the interface, not of a config section.)
+collect_leg_iface() {
+    local interface="$1"
+    [ -n "$interface" ] || return 0
 
-    if [ ! -e "/sys/class/net/${interface}" ]; then
+    if [ ! -e "${WAN_SYSFS}/${interface}" ]; then
         # The NORMAL bench state with no modem attached. Report it as absent and
         # carry on. No logger call: a missing leg must not fill the log on every
         # invocation.
@@ -294,10 +311,40 @@ collect_leg() {
         "$(modem_signal "$interface")"
 }
 
+# The declared `config uplink` interfaces, one per line. Used ONLY when the shared
+# resolver is not installed, so an older box keeps measuring exactly what it did.
+print_declared_uplink() {
+    local cfg="$1" interface
+    config_get interface "$cfg" 'interface'
+    [ -n "$interface" ] && printf '%s\n' "$interface"
+    return 0
+}
+
 main() {
     config_load "$CONFIG"
     RECORDS=""
-    config_foreach collect_leg 'uplink'
+
+    # DT-27: the legs to measure are THIS BOX's WAN links (the union the shared
+    # resolver defines), NOT only the `config uplink` bonding selection -- CAKE is
+    # configured per interface, so a single-WAN box is a leg set of ONE, not an
+    # empty one. If the resolver is not installed, fall back to the declared
+    # uplinks so an older box keeps measuring what it always did.
+    local links iface
+    if [ "$WAN_LIB_LOADED" -eq 1 ]; then
+        links="$(wan_links)"
+    else
+        links="$(config_foreach print_declared_uplink uplink)"
+    fi
+
+    # Iterate with a here-doc, NOT a pipe: a pipe would run this loop -- and thus
+    # append_leg -- in a subshell, and the accumulated RECORDS would be lost.
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        collect_leg_iface "$iface"
+    done <<WAN_LINKS_EOF
+$links
+WAN_LINKS_EOF
+
     emit_measurement "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RECORDS"
 }
 
