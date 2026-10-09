@@ -34,9 +34,21 @@ case "$cmd" in
 	get)
 		# Only the sqm queue mapping is needed: `sqm.@queue[<n>]` -> that queue's
 		# interface. A key with no answer exits 1, exactly as `uci -q get` does.
+		# Modelled on the REAL uci: `sqm.@queue[<n>]` answers with the section TYPE
+		# ("queue") and `sqm.@queue[<n>].interface` with that queue's interface.
+		# A stub that answered the interface for the bare key passed while the box
+		# silently found no queue at all.
 		case "$1" in
 		sqm.@queue\[*\])
 			n=$(printf '%s' "$1" | sed 's/.*\[\([0-9]*\)\].*/\1/')
+			i=0
+			for q in ${STUB_SQM_QUEUES:-}; do
+				[ "$i" = "$n" ] && { echo queue; exit 0; }
+				i=$((i + 1))
+			done
+			;;
+		sqm.@queue\[*\].interface)
+			n=$(printf '%s' "$1" | sed 's/.*\[\([0-9]*\)\].*\.interface$/\1/')
 			i=0
 			for q in ${STUB_SQM_QUEUES:-}; do
 				[ "$i" = "$n" ] && { echo "$q"; exit 0; }

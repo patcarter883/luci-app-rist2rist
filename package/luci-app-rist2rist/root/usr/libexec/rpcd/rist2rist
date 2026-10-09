@@ -499,12 +499,16 @@ shape_resume() { # shape_resume "<cleared ifaces>" -> echoes "" / restored / res
 }
 
 sqm_queue_for() { # sqm_queue_for <iface> -> echoes the sqm queue's index, or ""
-	local i=0 iface
+	local i=0 q_if
 
 	while :; do
-		iface=$(uci -q get "sqm.@queue[$i]" 2>/dev/null | head -1)
-		[ -n "$iface" ] || break
-		[ "$iface" = "$1" ] && { printf '%s' "$i"; return 0; }
+		# `.interface`, NOT the bare section key: `uci get sqm.@queue[0]` returns the
+		# section's TYPE ("queue") and never the interface, so matching on the bare
+		# key finds no leg on ANY real box -- silently, leaving the shaper unset
+		# while the run reports success.
+		q_if=$(uci -q get "sqm.@queue[$i].interface" 2>/dev/null | head -1)
+		[ -n "$q_if" ] || break
+		[ "$q_if" = "$1" ] && { printf '%s' "$i"; return 0; }
 		i=$((i + 1))
 	done
 	printf '%s' ""
