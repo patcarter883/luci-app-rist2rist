@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-rist2rist
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=43
+PKG_RELEASE:=44
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 include $(INCLUDE_DIR)/package.mk
@@ -121,6 +121,14 @@ endef
 define Package/luci-app-rist2rist/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
+# rpcd kills a script method at its timeout (30s by default, measured on the
+# bridge), and the plugin's calibrate measures every WAN leg and then confirms
+# the result -- about a minute. Leave the default and the bridge's own control
+# endpoint can never complete a calibration.
+if [ "$$(uci -q get rpcd.@rpcd[0].timeout)" != "300" ]; then
+	uci -q set rpcd.@rpcd[0].timeout=300
+	uci -q commit rpcd
+fi
 /etc/init.d/rpcd restart 2>/dev/null || true
 /etc/init.d/uhttpd reload 2>/dev/null || true
 # The control endpoint must be ENABLED, not merely installed: without this the

@@ -56,7 +56,10 @@ start_service() {
 		-h /www-bridge \
 		-x / \
 		-p "${ip}:${port}" \
-		-t 60 -T 30
+		# -t is the CGI timeout, and calibrate runs the bandwidth test once per leg
+		# per repeat, so it takes about a minute. At the old 60 it was killed
+		# mid-run and the endpoint answered with an error instead of a report.
+		-t 300 -T 300
 	procd_set_param respawn
 	procd_close_instance
 }
