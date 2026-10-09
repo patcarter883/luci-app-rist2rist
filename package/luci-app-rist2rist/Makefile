@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-rist2rist
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=38
+PKG_RELEASE:=39
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 include $(INCLUDE_DIR)/package.mk

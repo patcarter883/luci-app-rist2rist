@@ -140,6 +140,14 @@ SQM_INIT="${SQM_INIT:-/etc/init.d/sqm}"
 # is on a 500 kbit/s leg -- never engages at all.
 CAPACITY_MARGIN_PCT="${CAPACITY_MARGIN_PCT:-90}"
 
+# How many times the standard test is run per leg. A single raw sample on a mobile
+# leg is not a capacity: measured minutes apart, the same leg gave 500, 750, 500,
+# 750, and a shaper set from whichever one it caught inherits that whichever it is.
+# The MEDIAN of the repeats is used. An ODD count keeps the median an actually
+# measured value rather than an average of two that were never measured as such;
+# an even count takes the lower middle for the same reason.
+CALIBRATE_REPEATS="${CALIBRATE_REPEATS:-3}"
+
 err() { # err <code> <message> [legs-json] [shaper]
 	local extra=""
 	[ -n "$3" ] && extra="$extra,\"legs\":[$3]"
@@ -498,6 +506,42 @@ shape_resume() { # shape_resume "<cleared ifaces>" -> echoes "" / restored / res
 	printf '%s' "restored"
 }
 
+# Run the standard test CALIBRATE_REPEATS times and keep the run whose rate is the
+# MEDIAN of the ones that measured. Echoes that repeat's index (0 when none of them
+# produced a rate); each repeat's own JSON and exit code are left beside the state
+# file as <sf>.r<i> and <sf>.rc<i>, so the caller can read the diagnostics of the run
+# it actually chose -- and so can anyone looking at the box afterwards.
+calibrate_ramp() { # calibrate_ramp <iface> <statefile> -> echoes the chosen index
+	local iface="$1" sf="$2" i=0 n="$CALIBRATE_REPEATS" med=""
+
+	[ "$n" -ge 1 ] 2>/dev/null || n=1
+	rm -f "${sf}.r"* 2>/dev/null
+	: > "${sf}.rates"
+	while [ "$i" -lt "$n" ]; do
+		i=$((i + 1))
+		"$PROBE_CMD" "$iface" -u "$endpoint" --psk-file "$pskfile" \
+			--state-file "$sf" -j > "${sf}.r${i}" 2>/dev/null
+		printf '%s' "$?" > "${sf}.rc${i}"
+		printf '%s\n' "$(jsonfilter -e '@.measured_kbps' < "${sf}.r${i}" 2>/dev/null)" \
+			>> "${sf}.rates"
+	done
+	# Nonzero rates only: a repeat that carried nothing did not measure, and it is not
+	# a zero to be medianed "away" -- it is reported in the array beside this.
+	med=$(grep -vE '^$|^0$|^null$' "${sf}.rates" 2>/dev/null \
+		| sort -n | awk '{ v[NR] = $1 } END { if (NR == 0) exit 1; print v[int((NR + 1) / 2)] }')
+	# No repeat measured: report the LAST one anyway, because its exit code is the
+	# whole answer. Returning 0 here would point the caller at a file that does not
+	# exist, lose the tool's exit code, and turn a deliberate refusal (exit 3) into
+	# a failed measurement -- exactly the distinction the exit codes exist to carry.
+	[ -n "$med" ] || { printf '%s' "$n"; return 0; }
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		i=$((i + 1))
+		[ "$(jsonfilter -e '@.measured_kbps' < "${sf}.r${i}" 2>/dev/null)" = "$med" ] && break
+	done
+	printf '%s' "$i"
+}
+
 sqm_queue_for() { # sqm_queue_for <iface> -> echoes the sqm queue's index, or ""
 	local i=0 q_if
 
@@ -537,9 +581,9 @@ shape_configure() { # shape_configure <iface> <kbps> -> echoes the kbps written
 # wrong reading for a leg that carried its rate and merely bloated. <best> empty
 # means no leg measured, so no weight is derivable and every weight is null.
 legs_json() { # legs_json <best-kbps|empty>
-	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj sh sc sq sl s_if s_v c_if c_k c_half b_if b_v budget
+	local best="$1" first=1 out="" iface state kbps at fak q lr fr reps w wj sh sc sq sl sv svj s_if s_v c_if c_k c_half b_if b_v budget run
 
-	while IFS='|' read -r iface state kbps at fak q lr fr; do
+	while IFS='|' read -r iface state kbps at fak q lr fr reps; do
 		[ -n "$iface" ] || continue
 		w=""
 		if [ -n "$kbps" ] && [ -n "$best" ]; then
@@ -558,13 +602,34 @@ SHAPER_EOF
 		done <<CONFIRM_EOF
 $CONFIRMED
 CONFIRM_EOF
+		# The verdict on the setting, derived in ONE place from the one comparison
+		# that carries it: what the shaped leg then measured against what the shaper
+		# was set to. A leg that climbed past the shaper was not being shaped at all;
+		# one that stopped well under it is either too tight, or it was shaped from a
+		# raw figure the link has since gone below. Bands are named, not implied, so a
+		# report can be read without doing the arithmetic yourself.
+		sv=""
+		if [ -n "$sc" ] && [ -n "$sh" ] && [ "$sc" -ge 1 ] 2>/dev/null && [ "$sh" -ge 1 ] 2>/dev/null; then
+			if [ "$sc" -gt $((sh * 125 / 100)) ]; then
+				sv=not_shaping
+			elif [ "$sc" -lt $((sh * 75 / 100)) ]; then
+				sv=too_tight
+			else
+				sv=confirmed
+			fi
+		fi
+		# An unset verdict is null, not a hole: a field with no value takes the whole
+		# report with it, so a caller loses the calibration rather than one field.
+		# The bands are fixed tokens, so the JSON is the token in quotes; unset is
+		# null (never an unquoted word, which is what made the whole report invalid).
+		if [ -n "$sv" ]; then svj="\"$sv\""; else svj=null; fi
 		[ "$first" -eq 1 ] || out="$out,"
 		first=0
-		out="$out$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"shaper_kbps":%s,"measured_at":%s,"failed_at_kbps":%s,"failed_on_rtt":%s,"quality":%s,"loaded_rtt_ms":%s,"shaped_measured_kbps":%s,"shaped_quality":%s,"shaped_held":%s}' \
+		out="$out$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"shaper_kbps":%s,"measured_at":%s,"failed_at_kbps":%s,"failed_on_rtt":%s,"quality":%s,"loaded_rtt_ms":%s,"repeats_kbps":[%s],"shaped_measured_kbps":%s,"shaped_quality":%s,"shaped_held":%s,"shaped_verdict":%s}' \
 			"$(json_str "$iface")" "$state" "$wj" "${kbps:-null}" "${sh:-null}" \
 			"$(measure_json_str "$at")" "${fak:-null}" "${fr:-null}" \
-			"${q:-null}" "${lr:-null}" "${sc:-null}" "${sq:-null}" \
-			"${sl:-null}")"
+			"${q:-null}" "${lr:-null}" "${reps:-null}" "${sc:-null}" "${sq:-null}" \
+			"${sl:-null}" "$svj")"
 	done <<LEGS_EOF
 $measured
 LEGS_EOF
@@ -637,9 +702,14 @@ method_calibrate() {
 		[ -n "$iface" ] || continue
 		n_legs=$((n_legs + 1))
 		statefile="${PROBE_STATE_DIR}/probe-${iface}.json"
-		j=$("$PROBE_CMD" "$iface" -u "$endpoint" --psk-file "$pskfile" \
-			--state-file "$statefile" -j 2>/dev/null)
-		rc=$?
+		# The MEDIAN of CALIBRATE_REPEATS standard tests, not one sample.
+		run=$(calibrate_ramp "$iface" "$statefile")
+		rc=$(cat "${statefile}.rc${run}" 2>/dev/null)
+		j=$(cat "${statefile}.r${run}" 2>/dev/null)
+		# Every repeat's rate, so the spread is visible rather than hidden inside the
+		# median: a leg whose repeats disagree is a leg not to shape from.
+		reps=$(grep -vE '^$' "${statefile}.rates" 2>/dev/null | paste -sd, -)
+		[ -n "$reps" ] || reps=null
 		# The tool's exit codes ARE its contract: 3 is a deliberate refusal (a
 		# session on the leg, or the day's byte budget spent), 1 a failed
 		# measurement, 2 a usage mistake. Flattening them would cost a caller
@@ -677,7 +747,7 @@ method_calibrate() {
 		# `|`-delimited, NOT space-delimited: read() collapses runs of IFS
 		# whitespace, so a leg with no rate would promote the timestamp into its
 		# kbps field and the arithmetic would run on a date string.
-		measured="${measured}${iface}|${state}|${kbps}|${at}|${fak}|${q}|${lr}|${fr}
+		measured="${measured}${iface}|${state}|${kbps}|${at}|${fak}|${q}|${lr}|${fr}|${reps}
 "
 	done <<WAN_LINKS_EOF
 $legs
@@ -693,7 +763,7 @@ WAN_LINKS_EOF
 	# computed from one leg alone: it is a ratio, and the fastest measured leg
 	# defines the scale.
 	best=""
-	while IFS='|' read -r iface state kbps at fak q lr fr; do
+	while IFS='|' read -r iface state kbps at fak q lr fr reps; do
 		[ -n "$kbps" ] || continue
 		if [ -z "$best" ] || [ "$kbps" -gt "$best" ]; then best="$kbps"; fi
 	done <<MEASURED_EOF
@@ -715,7 +785,7 @@ MEASURED_EOF
 	# unreadable" instead of reading both as a number.
 	n_meas=0
 	total=0
-	while IFS='|' read -r iface state kbps at fak q lr fr; do
+	while IFS='|' read -r iface state kbps at fak q lr fr reps; do
 		[ -n "$kbps" ] || continue
 		n_meas=$((n_meas + 1))
 		total=$((total + kbps))
@@ -740,7 +810,7 @@ MEASURED_EOF
 	# all, so libRIST's own default stands -- writing one would assert a share no
 	# measurement supports, and the default is already >= 1, so DT-29's invariant
 	# holds either way.
-	while IFS='|' read -r iface state kbps at fak q lr fr; do
+	while IFS='|' read -r iface state kbps at fak q lr fr reps; do
 		[ -n "$iface" ] || continue
 		w=""
 		if [ -n "$kbps" ]; then

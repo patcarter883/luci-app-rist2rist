@@ -59,6 +59,18 @@ cat > "$tmp/probe" <<'PROBE'
 #!/bin/sh
 iface="$1"
 eval "kbps=\${PROBE_${iface}_KBPS:-0}"
+# A SEQUENCE of rates, one per invocation, for testing the repeats: the plugin runs
+# the standard test CALIBRATE_REPEATS times and must take the MEDIAN. Falls back to
+# the fixed rate above once the sequence is spent, so the shaped run that follows is
+# still a known value.
+eval "seq=\${PROBE_${iface}_SEQ:-}"
+if [ -n "$seq" ]; then
+	n=$(cat "${PROBE_SEQ_DIR:-/dev/null}/$iface" 2>/dev/null || echo 0)
+	n=$((n + 1))
+	[ -n "${PROBE_SEQ_DIR:-}" ] && printf '%s' "$n" > "$PROBE_SEQ_DIR/$iface"
+	v=$(printf '%s\n' $seq | sed -n "${n}p")
+	[ -n "$v" ] && kbps="$v"
+fi
 eval "rc=\${PROBE_${iface}_RC:-0}"
 [ "$rc" -ne 0 ] && exit "$rc"
 printf '%s\n' "$*" >> "${PROBE_ARGV_LOG:-/dev/null}"
@@ -99,10 +111,12 @@ exit 0
 SQM
 chmod +x "$tmp/sqm"
 
+PROBE_SEQ_DIR="$tmp/seq"
+mkdir -p "$PROBE_SEQ_DIR"
 UCI_STUB_LOG="$tmp/uci.log"
 PROBE_ARGV_LOG="$tmp/probe.argv"
 STUB_main_probe_psk_file="$tmp/psk"
-export UCI_STUB_LOG PROBE_ARGV_LOG STUB_main_probe_psk_file
+export UCI_STUB_LOG PROBE_ARGV_LOG STUB_main_probe_psk_file PROBE_SEQ_DIR
 export SQM_INIT="$tmp/sqm" STUB_SHAPED_DIR STUB_SHAPED_SAVE
 
 # Drive the plugin's calibrate method. The uci double logs every command, so the
@@ -111,6 +125,7 @@ export SQM_INIT="$tmp/sqm" STUB_SHAPED_DIR STUB_SHAPED_SAVE
 run_cal() {
 	: > "$UCI_STUB_LOG"
 	: > "$PROBE_ARGV_LOG"
+	rm -f "$PROBE_SEQ_DIR"/* 2>/dev/null
 	rm -f "$UCI_STUB_LOG.add" "$UCI_STUB_LOG.del"
 	printf '{"token":"%s"}' "$TOKEN" | env \
 		FUNCTIONS_SH="$here/stub-functions.sh" \
@@ -124,7 +139,19 @@ run_cal() {
 }
 
 field() { # field <json> <python expression over d>
-	printf '%s' "$1" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print($2)"
+	# On a parse error, SHOW the report that was received. A JSON syntax error means
+	# the plugin emitted a malformed report, and the raw text is the only thing that
+	# says where -- without it every assertion over it fails with the same traceback
+	# and none of them says why.
+	printf '%s' "$1" | python3 -c "
+import json, sys
+s = sys.stdin.read()
+try:
+	d = json.loads(s)
+except Exception as e:
+	sys.stderr.write('  RAW REPORT (unparseable: %s):\n  %s\n' % (e, s))
+	sys.exit(1)
+print($2)"
 }
 
 assert() { # assert <name> <shell condition, using $out / $log>
@@ -350,8 +377,8 @@ assert "the shaper is stopped BEFORE the first probe byte" \
 assert "and it is not started again until the probing is done" \
 	"[ \"\$last\" = 'sqm start' ]"
 between=$(sed -n '/sqm stop/,/sqm start/p' "$PROBE_ARGV_LOG")
-assert "both probes ran INSIDE the cleared window" \
-	"[ \"\$(printf '%s' \"\$between\" | grep -c -- '--psk-file')\" = 2 ]"
+assert "every leg is probed INSIDE the cleared window -- 2 legs x 3 repeats" \
+	"[ \"\$(printf '%s' \"\$between\" | grep -c -- '--psk-file')\" = 6 ]"
 assert "the run reports how the shaper was left" \
 	"[ \"\$(field \"\$out\" 'd[\"shaper\"]')\" = restored ]"
 
@@ -436,6 +463,46 @@ assert "the budget the bridge will SEND with is the sum of the shapers" \
 	"printf '%s' \"\$log\" | grep -q 'set rist2rist.main.measured_budget_kbps=2250'"
 
 echo
+echo "-- the measurement is the MEDIAN of repeats, and the spread is visible --"
+# A single raw sample on a mobile leg is not a capacity. Each leg is measured
+# CALIBRATE_REPEATS times and the median is what the shaper is set from.
+rm -f "$tmp/shaped"/*
+PROBE_lo_SEQ="300 750 500"        # median 500: the first sample alone would say 300
+PROBE_wwan1_SEQ="250 200 200"     # median 200: the first sample alone would say 250
+PROBE_lo_KBPS=2000                # what the SHAPED run then reports (not_shaping)
+PROBE_wwan1_KBPS=2000
+export PROBE_lo_SEQ PROBE_wwan1_SEQ PROBE_lo_KBPS PROBE_wwan1_KBPS
+out=$(run_cal)
+argvlog=$(cat "$PROBE_ARGV_LOG")
+log=$(cat "$UCI_STUB_LOG")
+
+assert "each leg gets the standard test repeated, not one sample" \
+	"[ \"\$(printf '%s' \"\$argvlog\" | grep -c 'probe-lo.json')\" = 3 ]"
+assert "the MEDIAN is used -- not the first sample, and not the last" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"measured_kbps\"]')\" = 500 ]"
+assert "and the same for the other leg, from its own repeats" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][1][\"measured_kbps\"]')\" = 200 ]"
+assert "every repeat's rate is reported, so disagreement is visible" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"repeats_kbps\"]')\" = '[300, 750, 500]' ]"
+assert "the shaper is set from the MEDIAN, not from a single sample" \
+	"printf '%s' \"\$log\" | grep -q 'set sqm.@queue\[0\].upload=450'"
+assert "a shaped leg that climbs PAST its shaper is called out, not left to read" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_verdict\"]')\" = not_shaping ]"
+unset PROBE_lo_SEQ PROBE_wwan1_SEQ
+
+echo
+echo "-- a shaped leg that holds its shaper is confirmed --"
+rm -f "$tmp/shaped"/*
+PROBE_lo_KBPS=450
+PROBE_wwan1_KBPS=0
+PROBE_wwan1_RC=3
+export PROBE_wwan1_RC
+out=$(run_cal)
+assert "the shaped leg's own ceiling against the shaper is the whole verdict" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_verdict\"]')\" = confirmed ]"
+unset PROBE_wwan1_RC
+
+echo
 echo "-- a leg that did NOT measure is never shaped from a guess --"
 rm -f "$tmp/shaped"/*
 PROBE_lo_KBPS=2000
@@ -450,7 +517,7 @@ assert "the leg that carried nothing gets NO shaper value" \
 	"! printf '%s' \"\$log\" | grep -q 'set sqm.@queue\[1\].upload'"
 assert "and the report says so rather than inventing one" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][1][\"shaper_kbps\"]')\" = None ]"
-unset PROBE_wwan1_RC
+unset PROBE_wwan1_RC STUB_SQM_QUEUES
 
 # ---------------------------------------------------------------------------
 echo
