@@ -64,6 +64,28 @@ MEASURE_CMD=${MEASURE_CMD:-/usr/sbin/rist2rist-measure}
 # Absolute, like MEASURE_CMD, so PATH stubbing cannot reach it.
 PROBE_CMD=${PROBE_CMD:-/usr/sbin/rist2rist-probe}
 
+# The scale a measured leg's weight is expressed in: the fastest measured leg gets
+# this, every other leg a proportional share, floored at 1. libRIST balances by the
+# RATIO of weights (a weighted round-robin over ctx->total_weight in src/udp.c), so
+# the unit is arbitrary -- 100 is for granularity: a leg at a tenth of the fastest
+# still gets 10, and one at a hundredth still gets the floor rather than 0.
+# weight 0 is NOT "unused": RIST_PEER_WEIGHT_DUPLICATE (include/librist/peer.h)
+# means DUPLICATE every packet, so 0 is never written for a bonded leg.
+# A possibly-empty string as a JSON string, or null when empty -- for the
+# provenance fields, where "" would read as a value and null is the honest
+# "we have none".
+measure_json_str() {
+	if [ -z "$1" ]; then printf 'null'; else printf '"%s"' "$(json_str "$1")"; fi
+}
+
+CAPACITY_WEIGHT_SCALE=${CAPACITY_WEIGHT_SCALE:-100}
+
+# Where each leg's calibration result is kept. PER LEG, because the tool's default
+# is ONE file: a two-leg run would overwrite the first leg's figure with the
+# second's, and the leg that vanished from the record is the one a later reader
+# most wants.
+PROBE_STATE_DIR=${PROBE_STATE_DIR:-/var/run/rist2rist}
+
 # The shared WAN-link resolver (DT-27.3) -- the ONE definition of this box's WAN
 # links, also sourced by the init script and the measurement helper. An absolute
 # path with an override, like MEASURE_CMD, because it is a TEST hook too.
@@ -411,7 +433,9 @@ method_wan_status() {
 # never measured", so a leg is never silently dropped from the array, and a leg
 # that refused never hands back figures to shape from.
 method_calibrate() {
-	local endpoint pskfile svc pid out legs iface j rc state first=1
+	local endpoint pskfile svc pid legs iface j rc state first=1
+	local statefile kbps at measured best total n_legs n_meas agg agg_state
+	local w sec s have hw sec_out out
 
 	config_load "$CONFIG"
 	config_get endpoint main probe_endpoint
@@ -439,7 +463,8 @@ method_calibrate() {
 	fi
 
 	# The leg set is the SHARED resolver's, exactly as the init and get_config use
-	# -- never a second answer to "what are this box's WAN links".
+	# -- never a second answer to "what are this box's WAN links". Every present
+	# link is in it, by DT-29: nothing narrows the bond.
 	if [ "$WAN_LIB_LOADED" -ne 1 ]; then
 		err probe_unavailable "the WAN link resolver ($WAN_LIB) is unavailable, so the legs to measure cannot be named"
 		return 0
@@ -451,10 +476,21 @@ method_calibrate() {
 		return 0
 	fi
 
-	out=""
+	# The sections naming a leg, collected once, so a derived weight updates the
+	# EXISTING section rather than adding a second one for the same interface.
+	UPLINK_DECLARED=""
+	config_foreach collect_uplink uplink
+
+	# ---- pass 1: measure every leg -------------------------------------------
+	mkdir -p "$PROBE_STATE_DIR" 2>/dev/null
+	measured=""
+	n_legs=0
 	while IFS= read -r iface; do
 		[ -n "$iface" ] || continue
-		j=$("$PROBE_CMD" "$iface" -u "$endpoint" --psk-file "$pskfile" -j 2>/dev/null)
+		n_legs=$((n_legs + 1))
+		statefile="${PROBE_STATE_DIR}/probe-${iface}.json"
+		j=$("$PROBE_CMD" "$iface" -u "$endpoint" --psk-file "$pskfile" \
+			--state-file "$statefile" -j 2>/dev/null)
 		rc=$?
 		# The tool's exit codes ARE its contract: 3 is a deliberate refusal (a
 		# session on the leg, or the day's byte budget spent), 1 a failed
@@ -465,20 +501,139 @@ method_calibrate() {
 			3) state=refused ;;
 			*) state=failed ;;
 		esac
-		[ "$first" -eq 1 ] || out="$out,"
-		first=0
+		kbps=""; at=""
 		if [ "$state" = "ok" ] && [ -n "$j" ] && \
 		   printf '%s' "$j" | jsonfilter -e '@' >/dev/null 2>&1; then
-			out="$out{\"interface\":\"$(json_str "$iface")\",\"state\":\"ok\",\"result\":$j}"
+			kbps=$(printf '%s' "$j" | jsonfilter -e '@.measured_kbps' 2>/dev/null)
+			at=$(printf '%s' "$j" | jsonfilter -e '@.measured_at' 2>/dev/null)
 		else
-			out="$out{\"interface\":\"$(json_str "$iface")\",\"state\":\"$state\",\"result\":null}"
+			state=${state}
 		fi
+		# 0 is NOT a measurement. A leg that carried nothing has already refused
+		# (the tool's MIN_LEG_BYTES guard, exit 1) -- reporting 0 as a rate would
+		# hand the caller a figure to shape from for a link that moved nothing.
+		case "$kbps" in
+			''|0|null) kbps="" ;;
+		esac
+		# "ok" and no rate is a contradiction: a leg that carried nothing has not
+		# been measured, whatever the exit code said. Class it with the failed
+		# measurements rather than letting an unusable run report as a pass.
+		if [ "$state" = "ok" ] && [ -z "$kbps" ]; then
+			state=failed
+		fi
+		# `|`-delimited, NOT space-delimited: read() collapses runs of IFS
+		# whitespace, so a leg with no rate would promote the timestamp into its
+		# kbps field and the arithmetic would run on a date string.
+		measured="${measured}${iface}|${state}|${kbps}|${at}
+"
 	done <<WAN_LINKS_EOF
 $legs
 WAN_LINKS_EOF
 
-	printf '{"ok":true,"endpoint":"%s","legs":[%s]}\n' \
-		"$(json_str "$endpoint")" "$out"
+	# ---- pass 2: derive, from ALL legs at once -------------------------------
+	#
+	# A weight is a leg's measured CONTRIBUTION to the aggregate, so it cannot be
+	# computed from one leg alone: it is a ratio, and the fastest measured leg
+	# defines the scale.
+	best=""
+	while IFS='|' read -r iface state kbps at; do
+		[ -n "$kbps" ] || continue
+		if [ -z "$best" ] || [ "$kbps" -gt "$best" ]; then best="$kbps"; fi
+	done <<MEASURED_EOF
+$measured
+MEASURED_EOF
+
+	if [ -z "$best" ]; then
+		err calibration_measured_nothing "no leg produced a usable rate; no weight was derived and the previous ones are left as they were"
+		return 0
+	fi
+
+	# An aggregate is NOT a sum of the legs that happened to answer. It is only
+	# reported when EVERY present leg was measured; otherwise it is null and says
+	# which kind of incomplete it is, so a consumer can tell "no legs" from "a leg
+	# unreadable" instead of reading both as a number.
+	n_meas=0
+	total=0
+	while IFS='|' read -r iface state kbps at; do
+		[ -n "$kbps" ] || continue
+		n_meas=$((n_meas + 1))
+		total=$((total + kbps))
+	done <<MEASURED_EOF
+$measured
+MEASURED_EOF
+	if [ "$n_meas" -lt "$n_legs" ]; then
+		# Reached only with at least one leg measured ($best was non-empty), so
+		# this is a PARTIAL sum -- some present leg is missing from it. A total
+		# covering no leg at all is the `calibration_measured_nothing` case above.
+		agg="null"
+		agg_state=partial
+	else
+		agg="$total"
+		agg_state=ok
+	fi
+
+	# The weights land in `config uplink` -- the ONE place the init already reads a
+	# per-leg weight from, so NOTHING in the start path changes: the process simply
+	# starts with the derived values. A measured leg gets a proportional share
+	# (floored at 1, never 0). A leg that was NOT measured gets no weight written at
+	# all, so libRIST's own default stands -- writing one would assert a share no
+	# measurement supports, and the default is already >= 1, so DT-29's invariant
+	# holds either way.
+	out=""
+	first=1
+	while IFS='|' read -r iface state kbps at; do
+		[ -n "$iface" ] || continue
+		w=""
+		if [ -n "$kbps" ]; then
+			w=$((kbps * CAPACITY_WEIGHT_SCALE / best))
+			[ "$w" -lt 1 ] && w=1
+		fi
+
+		sec=""
+		while read -r s have hw; do
+			[ "$have" = "$iface" ] && { sec="$s"; break; }
+		done <<SEC_EOF
+$UPLINK_DECLARED
+SEC_EOF
+		if [ -n "$w" ]; then
+			[ -n "$sec" ] || sec="$iface"
+			if uci -q set "$CONFIG.${sec}=uplink" && \
+			   uci -q set "$CONFIG.${sec}.interface=${iface}"; then
+				# Provenance: the figure the weight came from, and when, so the
+				# number on the box traces back to the run that produced it.
+				uci -q set "$CONFIG.${sec}.weight=${w}"
+				[ -n "$kbps" ] && uci -q set "$CONFIG.${sec}.measured_kbps=${kbps}"
+				[ -n "$at" ]   && uci -q set "$CONFIG.${sec}.measured_at=${at}"
+			fi
+		elif [ -n "$sec" ]; then
+			# This leg produced no fresh measurement, but a section naming it
+			# carries a weight from an EARLIER run. A weight is only meaningful
+			# as a SET -- one ratio across every bonded leg -- so leaving a stale
+			# one here would mix an old measurement into this run's ratio and
+			# make the whole set incoherent. Clear it instead: libRIST's own
+			# default then stands, and that default is >= 1, so the leg is still
+			# bonded (DT-29). (A run where NO leg measured returns earlier and
+			# deliberately leaves the last coherent set alone.)
+			uci -q delete "$CONFIG.${sec}.weight"
+			uci -q delete "$CONFIG.${sec}.measured_kbps"
+			uci -q delete "$CONFIG.${sec}.measured_at"
+		fi
+
+		[ "$first" -eq 1 ] || out="$out,"
+		first=0
+		if [ -n "$w" ]; then wj="$w"; else wj=null; fi
+		sec_out=$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"measured_at":%s}' \
+			"$(json_str "$iface")" "$state" "$wj" \
+			"${kbps:-null}" "$(measure_json_str "$at")")
+		out="$out$sec_out"
+	done <<MEASURED_EOF
+$measured
+MEASURED_EOF
+
+	uci -q commit "$CONFIG"
+
+	printf '{"ok":true,"endpoint":"%s","scale":%s,"aggregate_kbps":%s,"aggregate_state":"%s","legs":[%s]}\n' \
+		"$(json_str "$endpoint")" "$CAPACITY_WEIGHT_SCALE" "$agg" "$agg_state" "$out"
 }
 
 # ======================================================================
