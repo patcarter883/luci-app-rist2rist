@@ -24,7 +24,7 @@ diff -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
 diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-probe.c
 --- a/tools/rist2rist-probe.c	1970-01-01 10:00:00.000000000 +1000
 +++ b/tools/rist2rist-probe.c	2026-10-09 18:26:22.795775280 +1100
-@@ -0,0 +1,1101 @@
+@@ -0,0 +1,1181 @@
 +/*
 + * rist2rist-probe -- a standalone, operator-runnable ACTIVE probe of ONE WAN leg.
 + * SPDX-License-Identifier: AGPL-3.0-or-later
@@ -222,12 +222,43 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +static unsigned long long g_sum_retrans_bytes;
 +static unsigned long long g_sum_sent_pkts;
 +static unsigned long long g_sum_retrans_pkts;
++/* Refused retransmissions, by reason. These exist ONLY in librist's stats JSON
++ * -- no field of struct rist_stats_sender_peer carries them -- and they are the
++ * difference between "the leg needed no repairs" and "librist was not allowed to
++ * make them". Without them a run whose every retransmission was refused for
++ * budget scores a PERFECT quality, which flatters a bad link in the one
++ * direction that matters. */
++static unsigned long long g_sum_bw_skip;
++static unsigned long long g_sum_bloat_skip;
++static unsigned long long g_sum_retrans_skip;
 +/* Set from the peer stats: whether TR-06-3 Advanced FRAMING is active on the
 + * wire. An Advanced context uses Main framing until the peer advertises
 + * Advanced support, so `profile` alone does not prove the framing engaged --
 + * this is the number that would have caught the probe measuring Main while the
 + * product ran Advanced. */
 +static int g_res_advanced;
++
++/* One numeric key out of librist's stats JSON, summed over every occurrence.
++ * The probe is a single-peer sender, so each key appears once per interval; the
++ * sum is written this way so a JSON carrying several peers cannot silently drop
++ * all but one. `key` includes its quotes, to match the JSON literally rather
++ * than as a substring of a longer name. */
++static unsigned long long json_num(const char *json, const char *key)
++{
++	const char *p = json;
++	size_t klen = strlen(key);
++	unsigned long long total = 0;
++
++	while ((p = strstr(p, key)) != NULL) {
++		p += klen;
++		if (*p == '"')      /* the key's closing quote */
++			p++;
++		while (*p == ' ' || *p == ':')
++			p++;
++		total += (unsigned long long)strtod(p, NULL);
++	}
++	return total;
++}
 +
 +static int stats_cb(void *arg, const struct rist_stats *s)
 +{
@@ -251,6 +282,12 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +		g_sum_retrans_bytes += g_latest.retransmitted_bytes;
 +		g_sum_sent_pkts += g_latest.sent_pkts;
 +		g_sum_retrans_pkts += g_latest.retrans_pkts;
++		if (s->stats_json != NULL) {
++			g_sum_bw_skip += json_num(s->stats_json, "\"bandwidth_skipped\"");
++			g_sum_bloat_skip += json_num(s->stats_json, "\"bloat_skipped\"");
++			g_sum_retrans_skip +=
++				json_num(s->stats_json, "\"retransmit_skipped\"");
++		}
 +		pthread_mutex_unlock(&g_lock);
 +	}
 +	/* librist hands ownership over: not freeing this leaks the stats JSON. */
@@ -272,6 +309,7 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +struct qsnap {
 +	unsigned long long bs, br;   /* bytes   */
 +	unsigned long long ps, pr;   /* packets */
++	unsigned long long sk;       /* refused retransmissions, packets */
 +};
 +
 +static void qsnap_take(struct qsnap *q)
@@ -281,32 +319,39 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +	q->br = g_sum_retrans_bytes;
 +	q->ps = g_sum_sent_pkts;
 +	q->pr = g_sum_retrans_pkts;
++	q->sk = g_sum_bw_skip + g_sum_bloat_skip + g_sum_retrans_skip;
 +	pthread_mutex_unlock(&g_lock);
 +}
 +
-+/* Quality over the STEP, as a BYTE ratio.
++/* Quality over the STEP.
 + *
-+ * librist's own Q counts PACKETS: sent/(sent + skips + retrans). On this build
-+ * `stats.sender_peer.sent` reads 0 in the live stats while sent_bytes is well
-+ * above zero, so a packet ratio divides by nothing and scores 0.00 for a step
-+ * that demonstrably carried traffic -- and a 0.00 attaches to EVERY step, the
-+ * first included, so the ramp never found a ceiling and always "failed" at the
-+ * floor. Both packet counters are still reported (`sent_packets` /
-+ * `retransmitted_packets`) so the discrepancy stays visible rather than being
-+ * papered over. The byte ratio answers the question the probe is actually
-+ * asking -- what fraction of the carried load was repairs -- and so is the
-+ * honest verdict even where the packet counters are unpopulated. The skip
-+ * counters are not in the C struct at all (JSON only), so refused
-+ * retransmissions are not counted; the tool surfaces those separately through
-+ * retransmitted_bytes and librist's own budget warnings. */
++ * librist's own formula is sent/(sent + skips + retrans) over ONE interval, and
++ * the three SKIP counters live only in librist's stats JSON -- the C struct has
++ * none of them. Here it is applied over a STEP, with the skips read from the
++ * JSON: refusing a retransmission for budget is a REAL degradation and must cost
++ * quality, or a link that had every repair refused scores a perfect 100.
++ *
++ * The packet ratio is preferred because it is the formula librist itself uses.
++ * Some builds report a zero packet count for an interval while the byte counters
++ * are live; a packet ratio would then divide by nothing and score 0.00 for a step
++ * that demonstrably carried traffic, which attaches to EVERY step and makes the
++ * ramp always "fail" at the floor. So the byte ratio is the fallback -- it cannot
++ * see refusals, which is exactly why `skipped_packets` is reported separately
++ * rather than left implicit. */
 +static double qsnap_quality(const struct qsnap *q)
 +{
-+	unsigned long long s, r;
++	unsigned long long s, r, ps, pr, sk;
 +
 +	pthread_mutex_lock(&g_lock);
 +	s = g_sum_sent_bytes - q->bs;
 +	r = g_sum_retrans_bytes - q->br;
++	ps = g_sum_sent_pkts - q->ps;
++	pr = g_sum_retrans_pkts - q->pr;
++	sk = (g_sum_bw_skip + g_sum_bloat_skip + g_sum_retrans_skip) - q->sk;
 +	pthread_mutex_unlock(&g_lock);
++
++	if (ps > 0)
++		return 100.0 * (double)ps / (double)(ps + pr + sk);
 +	if (s == 0)
 +		return 0.0;   /* nothing left: unknown, never a pass */
 +	return 100.0 * (double)s / (double)(s + r);
@@ -511,6 +556,14 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +	unsigned long long budget_spent;
 +	double duration_s;
 +	int clean_to_ceiling;
++	/* WHY the ramp stopped, and what the leg was doing when it did. A ramp that
++	 * stops at the first step is not the same as a leg that carried nothing, and
++	 * the two were indistinguishable: `quality` and `loaded_rtt_ms` were only ever
++	 * written on a PASS, so the failing step reported the struct's initialisers
++	 * (0.00 and null) whatever it had actually done. */
++	int failed_on_rtt;
++	int failed_on_quality;
++	unsigned long long skipped_pkts;   /* refused retransmissions, all reasons */
 +};
 +
 +static void print_json(FILE *out, const struct result *r)
@@ -543,12 +596,21 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +	else
 +		fprintf(out, "null");
 +	fprintf(out, ",\"ceiling_reached\":%s", r->clean_to_ceiling ? "true" : "false");
++
++	/* Why the ramp stopped. `failed_at_kbps` alone cannot distinguish a leg that
++	 * carried the step and bloated from one that could not move the bytes. */
++	fprintf(out, ",\"failed_on_rtt\":%s,\"failed_on_quality\":%s",
++		r->failed_on_rtt ? "true" : "false",
++		r->failed_on_quality ? "true" : "false");
 +	fprintf(out, ",\"quality\":%.2f,\"advanced_framing\":%s,\"sent_packets\":%llu,"
 +		"\"retransmitted_packets\":%llu",
 +		r->quality, r->advanced ? "true" : "false",
 +		r->sent_pkts, r->retrans_pkts);
 +	fprintf(out, ",\"sent_bytes\":%llu", r->sent_bytes);
 +	fprintf(out, ",\"retransmitted_bytes\":%llu", r->retrans_bytes);
++	/* Retransmissions librist REFUSED (budget / bloat / cap). Non-zero here means
++	 * repairs were withheld, so `quality` flatters the leg by exactly that much. */
++	fprintf(out, ",\"skipped_packets\":%llu", r->skipped_pkts);
 +	/* Where the byte figure came from: the leg's own counter (true wire spend on
 +	 * a metered link) or librist's summed intervals (bench runs). A consumer
 +	 * must be able to see which, because they are not the same quantity. */
@@ -576,10 +638,20 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +			r->failed_kbps);
 +	else
 +		fprintf(out, "first bad    : none (ramp stopped at the ceiling)\n");
++	if (r->failed_kbps != 0)
++		fprintf(out, "why          : %s\n",
++			r->failed_on_rtt && r->failed_on_quality ?
++				"latency rose above idle AND quality fell" :
++			r->failed_on_rtt ?
++				"latency rose above idle -- the leg is saturated, not broken" :
++			r->failed_on_quality ?
++				"quality fell -- repairs could not keep up" :
++				"unrecorded");
 +	fprintf(out, "quality      : %.2f\n      advanced framing : %s (TR-06-3; false means Main framing was used)\n",
 +		r->quality, r->advanced ? "active" : "NOT active");
-+	fprintf(out, "bytes spent  : %llu (%llu of them retransmissions, metered by %s)\n",
-+		r->sent_bytes, r->retrans_bytes, r->metering);
++	fprintf(out, "bytes spent  : %llu (%llu of them retransmissions, %llu refused, "
++		"metered by %s)\n",
++		r->sent_bytes, r->retrans_bytes, r->skipped_pkts, r->metering);
 +	fprintf(out, "budget today : %llu bytes\n", r->budget_spent);
 +}
 +
@@ -984,7 +1056,7 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +			double t0 = now_s();
 +			double bytes = 0.0, rtt_max = 0.0, q;
 +			struct qsnap snap;
-+			int clean;
++			int clean, rose_rtt;
 +
 +			qsnap_take(&snap);
 +			if (rate_f > (double)max_kbps)
@@ -1001,14 +1073,21 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +			 * unknown the quality signal alone decides -- the probe must not
 +			 * call a leg good because a number was missing. */
 +			clean = 1;
++			rose_rtt = 0;
 +			if (res.baseline_rtt_ms > 0.0 && rtt_max > 0.0 &&
-+			    rtt_max > res.baseline_rtt_ms * (1.0 + rise_pct / 100.0))
++			    rtt_max > res.baseline_rtt_ms * (1.0 + rise_pct / 100.0)) {
 +				clean = 0;
++				rose_rtt = 1;
++			}
 +			if (q < quality_floor)
 +				clean = 0;
 +
 +			if (!clean) {
 +				res.failed_kbps = (unsigned long long)rate_f;
++				res.loaded_rtt_ms = rtt_max > 0.0 ? rtt_max : -1.0;
++				res.quality = q;
++				res.failed_on_rtt = rose_rtt;
++				res.failed_on_quality = (q < quality_floor);
 +				break;
 +			}
 +			res.carried_kbps = (unsigned long long)rate_f;
@@ -1041,6 +1120,7 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +		pthread_mutex_lock(&g_lock);
 +		sent = g_sum_sent_bytes;
 +		retrans = g_sum_retrans_bytes;
++		res.skipped_pkts = g_sum_bw_skip + g_sum_bloat_skip + g_sum_retrans_skip;
 +		pthread_mutex_unlock(&g_lock);
 +
 +		if (bound) {
