@@ -131,9 +131,13 @@ redact_url() { # redact_url <text>
 	printf '%s' "$1" | sed -E 's/(secret=)[^&"[:space:]]*/\1REDACTED/g'
 }
 
-err() { # err <code> <message> [legs-json]
+# The shaper's service. Overridable so the off-device suite can supply one.
+SQM_INIT="${SQM_INIT:-/etc/init.d/sqm}"
+
+err() { # err <code> <message> [legs-json] [shaper]
 	local extra=""
-	[ -n "$3" ] && extra=",\"legs\":[$3]"
+	[ -n "$3" ] && extra="$extra,\"legs\":[$3]"
+	[ -n "$4" ] && extra="$extra,\"shaper\":\"$4\""
 	printf '{"ok":false,"error":"%s","message":"%s"%s}\n' "$1" "$(json_str "$2")" "$extra"
 }
 
@@ -441,6 +445,47 @@ method_wan_status() {
 # failed: a caller must be able to tell "no clean rate on wwan1" from "wwan1 was
 # never measured", so a leg is never silently dropped from the array, and a leg
 # that refused never hands back figures to shape from.
+# --- the shaper, cleared for the measurement --------------------------------
+# A leg measured THROUGH its own shaper is not measured. CAKE caps the rate and
+# flattens the queue, so the probe would read the qdisc's rate instead of the
+# link's, and a ramp behind a low shaper climbs to its own ceiling and calls that
+# `clean_to_ceiling`. Ordering -- calibrate before shaping -- only works the FIRST
+# time: a bridge arriving at a second event still shaped from the last one would
+# derive every weight from the shaper. So calibrate CLEARS it, measures, and puts
+# it back on EVERY exit including a failure, because the shaper belongs to the
+# operator and not to this run.
+#
+# CAKE on OpenWrt runs through an IFB (ifb4<iface>), the device the init also
+# names, so a cake qdisc there is the ONE signal that a leg is shaped.
+shape_up() { # shape_up <iface>
+	tc -s qdisc show dev "ifb4$1" 2>/dev/null | grep -q 'qdisc cake'
+}
+
+shape_suspend() { # shape_suspend "<ifaces>" -> echoes the ifaces it CLEARED
+	local iface cleared=""
+
+	[ -x "$SQM_INIT" ] || { printf '%s' ""; return 0; }
+	for iface in $1; do
+		shape_up "$iface" || continue
+		"$SQM_INIT" stop >/dev/null 2>&1
+		cleared="$cleared $iface"
+	done
+	printf '%s' "$cleared"
+}
+
+shape_resume() { # shape_resume "<cleared ifaces>" -> echoes "" / restored / restore_failed
+	local iface
+
+	[ -n "$1" ] || { printf '%s' ""; return 0; }
+	"$SQM_INIT" start >/dev/null 2>&1
+	# Do not CLAIM it came back -- check it. A calibration that silently leaves the
+	# operator's WAN unshaped is worse than one that says it could not restore it.
+	for iface in $1; do
+		shape_up "$iface" || { printf '%s' "restore_failed"; return 0; }
+	done
+	printf '%s' "restored"
+}
+
 # The per-leg report, built ONCE and used by BOTH exits. A calibration that
 # derives no weight still has to say, per leg, WHY -- otherwise the caller sees
 # only "measured nothing", which reads as a dead link, and that is exactly the
@@ -521,6 +566,12 @@ method_calibrate() {
 	UPLINK_DECLARED=""
 	config_foreach collect_uplink uplink
 
+	# Clear the shaper BEFORE the first probe byte, and arm the restore with it: a
+	# run that dies mid-measurement must not leave the operator's WAN unshaped.
+	shaper=none
+	cleared=$(shape_suspend "$legs")
+	[ -n "$cleared" ] && trap 'shape_resume "$cleared" >/dev/null; trap - EXIT INT TERM' EXIT INT TERM
+
 	# ---- pass 1: measure every leg -------------------------------------------
 	mkdir -p "$PROBE_STATE_DIR" 2>/dev/null
 	measured=""
@@ -575,6 +626,13 @@ method_calibrate() {
 $legs
 WAN_LINKS_EOF
 
+	# Put the shaper back as soon as the last probe has finished -- the derivation
+	# below needs no traffic -- and say how it was left.
+	if [ -n "$cleared" ]; then
+		shaper=$(shape_resume "$cleared")
+		trap - EXIT INT TERM
+	fi
+
 	# ---- pass 2: derive, from ALL legs at once -------------------------------
 	#
 	# A weight is a leg's measured CONTRIBUTION to the aggregate, so it cannot be
@@ -589,7 +647,7 @@ $measured
 MEASURED_EOF
 
 	if [ -z "$best" ]; then
-		err calibration_measured_nothing "no leg produced a usable rate; no weight was derived and the previous ones are left as they were" "$(legs_json '')"
+		err calibration_measured_nothing "no leg produced a usable rate; no weight was derived and the previous ones are left as they were" "$(legs_json '')" "$shaper"
 		return 0
 	fi
 
@@ -668,8 +726,9 @@ MEASURED_EOF
 
 	uci -q commit "$CONFIG"
 
-	printf '{"ok":true,"endpoint":"%s","scale":%s,"aggregate_kbps":%s,"aggregate_state":"%s","legs":[%s]}\n' \
-		"$(json_str "$endpoint")" "$CAPACITY_WEIGHT_SCALE" "$agg" "$agg_state" "$(legs_json "$best")"
+	printf '{"ok":true,"endpoint":"%s","scale":%s,"aggregate_kbps":%s,"aggregate_state":"%s","legs":[%s],"shaper":"%s"}\n' \
+		"$(json_str "$endpoint")" "$CAPACITY_WEIGHT_SCALE" "$agg" "$agg_state" "$(legs_json "$best")" \
+		"$shaper"
 }
 
 # ======================================================================

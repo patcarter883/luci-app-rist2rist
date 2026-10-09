@@ -22,6 +22,23 @@ plugin="$here/../root/usr/libexec/rpcd/rist2rist"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# A shaper-aware tc double for THIS suite, put AHEAD of tests/bin. The shared
+# tests/bin/tc answers per-MODE (TC_STUB_MODE) for the measure helper; this suite
+# needs per-DEVICE, because the case that matters is one leg shaped and another
+# not -- and a fixture that answers by name would hide exactly that bug.
+mkdir -p "$tmp/tcbin"
+cat > "$tmp/tcbin/tc" <<'TC'
+#!/bin/sh
+[ "$1" = "-s" ] && [ "$2 $3" = "qdisc show" ] && [ "$4" = "dev" ] || exit 0
+if [ -e "${STUB_SHAPED_DIR:-/nonexistent}/$5" ]; then
+	printf 'qdisc cake 8012: root refcnt 2 bandwidth 8Mbit besteffort triple-isolate\n Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)\n'
+fi
+exit 0
+TC
+chmod +x "$tmp/tcbin/tc"
+PATH="$tmp/tcbin:$PATH"
+export PATH
+
 TOKEN='test-token-abcdefghijklmnop'
 TOKEN_HASH=$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)
 
@@ -57,10 +74,36 @@ printf '{"interface":"%s","measured_kbps":%s,"measured_at":"2026-10-09T00:00:00Z
 PROBE
 chmod +x "$tmp/probe"
 
+# The shaper's service, as the plugin uses it: `stop` clears the qdiscs, `start`
+# installs them. Both are logged into the PROBE log, so the ORDER is assertable --
+# the whole point is that no probe byte is sent while the shaper is up. A fixture
+# with a shaped leg is a file in STUB_SHAPED_DIR; tc reports cake for it.
+mkdir -p "$tmp/shaped"
+STUB_SHAPED_DIR="$tmp/shaped"
+STUB_SHAPED_SAVE="$tmp/shaped.save"
+cat > "$tmp/sqm" <<'SQM'
+#!/bin/sh
+case "$1" in
+	stop)
+		ls "$STUB_SHAPED_DIR" > "$STUB_SHAPED_SAVE" 2>/dev/null || true
+		rm -f "$STUB_SHAPED_DIR"/*
+		printf 'sqm stop\n' >> "$PROBE_ARGV_LOG" ;;
+	start)
+		while read -r d; do [ -n "$d" ] && touch "$STUB_SHAPED_DIR/$d"; done < "$STUB_SHAPED_SAVE" 2>/dev/null
+		# A restore that does not come back, for the case that must be REPORTED
+		# rather than assumed.
+		[ "${STUB_SQM_START_BROKEN:-0}" = 1 ] && rm -f "$STUB_SHAPED_DIR"/*
+		printf 'sqm start\n' >> "$PROBE_ARGV_LOG" ;;
+	esac
+exit 0
+SQM
+chmod +x "$tmp/sqm"
+
 UCI_STUB_LOG="$tmp/uci.log"
 PROBE_ARGV_LOG="$tmp/probe.argv"
 STUB_main_probe_psk_file="$tmp/psk"
 export UCI_STUB_LOG PROBE_ARGV_LOG STUB_main_probe_psk_file
+export SQM_INIT="$tmp/sqm" STUB_SHAPED_DIR STUB_SHAPED_SAVE
 
 # Drive the plugin's calibrate method. The uci double logs every command, so the
 # writes can be asserted; PROC_ROOT is deliberately UNSET so the ubus double
@@ -286,6 +329,71 @@ assert "and still nothing is written" \
 	"[ -z \"\$(cat \"\$UCI_STUB_LOG\")\" ]"
 
 unset PROBE_lo_FAILED_ON_RTT PROBE_lo_QUALITY PROBE_lo_LOADED_RTT PROBE_lo_FAILED_AT
+
+# ---------------------------------------------------------------------------
+echo
+echo "-- the shaper is CLEARED for the measurement, and put back afterwards --"
+# A leg measured THROUGH its own shaper is not measured: CAKE caps the rate and
+# flattens the queue, so the ramp reads the qdisc instead of the link and calls
+# its own ceiling clean. Ordering -- calibrate before shaping -- only works the
+# first time; a bridge arriving at a second event still shaped from the last one
+# would derive every weight from the shaper.
+touch "$tmp/shaped/ifb4wwan1"
+PROBE_lo_KBPS=2000
+PROBE_wwan1_KBPS=500
+out=$(run_cal)
+
+first=$(head -1 "$PROBE_ARGV_LOG")
+last=$(tail -1 "$PROBE_ARGV_LOG")
+assert "the shaper is stopped BEFORE the first probe byte" \
+	"[ \"\$first\" = 'sqm stop' ]"
+assert "and it is not started again until the probing is done" \
+	"[ \"\$last\" = 'sqm start' ]"
+between=$(sed -n '/sqm stop/,/sqm start/p' "$PROBE_ARGV_LOG")
+assert "both probes ran INSIDE the cleared window" \
+	"[ \"\$(printf '%s' \"\$between\" | grep -c -- '--psk-file')\" = 2 ]"
+assert "the run reports how the shaper was left" \
+	"[ \"\$(field \"\$out\" 'd[\"shaper\"]')\" = restored ]"
+
+echo
+echo "-- a run that derives NOTHING still puts the shaper back --"
+PROBE_lo_KBPS=0
+PROBE_wwan1_KBPS=0
+PROBE_lo_RC=3
+PROBE_wwan1_RC=3
+export PROBE_lo_RC PROBE_wwan1_RC
+touch "$tmp/shaped/ifb4wwan1"
+out=$(run_cal)
+
+assert "the shaper is restored even when no weight was derived" \
+	"printf '%s' \"\$(cat \"\$PROBE_ARGV_LOG\")\" | grep -q 'sqm start'"
+assert "and the error says so rather than leaving it unsaid" \
+	"[ \"\$(field \"\$out\" 'd[\"shaper\"]')\" = restored ]"
+unset PROBE_lo_RC PROBE_wwan1_RC
+
+echo
+echo "-- an UNSHAPED bridge: starting the service would install a shaper it never had --"
+rm -f "$tmp/shaped"/*
+PROBE_lo_KBPS=2000
+PROBE_wwan1_KBPS=500
+out=$(run_cal)
+
+assert "nothing is stopped, and nothing is started, when no leg is shaped" \
+	"! printf '%s' \"\$(cat \"\$PROBE_ARGV_LOG\")\" | grep -q 'sqm '"
+assert "and the run says the shaper was not involved" \
+	"[ \"\$(field \"\$out\" 'd[\"shaper\"]')\" = none ]"
+
+echo
+echo "-- a restore that does not come back must be REPORTED, never assumed --"
+touch "$tmp/shaped/ifb4wwan1"
+STUB_SQM_START_BROKEN=1
+export STUB_SQM_START_BROKEN
+out=$(run_cal)
+
+assert "a failed restore is reported as failed" \
+	"[ \"\$(field \"\$out\" 'd[\"shaper\"]')\" = restore_failed ]"
+unset STUB_SQM_START_BROKEN
+rm -f "$tmp/shaped"/*
 
 # ---------------------------------------------------------------------------
 echo
