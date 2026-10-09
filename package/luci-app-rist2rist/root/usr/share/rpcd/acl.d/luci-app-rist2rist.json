@@ -4,7 +4,7 @@
 		"read": {
 			"ubus": {
 				"service": [ "list" ],
-				"rist2rist": [ "status", "get_config", "claim" ]
+				"rist2rist": [ "status", "get_config", "wan_status", "claim" ]
 			},
 			"uci": [ "rist2rist" ],
 			"file": {
@@ -23,7 +23,7 @@
 		"description": "rist2rist control for a LAN client holding the bridge's pair token. rpcd's exec interface does not identify the caller, so the plugin verifies the token itself: every method except 'claim' is refused without it, and 'claim' is refused unless the bridge is virgin. Keep this list in step with the plugin's dispatcher.",
 		"read": {
 			"ubus": {
-				"rist2rist": [ "status", "get_config", "claim" ]
+				"rist2rist": [ "status", "get_config", "wan_status", "claim" ]
 			}
 		},
 		"write": {

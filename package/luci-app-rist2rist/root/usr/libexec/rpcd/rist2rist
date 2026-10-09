@@ -6,6 +6,7 @@
 #   rist2rist.release     (token)    return the bridge to unclaimed
 #   rist2rist.status      (token)    running state, pid and the REAL effective argv
 #   rist2rist.get_config  (token)    the UCI configuration as structured JSON
+#   rist2rist.wan_status  (token)    the passive per-leg measurement snapshot (read-only)
 #   rist2rist.set_config  (token)    apply a whitelisted config object, then commit
 #   rist2rist.reconcile   (token)    apply listen_url + outputs only (the "adopt" action)
 #
@@ -52,6 +53,11 @@ FUNCTIONS_SH=${FUNCTIONS_SH:-/lib/functions.sh}
 # cannot reach it.
 RELOAD_CMD=${RELOAD_CMD:-/etc/init.d/rist2rist}
 
+# Test hook: the passive per-leg measurement helper -- the READ path for the
+# observed figures. An absolute path, like RELOAD_CMD, so PATH stubbing cannot
+# reach it.
+MEASURE_CMD=${MEASURE_CMD:-/usr/sbin/rist2rist-measure}
+
 CONFIG=rist2rist
 
 # Minimal JSON string escaping for values (URLs/paths) that can contain quotes.
@@ -97,22 +103,107 @@ emit_output() {
 		"$(json_str "$cfg")" "$(json_str "$address")"
 }
 
+# ======================================================================
+# the passive measurement snapshot (the read path)
+# ======================================================================
+
+# Run the measurement helper and echo its JSON on success. Returns non-zero with
+# no output when the helper is missing or its output is not a JSON object. This is
+# the ONE definition of "the helper's result", so wan_status and get_config
+# validate it identically -- and neither can hand a caller a fabricated value.
+run_measure() {
+	local out
+	[ -x "$MEASURE_CMD" ] || return 1
+	out=$("$MEASURE_CMD" 2>/dev/null)
+	case "$out" in
+		"{"*"}") printf '%s' "$out"; return 0 ;;
+		*)        return 1 ;;
+	esac
+}
+
+# The snapshot read ONCE per get_config and reused for every leg: the helper is a
+# one-shot probe, not a cheap file read, so it must not run per section. Empty
+# when unavailable -- the measured fields then stay null, the honest "unknown".
+MEASURE_JSON=""
+load_measure() {
+	MEASURE_JSON=$(run_measure) || MEASURE_JSON=""
+}
+
+# The index in the current snapshot of the leg whose interface matches $1, or
+# empty when the snapshot carries no such leg. jsonfilter cannot match a key
+# against a value, so the legs are walked by index. Empty is a legitimate answer:
+# an absent leg is normal, not an error.
+measure_leg_index() { # measure_leg_index <iface>
+	local i=0 iface
+	[ -n "$MEASURE_JSON" ] || return 0
+	while :; do
+		iface=$(printf '%s' "$MEASURE_JSON" | jsonfilter -e "@.legs[$i].interface" 2>/dev/null)
+		[ -z "$iface" ] && break
+		if [ "$iface" = "$1" ]; then printf '%s' "$i"; return 0; fi
+		i=$((i + 1))
+	done
+}
+
+# One measured field as a JSON token. jsonfilter prints a string bare, so a string
+# is re-quoted and escaped here; a number/boolean is passed through. A value the
+# snapshot does not carry -- or a leg it does not cover -- is emitted as null,
+# NEVER 0 or a default, so "unknown" survives the read path.
+measure_field_json() { # measure_field_json <leg-index-or-empty> <field> <str|num>
+	local v=""
+	[ -n "$1" ] && v=$(printf '%s' "$MEASURE_JSON" | jsonfilter -e "@.legs[$1].$2" 2>/dev/null)
+	case "$v" in
+		''|null) printf 'null'; return 0 ;;
+	esac
+	case "$3" in
+		str) printf '"%s"' "$(json_str "$v")" ;;
+		*)   printf '%s' "$v" ;;
+	esac
+}
+
 # config_foreach callback: one JSON object per configured WAN uplink.
 #
 # READ-ONLY to callers by design: which physical links exist, and how traffic is
 # shared across them, is the router's own business and is configured locally. It
 # is reported only so a client can SHOW what a bridge is bonded across.
-# `present` reflects whether the interface exists right now, which is why a leg
-# can be configured and legitimately idle.
+#
+# The DECLARED leg (section/interface/weight) and its OBSERVED state (the passive
+# helper's per-leg figures) are merged into ONE object, so a single get_config
+# shows both without a second call.
 emit_uplink() {
-	local cfg="$1" interface weight present
+	local cfg="$1" interface weight present idx
 	config_get interface "$cfg" interface
 	config_get weight    "$cfg" weight
 	[ -z "$interface" ] && return 0
-	[ -e "/sys/class/net/${interface}" ] && present=true || present=false
-	printf '{"section":"%s","interface":"%s","weight":"%s","present":%s},' \
+	idx=$(measure_leg_index "$interface")
+	# `present` prefers the snapshot when the helper covered this leg, so it is the
+	# SAME observation as the merged figures and the two cannot disagree. It falls
+	# back to the interface's existence -- the plugin's own definition, which is
+	# also what lets a leg be configured and legitimately idle -- when there is no
+	# snapshot, or the helper reported no usable boolean.
+	present=$(measure_field_json "$idx" present num)
+	case "$present" in
+		true|false) ;;
+		*) [ -e "/sys/class/net/${interface}" ] && present=true || present=false ;;
+	esac
+	printf '{"section":"%s","interface":"%s","weight":"%s","present":%s,' \
 		"$(json_str "$cfg")" "$(json_str "$interface")" \
 		"$(json_str "$weight")" "$present"
+	printf '"state":%s,"shaped_kbps":%s,"tx_bytes":%s,"rx_bytes":%s,' \
+		"$(measure_field_json "$idx" state str)" \
+		"$(measure_field_json "$idx" shaped_kbps num)" \
+		"$(measure_field_json "$idx" tx_bytes num)" \
+		"$(measure_field_json "$idx" rx_bytes num)"
+	printf '"tx_dropped":%s,"tx_overlimits":%s,"backlog_bytes":%s,"signal_dbm":%s,' \
+		"$(measure_field_json "$idx" tx_dropped num)" \
+		"$(measure_field_json "$idx" tx_overlimits num)" \
+		"$(measure_field_json "$idx" backlog_bytes num)" \
+		"$(measure_field_json "$idx" signal_dbm num)"
+	printf '"rtt_ms":%s,"jitter_ms":%s,"quality":%s,"measured_kbps":%s,"measured_at":%s},' \
+		"$(measure_field_json "$idx" rtt_ms num)" \
+		"$(measure_field_json "$idx" jitter_ms num)" \
+		"$(measure_field_json "$idx" quality num)" \
+		"$(measure_field_json "$idx" measured_kbps num)" \
+		"$(measure_field_json "$idx" measured_at str)"
 }
 
 method_get_config() {
@@ -140,6 +231,9 @@ method_get_config() {
 	# Claimed is derived from the token existing, not tracked separately -- one
 	# definition, so the two can never disagree.
 	[ -n "$token_hash" ] && claimed=1 || claimed=0
+
+	# The observed per-leg figures, read once and merged into each uplink below.
+	load_measure
 
 	outputs=$(config_foreach emit_output destination)
 	uplinks=$(config_foreach emit_uplink uplink)
@@ -196,6 +290,21 @@ method_status() {
 
 	printf '{"ok":true,"running":%s,"pid":"%s","argv":"%s"}\n' \
 		"$running" "$(json_str "$pid")" "$(json_str "$argv")"
+}
+
+# READ-ONLY: the passive snapshot of this router's WAN legs. The helper's JSON is
+# passed through UNCHANGED -- its nulls are the honest "unknown" and must not be
+# turned into 0 or a default here. A missing helper, or output that is not a JSON
+# object, is a JSON error, never an empty object: a caller must be able to tell
+# "no measurement" from "all zero". Per-leg capacity stays here and NEVER reaches
+# the frozen wan_telemetry OOB message.
+method_wan_status() {
+	local out
+	if ! out=$(run_measure); then
+		err measure_unavailable "the measurement helper ($MEASURE_CMD) is missing or produced no usable output"
+		return 0
+	fi
+	printf '%s\n' "$out"
 }
 
 # ======================================================================
@@ -483,7 +592,7 @@ method_reload() {
 case "$1" in
 	list)
 		# rpcd requires this to enumerate the object's methods.
-		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "set_config": {}, "set_link_secret": {}, "reconcile": {}, "reload": {} }'
+		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "wan_status": {}, "set_config": {}, "set_link_secret": {}, "reconcile": {}, "reload": {} }'
 		;;
 	call)
 		REQ_BODY=$(cat)
@@ -495,6 +604,7 @@ case "$1" in
 			case "$2" in
 				status)     method_status ;;
 				get_config) method_get_config ;;
+				wan_status) method_wan_status ;;
 				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address" ;;
 				set_link_secret) require_managed && method_set_link_secret ;;
 				reconcile)  require_managed && apply_config "listen_url outputs address" ;;
