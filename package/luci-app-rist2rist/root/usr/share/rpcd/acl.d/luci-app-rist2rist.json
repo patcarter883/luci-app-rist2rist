@@ -13,9 +13,9 @@
 		},
 		"write": {
 			"ubus": {
-				"rist2rist": [ "set_config", "set_link_secret", "reconcile", "reload", "release" ]
-			},
-			"uci": [ "rist2rist" ]
+				"rist2rist": [ "set_config", "set_link_secret", "reconcile", "reload", "release", "calibrate" ]
+								},
+								"uci": [ "rist2rist" ]
 		}
 	},
 
@@ -28,7 +28,7 @@
 		},
 		"write": {
 			"ubus": {
-				"rist2rist": [ "set_config", "set_link_secret", "reconcile", "reload", "release" ]
+				"rist2rist": [ "set_config", "set_link_secret", "reconcile", "reload", "release", "calibrate" ]
 			}
 		}
 	}

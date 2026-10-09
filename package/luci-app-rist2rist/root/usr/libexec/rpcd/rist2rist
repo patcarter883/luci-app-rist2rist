@@ -60,6 +60,10 @@ RELOAD_CMD=${RELOAD_CMD:-/etc/init.d/rist2rist}
 # reach it.
 MEASURE_CMD=${MEASURE_CMD:-/usr/sbin/rist2rist-measure}
 
+# Test hook: the ACTIVE probe tool -- the instrument the calibration run drives.
+# Absolute, like MEASURE_CMD, so PATH stubbing cannot reach it.
+PROBE_CMD=${PROBE_CMD:-/usr/sbin/rist2rist-probe}
+
 # The shared WAN-link resolver (DT-27.3) -- the ONE definition of this box's WAN
 # links, also sourced by the init script and the measurement helper. An absolute
 # path with an override, like MEASURE_CMD, because it is a TEST hook too.
@@ -390,6 +394,94 @@ method_wan_status() {
 }
 
 # ======================================================================
+# the ACTIVE calibration run (DT-28)
+# ======================================================================
+
+# Run the ACTIVE probe against the configured endpoint, one WAN leg at a time, and
+# report each leg's highest clean carried rate.
+#
+# PRE-START ONLY (DT-26). The probe PUTS TRAFFIC on the link, so while a session
+# is running it is a REFUSAL, not a de-prioritisation: it would steal capacity
+# from the very stream being measured. Enforced here as well as in the tool,
+# because THIS is the path an operator's button reaches.
+#
+# The run is the long pole -- a ramp spends tens of seconds per leg -- so a client
+# MUST allow a long call. Every leg is reported INCLUDING one that refused or
+# failed: a caller must be able to tell "no clean rate on wwan1" from "wwan1 was
+# never measured", so a leg is never silently dropped from the array, and a leg
+# that refused never hands back figures to shape from.
+method_calibrate() {
+	local endpoint pskfile svc pid out legs iface j rc state first=1
+
+	config_load "$CONFIG"
+	config_get endpoint main probe_endpoint
+	config_get pskfile  main probe_psk_file
+
+	if [ -z "$endpoint" ]; then
+		err probe_unconfigured "no probe_endpoint is configured on this bridge; calibration is unavailable"
+		return 0
+	fi
+	if [ ! -x "$PROBE_CMD" ]; then
+		err probe_unavailable "the probe tool ($PROBE_CMD) is not installed"
+		return 0
+	fi
+
+	# A session running? Refuse. Same source of truth as method_status: procd.
+	if command -v ubus >/dev/null 2>&1; then
+		svc=$(ubus call service list '{"name":"rist2rist"}' 2>/dev/null)
+	fi
+	if [ -n "$svc" ] && command -v jsonfilter >/dev/null 2>&1; then
+		pid=$(printf '%s' "$svc" | jsonfilter -e '@.rist2rist.instances.*.pid' 2>/dev/null | head -n 1)
+	fi
+	if [ -n "$pid" ]; then
+		err probe_refused "refusing to calibrate while a session is running: the probe would steal capacity from the stream it is meant to measure"
+		return 0
+	fi
+
+	# The leg set is the SHARED resolver's, exactly as the init and get_config use
+	# -- never a second answer to "what are this box's WAN links".
+	if [ "$WAN_LIB_LOADED" -ne 1 ]; then
+		err probe_unavailable "the WAN link resolver ($WAN_LIB) is unavailable, so the legs to measure cannot be named"
+		return 0
+	fi
+
+	legs=$(wan_links)
+	if [ -z "$legs" ]; then
+		err probe_no_legs "no WAN link is present to measure"
+		return 0
+	fi
+
+	out=""
+	while IFS= read -r iface; do
+		[ -n "$iface" ] || continue
+		j=$("$PROBE_CMD" "$iface" -u "$endpoint" --psk-file "$pskfile" -j 2>/dev/null)
+		rc=$?
+		# The tool's exit codes ARE its contract: 3 is a deliberate refusal (a
+		# session on the leg, or the day's byte budget spent), 1 a failed
+		# measurement, 2 a usage mistake. Flattening them would cost a caller
+		# exactly the distinction it needs.
+		case "$rc" in
+			0) state=ok ;;
+			3) state=refused ;;
+			*) state=failed ;;
+		esac
+		[ "$first" -eq 1 ] || out="$out,"
+		first=0
+		if [ "$state" = "ok" ] && [ -n "$j" ] && \
+		   printf '%s' "$j" | jsonfilter -e '@' >/dev/null 2>&1; then
+			out="$out{\"interface\":\"$(json_str "$iface")\",\"state\":\"ok\",\"result\":$j}"
+		else
+			out="$out{\"interface\":\"$(json_str "$iface")\",\"state\":\"$state\",\"result\":null}"
+		fi
+	done <<WAN_LINKS_EOF
+$legs
+WAN_LINKS_EOF
+
+	printf '{"ok":true,"endpoint":"%s","legs":[%s]}\n' \
+		"$(json_str "$endpoint")" "$out"
+}
+
+# ======================================================================
 # the pair token
 # ======================================================================
 
@@ -543,6 +635,7 @@ apply_config() {
 	local allowed="$1" j=0 present=""
 	local listen_url profile out_profile enabled
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
+	local probe_endpoint
 	local i addr sec
 
 	body_has_secret_key && { err secret_field "the request contains a secret-bearing field"; return 1; }
@@ -552,6 +645,14 @@ apply_config() {
 	if [ -n "$listen_url" ]; then
 		url_ok "$listen_url" listen_url || return 1
 		uci set "$CONFIG.main.listen_url=$listen_url" || { err apply_failed "listen_url"; return 1; }
+	fi
+
+	# The calibration endpoint. An ADDRESS ONLY, exactly like a destination --
+	# it reaches the relay that hosts the authenticated probe sink.
+	probe_endpoint=$(jget '@.probe_endpoint')
+	if [ -n "$probe_endpoint" ]; then
+		url_ok "$probe_endpoint" probe_endpoint || return 1
+		uci set "$CONFIG.main.probe_endpoint=$probe_endpoint" || { err apply_failed "probe_endpoint"; return 1; }
 	fi
 
 	profile=$(jget '@.profile')
@@ -674,7 +775,7 @@ method_reload() {
 case "$1" in
 	list)
 		# rpcd requires this to enumerate the object's methods.
-		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "wan_status": {}, "set_config": {}, "set_link_secret": {}, "reconcile": {}, "reload": {} }'
+		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "wan_status": {}, "set_config": {}, "set_link_secret": {}, "reconcile": {}, "calibrate": {}, "reload": {} }'
 		;;
 	call)
 		REQ_BODY=$(cat)
@@ -687,9 +788,10 @@ case "$1" in
 				status)     method_status ;;
 				get_config) method_get_config ;;
 				wan_status) method_wan_status ;;
-				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address" ;;
+				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery buffer_min buffer_max rtt_min rtt_max reorder_buffer probe_endpoint outputs address" ;;
 				set_link_secret) require_managed && method_set_link_secret ;;
 				reconcile)  require_managed && apply_config "listen_url outputs address" ;;
+				calibrate)  require_managed && method_calibrate ;;
 				reload)     method_reload ;;
 				release)    method_release ;;
 				*)          echo '{}' ;;
