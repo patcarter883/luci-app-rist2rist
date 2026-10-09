@@ -1,3 +1,4 @@
 001-librist-receiver-fixes.patch
 002-rist2rist-wan-telemetry.patch
 003-rist2rist-redact-secret-in-url-log.patch
+004-rist2rist-secret-from-file.patch

@@ -256,15 +256,29 @@ append_output_url() {
     #
     # The value must never reach a log: the plugin redacts it in `status`, and
     # 003-rist2rist-redact-secret-in-url-log.patch redacts it in the daemon's own
-    # Outurl line. Only argv carries it in the clear, and argv is root-readable --
-    # libRIST offers no file-based passphrase.
-    local psk secret_file aes
+    # Outurl line. It is the one thing that must also stay out of ARGV, because
+    # /proc/<pid>/cmdline is world-readable (0644) -- so a passphrase in argv, as
+    # `-s` or as a `secret=` URL parameter, is readable by EVERY process on the
+    # box, not merely root. It is therefore handed over as a FILE PATH
+    # (`--secret-file`): the path is not a secret and the file is 0600.
+    #
+    # aes-type is not a secret, so the encryption STRENGTH stays a plain uci
+    # option LuCI can show -- but it is passed as the tool's dedicated `-e`
+    # (1 = AES-128, 2 = AES-256) rather than as a URL parameter, so the output
+    # URL carries no crypto material at all.
+    local secret_file aes enc
     secret_file=/etc/rist2rist.link_secret
+    LINK_SECRET_FILE_IN_USE=""
+    ENC_TYPE=""
     if [ -s "$secret_file" ] && [ -r "$secret_file" ]; then
-        psk=$(head -n 1 "$secret_file")
-        if [ -n "$psk" ]; then
+        if [ -n "$(head -n 1 "$secret_file" 2>/dev/null)" ]; then
             config_get aes 'main' 'psk_aes' 256
-            query="${query}&secret=${psk}&aes-type=${aes}"
+            case "$aes" in
+                128) enc=1 ;;
+                *)   enc=2 ;;
+            esac
+            LINK_SECRET_FILE_IN_USE="$secret_file"
+            ENC_TYPE="$enc"
         fi
     fi
 
@@ -375,6 +389,12 @@ start_service() {
     procd_set_param command /usr/bin/rist2rist
     procd_append_param command -i "$listen_url"
     procd_append_param command -o "$OUTPUT_URLS"
+    # The session passphrase reaches the daemon as a FILE PATH, never as a value:
+    # /proc/<pid>/cmdline is world-readable (0644), so `-s` or a `secret=` URL
+    # parameter would expose the key to every process on the box. The path is not
+    # a secret; the file is 0600. `-e` sets the AES strength (1 = 128, 2 = 256).
+    [ -n "$LINK_SECRET_FILE_IN_USE" ] && procd_append_param command --secret-file "$LINK_SECRET_FILE_IN_USE"
+    [ -n "$ENC_TYPE" ] && procd_append_param command -e "$ENC_TYPE"
     procd_append_param command -p "$profile"
     procd_append_param command -P "$out_profile"
     procd_append_param command -v "$loglevel"
