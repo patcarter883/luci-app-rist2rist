@@ -452,6 +452,15 @@ export MEASURE_STUB_MODE
 out=$(run 1 wan_status "$(tb '{}')")
 check "wan_status refuses a helper whose output is unusable" "$out" \
 	"d.get('ok') is False and d.get('error') == 'measure_unavailable'"
+
+# Object-shaped but NOT valid JSON must be refused as well: a brace test alone
+# would accept it and hand the caller malformed JSON while claiming to have
+# checked it, which is exactly what the contract forbids.
+MEASURE_STUB_MODE=garbage-object
+export MEASURE_STUB_MODE
+out=$(run 1 wan_status "$(tb '{}')")
+check "wan_status refuses object-shaped but unparseable output" "$out" \
+	"d.get('ok') is False and d.get('error') == 'measure_unavailable'"
 unset MEASURE_STUB_MODE
 
 # get_config now carries the OBSERVED figures beside the DECLARED leg, so one call

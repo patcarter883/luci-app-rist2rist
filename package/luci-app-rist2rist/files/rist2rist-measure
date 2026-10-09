@@ -226,16 +226,29 @@ tc_fill() { # tc_fill <iface>
 # so we enumerate the modems `mmcli -L` lists and ask each one. If no modem
 # claims the interface, the result is empty -- never a numeric guess.
 modem_index_for_iface() { # modem_index_for_iface <iface>
-    local iface="$1" n
+    local iface="$1" n ports w
     [ -n "$iface" ] || return 0
     mmcli -L 2>/dev/null \
         | sed -n 's#.*/Modem/\([0-9][0-9]*\).*#\1#p' \
         | while IFS= read -r n; do
             [ -n "$n" ] || continue
-            if mmcli -m "$n" 2>/dev/null | grep -q "[[:space:]]${iface} (net)"; then
-                printf '%s\n' "$n"
-                break
-            fi
+            # Compare the interface as a LITERAL word, never as a regex: the name
+            # comes from UCI, so a regex metacharacter in it could otherwise match
+            # a DIFFERENT modem's port and return a WRONG index -- strictly worse
+            # than reporting nothing. Splitting on commas and spaces leaves the
+            # bare interface names out of a line like
+            #   ports: cdc-wdm0 (mbim), wwan1 (net)
+            # mmcli prints a detail table, so the field sits after a '|' rather
+            # than at the start of the line -- anchor on 'ports:' itself, not on
+            # the line start, or nothing matches and the lookup silently fails.
+            ports=$(mmcli -m "$n" 2>/dev/null \
+                | sed -n 's/.*ports:[[:space:]]*//p')
+            for w in $(printf '%s' "$ports" | tr ',' ' '); do
+                if [ "$w" = "$iface" ]; then
+                    printf '%s\n' "$n"
+                    break
+                fi
+            done
         done
 }
 

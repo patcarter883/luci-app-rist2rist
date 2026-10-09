@@ -108,17 +108,26 @@ emit_output() {
 # ======================================================================
 
 # Run the measurement helper and echo its JSON on success. Returns non-zero with
-# no output when the helper is missing or its output is not a JSON object. This is
-# the ONE definition of "the helper's result", so wan_status and get_config
-# validate it identically -- and neither can hand a caller a fabricated value.
+# no output when the helper is missing or its output is not a valid JSON object.
+# This is the ONE definition of "the helper's result", so wan_status and
+# get_config validate it identically -- and neither can hand a caller a
+# fabricated value.
+#
+# The brace test alone would accept `{garbage}`, i.e. hand a caller malformed
+# JSON while this method claims to have checked it. jsonfilter is already how
+# this plugin reads JSON, so it is the honest check; `-e '@'` yields the document
+# itself and fails on anything unparseable.
 run_measure() {
 	local out
 	[ -x "$MEASURE_CMD" ] || return 1
 	out=$("$MEASURE_CMD" 2>/dev/null)
 	case "$out" in
-		"{"*"}") printf '%s' "$out"; return 0 ;;
-		*)        return 1 ;;
+		"{"*"}") ;;
+		*) return 1 ;;
 	esac
+	printf '%s' "$out" | jsonfilter -e '@' >/dev/null 2>&1 || return 1
+	printf '%s' "$out"
+	return 0
 }
 
 # The snapshot read ONCE per get_config and reused for every leg: the helper is a

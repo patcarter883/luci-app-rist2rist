@@ -7,11 +7,17 @@
 # used by stub-functions.sh, so the interface join is exercised for both a present
 # and an absent leg.
 #
-# MEASURE_STUB_MODE=garbage models a helper whose output is not a JSON object, to
-# exercise the plugin's "unusable output" refusal.
+# MEASURE_STUB_MODE=garbage models a helper whose output is not a JSON object.
+# MEASURE_STUB_MODE=garbage-object models the subtler case: output that LOOKS like
+# an object (braces at both ends) but does not parse, which a brace test alone
+# would wrongly accept.
 case "${MEASURE_STUB_MODE:-ok}" in
 	garbage)
 		printf 'not json\n'
+		exit 0
+		;;
+	garbage-object)
+		printf '{garbage}\n'
 		exit 0
 		;;
 esac

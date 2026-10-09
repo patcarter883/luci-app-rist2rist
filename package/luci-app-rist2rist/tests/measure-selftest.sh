@@ -72,6 +72,12 @@ echo "rist2rist-measure: pure core (emit_measurement)"
 
 rec=$(printf 'wwan1|true|8000|100|200|0|1|0|-70\nwwan0|false|||||||\n')
 out=$(emit_measurement '2026-01-01T00:00:00Z' "$rec")
+# The field set IS the contract, so assert it exactly: checking values alone
+# would still pass if an extra key silently inflated the object.
+check "core: a leg carries exactly the agreed field set" "$out" \
+    "sorted(d['legs'][0].keys()) == ['backlog_bytes','interface','jitter_ms','measured_at','measured_kbps','present','quality','rtt_ms','rx_bytes','shaped_kbps','signal_dbm','state','tx_bytes','tx_dropped','tx_overlimits']"
+check "core: the aggregate carries exactly state, shaped_kbps, measured_kbps" "$out" \
+    "sorted(d['aggregate'].keys()) == ['measured_kbps','shaped_kbps','state']"
 check "core: generated_at echoed" "$out" "d['generated_at'] == '2026-01-01T00:00:00Z'"
 check "core: one leg per record" "$out" "len(d['legs']) == 2"
 check "core: a present shaped leg is state ok" "$out" \
@@ -212,6 +218,20 @@ if [ -z "$idx" ]; then
 else
     fail "modem: wwan9 resolved to '$idx', expected empty"
 fi
+
+# The interface name reaches this from UCI, so it must be matched LITERALLY.
+# 'wwan.' is a regex that matches wwan1, so a regex compare would resolve to
+# modem 0 here -- a WRONG index, which is worse than reporting nothing at all.
+MMCLI_STUB_MODEM=0
+MMCLI_STUB_IFACE=wwan1
+export MMCLI_STUB_MODEM MMCLI_STUB_IFACE
+idx=$(modem_index_for_iface 'wwan.')
+if [ -z "$idx" ]; then
+    pass "modem: a metacharacter name does not false-match another modem"
+else
+    fail "modem: 'wwan.' resolved to '$idx' -- a regex match leaked through"
+fi
+unset MMCLI_STUB_MODEM MMCLI_STUB_IFACE
 
 MMCLI_STUB_RSSI=-71
 export MMCLI_STUB_RSSI
