@@ -98,6 +98,17 @@ out=$(call calibrate)
 if reply_has_result "$out"; then r=0; else r=1; fi
 expect "calibrate reaches the plugin through the endpoint" "$r"
 
+# --- the call timeout must outlast a calibration -------------------------------
+# ubus gives a command 30 seconds by default, and a calibration takes about a
+# minute. The shim therefore has to ask for longer. The reply looks the SAME
+# either way -- a timeout arrives as "the bridge is unreachable" -- so this
+# asserts what the shim passed, which is the only place the defect is visible.
+: > "$tmp/ubus.log"
+UBUS_LOG="$tmp/ubus.log" call calibrate >/dev/null
+passed_timeout=$(grep ' calibrate' "$tmp/ubus.log" | head -1 | awk '{print $1}')
+if [ -n "$passed_timeout" ] && [ "$passed_timeout" -gt 30 ] 2>/dev/null; then r=0; else r=1; fi
+expect "the calibrate call is given a timeout longer than ubus's 30s default" "$r"
+
 # --- and nothing beyond it ----------------------------------------------------
 out=$(call reboot)
 if reply_refused "$out" -32601; then r=0; else r=1; fi

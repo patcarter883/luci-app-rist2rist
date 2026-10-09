@@ -69,7 +69,11 @@ fi
 ARGS="$(printf '%s' "$BODY" | jsonfilter -e '@.params[3]' 2>/dev/null)"
 case "$ARGS" in ''|'null') ARGS='{}' ;; esac
 
-RESULT="$(ubus call rist2rist "$METHOD" "$ARGS" 2>&1)"
+# `ubus` gives a command 30 seconds by default, and a calibration measures every
+# leg and then confirms it -- about a minute. Without this the call was cut off at
+# 30s and the endpoint reported the bridge unreachable while the plugin was still
+# working, which is the failure mode that matters here: not wrong, just too early.
+RESULT="$(ubus -t 300 call rist2rist "$METHOD" "$ARGS" 2>&1)"
 
 # `ubus call` prints the result JSON, or a plain diagnostic line on failure. A
 # plugin-level refusal (token_required, already_claimed) is a SUCCESSFUL call

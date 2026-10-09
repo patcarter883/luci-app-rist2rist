@@ -52,13 +52,15 @@ start_service() {
 	fi
 
 	procd_open_instance
+	# -t is uhttpd's request timeout and -T its CGI timeout, and calibrate runs the
+	# bandwidth test once per leg per repeat, so it takes about a minute. At the old
+	# 60 the CGI was killed mid-run and the endpoint answered with an error instead
+	# of a report. The comment sits here, not among the arguments below: a '#' after
+	# a trailing backslash ends the command, and the options would apply to nothing.
 	procd_set_param command "$PROG" -f \
 		-h /www-bridge \
 		-x / \
 		-p "${ip}:${port}" \
-		# -t is the CGI timeout, and calibrate runs the bandwidth test once per leg
-		# per repeat, so it takes about a minute. At the old 60 it was killed
-		# mid-run and the endpoint answered with an error instead of a report.
 		-t 300 -T 300
 	procd_set_param respawn
 	procd_close_instance

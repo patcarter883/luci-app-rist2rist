@@ -26,6 +26,18 @@ plugin="$here/../../root/usr/libexec/rpcd/rist2rist"
 FUNCTIONS_SH="$here/../stub-functions.sh"
 export FUNCTIONS_SH
 
+# Global options come before the command, as in the real tool.
+TIMEOUT=""
+if [ "${1:-}" = "-t" ]; then
+	TIMEOUT="${2:-}"
+	shift 2
+fi
+# Every call is recorded, so a suite can assert what the caller passed as well as
+# what it got back -- the timeout is invisible in the reply and was wrong.
+if [ -n "${UBUS_LOG:-}" ]; then
+	printf '%s %s\n' "$TIMEOUT" "$*" >> "$UBUS_LOG"
+fi
+
 case "${1:-}" in
 call)
 	obj="${2:-}"
