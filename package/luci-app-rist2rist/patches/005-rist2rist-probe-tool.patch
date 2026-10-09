@@ -1,6 +1,6 @@
 diff -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
 --- a/tools/meson.build	2026-07-30 13:39:06.000000000 +1000
-+++ b/tools/meson.build	2026-10-09 18:01:43.359382401 +1100
++++ b/tools/meson.build	2026-10-09 18:10:21.022448981 +1100
 @@ -80,6 +80,19 @@
  	include_directories: inc,
  	install: should_install)
@@ -23,8 +23,8 @@ diff -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
  	dependencies: [
 diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-probe.c
 --- a/tools/rist2rist-probe.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/tools/rist2rist-probe.c	2026-10-09 18:01:43.339324530 +1100
-@@ -0,0 +1,997 @@
++++ b/tools/rist2rist-probe.c	2026-10-09 18:10:21.005367361 +1100
+@@ -0,0 +1,1006 @@
 +/*
 + * rist2rist-probe -- a standalone, operator-runnable ACTIVE probe of ONE WAN leg.
 + * SPDX-License-Identifier: AGPL-3.0-or-later
@@ -120,16 +120,23 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 + * the transport the product actually runs, so it sends these unless the
 + * operator's URL already sets them. */
 +#define WAN_BUFFER_MIN     "1000"
-+/* 3000 ms, not the bridge's 5000: `bandwidth=` below is the ceiling for payload
-+ * PLUS retransmissions, and the recovery window holds buffer_ms x bandwidth
-+ * packets. At bandwidth = 1.5x a 50000 kbps ceiling, a 5000 ms buffer needs
-+ * ~47k packets -- past the Main-profile retransmit window of 32768, after which
-+ * packets "cannot be retransmitted". 3000 ms holds ~21k and still dwarfs the
-+ * 2x-RTT a WAN leg needs. */
-+#define WAN_BUFFER_MAX     "3000"
++#define WAN_BUFFER_MAX     "5000"
 +#define WAN_RTT_MIN        "40"
 +#define WAN_RTT_MAX        "500"
-+#define WAN_REORDER_BUFFER "240"
++#define WAN_REORDER_BUFFER "30"
++
++/* THE PROFILE IS PART OF THE TRANSPORT, AND THE PRODUCT RUNS ADVANCED.
++ * `TRANSPORT_PROFILE.md:139`: "RIST ingest: RISTNetReceiver, ADVANCED profile,
++ * timing-mode=0 (SOURCE)". The bridge matches: UCI profile='2'/out_profile='2',
++ * passed as `-p 2 -P 2` (the URL therefore carries no profile= of its own).
++ * This tool hard-coded RIST_PROFILE_MAIN, so it measured a Main-profile hop and
++ * reported Main-profile recovery behaviour -- including librist's 32768-packet
++ * window warning -- for a product that never runs that profile. Advanced uses
++ * `recovery-depth` (default 3): a ring of 65536<<3 packets, so the Main-profile
++ * window constraint does not apply here and buffer-max stays at the bridge's
++ * 5000 ms. */
++#define WAN_PROFILE        "2"
++#define WAN_TIMING_MODE    "0"
 +
 +/* A BOUND run that moves less than this never left the leg; see the check at the
 + * metered total. A failed measurement, not a policy refusal. */
@@ -722,6 +729,8 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +			{ "rtt-min",        WAN_RTT_MIN },
 +			{ "rtt-max",        WAN_RTT_MAX },
 +			{ "reorder-buffer", WAN_REORDER_BUFFER },
++			{ "profile",        WAN_PROFILE },
++			{ "timing-mode",    WAN_TIMING_MODE },
 +		};
 +		char sep = (strchr(url, '?') != NULL) ? '&' : '?';
 +		size_t i;
@@ -786,7 +795,7 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +	/* ---- librist ------------------------------------------------------ */
 +	if (rist_logging_set(&logset, RIST_LOG_WARN, log_cb, NULL, NULL, NULL) != 0)
 +		return EXIT_ERROR;
-+	if (rist_sender_create(&ctx, RIST_PROFILE_MAIN, 0, logset) != 0) {
++	if (rist_sender_create(&ctx, RIST_PROFILE_ADVANCED, 0, logset) != 0) {
 +		fprintf(stderr, "rist2rist-probe: could not create the sender context\n");
 +		rist_logging_unset_global();
 +		return EXIT_ERROR;
