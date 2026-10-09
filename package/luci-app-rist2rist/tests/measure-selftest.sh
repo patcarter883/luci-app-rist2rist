@@ -287,6 +287,9 @@ network.wwan1.proto='modemmanager'
 network.wan6=interface
 network.wan6.device='eth9'
 network.wan6.proto='dhcp'
+network.wan7=interface
+network.wan7.device='eth 1'
+network.wan7.proto='dhcp'
 EOF
 
 WAN_LIB_NETWORK_FIXTURE="$netfix"
@@ -317,6 +320,14 @@ if has_line "$links" eth9 && ! has_line "$links" wan6; then
     pass "resolver: a section's device option is bound, not its logical name (wan6 -> eth9)"
 else
     fail "resolver: device vs section name wrong: '$links'"
+fi
+# A `device`/`ifname` value that is not a plausible netdev name (here a SPACE, in
+# production shape `eth 1`) must be ignored, and the section name used instead.
+# Binding it verbatim named a leg the presence check could never satisfy.
+if printf '%s\n' "$links" | grep -qxF 'wan7' && ! printf '%s\n' "$links" | grep -qF 'eth 1'; then
+    pass "resolver: a device value with a space is NOT bound (the netdev is used)"
+else
+    fail "resolver: bound a non-netdev device value: '$links'"
 fi
 # A modemmanager interface declares `device` as the modem's PHYSICAL PATH, not a
 # netdev (verbatim production shape, wwan1 above). Binding that path names a device
@@ -385,6 +396,7 @@ dt27_net="$tmp/dt27-network.show"
 cat > "$dt27_net" <<'EOF'
 network.loopback.proto='static'
 network.wwan0.proto='modemmanager'
+network.wwan1.device='/sys/devices/pci0000:00/0000:00:15.0/usb1/1-2'
 network.wwan1.proto='modemmanager'
 EOF
 
@@ -397,6 +409,8 @@ dt27_run() { # dt27_run <resolver-path> <network-fixture> <sysfs-root>
 out=$(dt27_run "$wanlib" "$dt27_net" "$dt27_sysfs")
 check "e2e DT-27: EVERY WAN link is enumerated (wwan0 exists only in network config)" "$out" \
     "{l['interface'] for l in d['legs']} == {'lo','wwan1','wwan0'}"
+check "e2e DT-27: the production device PATH is not bound as a leg" "$out" \
+    "not any('/' in l['interface'] for l in d['legs'])"
 check "e2e DT-27: the absent WAN link reports present:false / state absent" "$out" \
     "any(l['interface']=='wwan0' and l['present'] is False and l['state']=='absent' and l['shaped_kbps'] is None for l in d['legs'])"
 check "e2e DT-27: the present WAN link carries its measured fields" "$out" \

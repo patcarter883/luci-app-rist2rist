@@ -14,14 +14,13 @@ OUTPUT_RECOVERY=""
 #
 # The encoder supplies only WHERE the stream goes (the cloud POP the backplane
 # allocated for the session). WHICH physical links carry it is this router's
-# business, and the leg set is simply the WAN links the router HAS (resolved by
-# the shared resolver, see load_wan_lib below) -- NOT the `config uplink` set.
-#
-# `config uplink` is now ONLY an optional per-interface override: a section whose
-# interface resolves to one of those WAN links supplies that leg's `weight`. It can
-# never ADD a leg (the resolver is the sole source of the set), and a section for
-# an absent interface contributes nothing. UPLINK_WEIGHTS holds "interface weight"
-# lines for that lookup.
+# business: the leg set is the UNION of the router's network WAN-proto interfaces
+# and any interface named in a `config uplink` section (resolved by the shared
+# resolver, see load_wan_lib). `config uplink` supplies an optional per-leg
+# `weight`, but it is also PART of the set: a declaration MAY ADD a leg the
+# network config does not mark as a WAN. It can never make an interface EXIST,
+# though -- an absent one is reported absent and never bound. UPLINK_WEIGHTS holds
+# "interface weight" lines for that lookup.
 UPLINK_WEIGHTS=""
 
 # This box's PRESENT WAN links (DT-27), one interface name per line, resolved once
@@ -158,10 +157,11 @@ append_url() {
     OUTPUT_URLS="${OUTPUT_URLS:+${OUTPUT_URLS},}${1}"
 }
 
-# config_foreach callback: record a `config uplink` section as an OPTIONAL weight
-# override (DT-27). This does NOT define the leg set -- the resolver does. A
-# section for an absent interface, or for an interface the resolver never returned,
-# is simply never looked up, so it can neither add a leg nor reach the binary.
+# config_foreach callback: record a `config uplink` section's WEIGHT override
+# (DT-27). The leg SET is the resolver's union (which also includes the declared
+# interfaces); this callback only collects the optional per-leg weights, so a
+# section naming an interface that never becomes present simply never has its
+# weight applied and adds nothing to the bound legs.
 collect_uplink() {
     local cfg="$1" interface weight
     config_get interface "$cfg" 'interface'
@@ -268,9 +268,10 @@ append_output_url() {
         fi
     fi
 
-    # The leg set is this box's PRESENT WAN links (DT-27) -- NOT the `config
-    # uplink` set, which is only an optional source of per-leg weights. Emit one
-    # output URL per present link; `miface=` binds it to the interface CAKE shapes.
+    # The leg set is this box's PRESENT WAN links (DT-27) -- the resolver's union
+    # of network WAN protos and declared uplinks; `config uplink` additionally
+    # provides per-leg weights. Emit one output URL per present link; `miface=`
+    # binds it to the interface CAKE shapes.
     if [ -n "$WAN_PRESENT" ]; then
         while IFS= read -r interface; do
             [ -n "$interface" ] || continue
@@ -350,9 +351,10 @@ start_service() {
     # this string is what the output URL is built from.
     OUTPUT_RECOVERY="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}&bandwidth=${maxbitrate}"
 
-    # The leg set for every destination: this box's PRESENT WAN links (DT-27),
-    # independent of `config uplink` (which only supplies optional per-leg
-    # weights). Resolved once, so every destination reuses the same set. Read-only.
+    # The leg set for every destination: this box's PRESENT WAN links (DT-27) --
+    # the resolver's union of network WAN protos and declared uplinks. `config
+    # uplink` contributes to that union AND supplies optional per-leg weights.
+    # Resolved once, so every destination reuses the same set. Read-only.
     UPLINK_WEIGHTS=""
     config_foreach collect_uplink 'uplink'
     resolve_wan_present

@@ -197,6 +197,27 @@ case "$STARTED_CHILD" in
     *)                pass "an absent interface's uplink was not emitted" ;;
 esac
 
+# --- 2b. weight '0' must be emitted, not dropped -------------------------------
+# SMPTE 2022-7 redundancy: weight=0 means "duplicate the full stream down this
+# link". `[ -n "0" ]` is TRUE, so a present interface declared with weight '0'
+# must carry `weight=0` on its leg. This is the case the config comment calls out,
+# and it was untested.
+use_wan "$wanlib" "$one"
+STUB_UPLINK_COUNT=1
+STUB_UP_0_IFACE="wwan1"; STUB_UP_0_WEIGHT="0"
+STUB_DEST_COUNT=1
+STUB_DEST_0_ADDR="syd1-a.relay.example.net:5000"
+run_case
+if [ "$(count_in_child 'weight=0')" = "1" ]; then
+    pass "weight '0' (SMPTE 2022-7 redundancy) is emitted as weight=0"
+else
+    fail "weight '0' was dropped: -o='$STARTED_CHILD'"
+fi
+case "$STARTED_CHILD" in
+    *"miface=wwan1"*"weight=0"*) pass "the weight=0 leg is bound to the present interface" ;;
+    *)                           fail "weight=0 leg malformed: -o='$STARTED_CHILD'" ;;
+esac
+
 # --- 3. two present WAN links -> two bound legs --------------------------------
 use_wan "$wanlib" "$two"
 STUB_UPLINK_COUNT=0

@@ -11,9 +11,11 @@
 #   rist2rist.reconcile   (token)    apply listen_url + outputs only (the "adopt" action)
 #
 # A destination is an ADDRESS ONLY. The encoder names the cloud POP to send to;
-# which of this router's WAN links carry it, and their weights, are local `config
-# uplink` sections and are NOT settable through this API -- they are reported
-# read-only in get_config's `uplinks` array so a client can display them.
+# which of this router's WAN links carry it, and their weights, are resolved
+# locally -- the WAN links from the shared resolver, their weights from any
+# `config uplink` section naming them -- and are NOT settable through this API.
+# They are reported read-only in get_config's `uplinks` array so a client can
+# display them.
 #   rist2rist.reload      (token)    restart the procd instance to activate the config
 #
 # AUTHENTICATION HAPPENS IN THIS PLUGIN, not by an rpcd session login. rpcd's exec
@@ -57,6 +59,21 @@ RELOAD_CMD=${RELOAD_CMD:-/etc/init.d/rist2rist}
 # observed figures. An absolute path, like RELOAD_CMD, so PATH stubbing cannot
 # reach it.
 MEASURE_CMD=${MEASURE_CMD:-/usr/sbin/rist2rist-measure}
+
+# The shared WAN-link resolver (DT-27.3) -- the ONE definition of this box's WAN
+# links, also sourced by the init script and the measurement helper. An absolute
+# path with an override, like MEASURE_CMD, because it is a TEST hook too.
+#
+# Sourcing it is GUARDED: on a partial/older install the file is absent, and
+# WAN_LIB_LOADED stays 0. get_config then falls back to the declared `config
+# uplink` sections (the pre-DT-27 behaviour), so a partial install cannot turn the
+# uplinks array empty or break the response.
+WAN_LIB=${RIST2RIST_WAN_LIB:-/usr/lib/rist2rist/wan.sh}
+WAN_LIB_LOADED=0
+if [ -r "$WAN_LIB" ]; then
+	# shellcheck source=/dev/null
+	. "$WAN_LIB" && WAN_LIB_LOADED=1
+fi
 
 CONFIG=rist2rist
 
@@ -169,33 +186,61 @@ measure_field_json() { # measure_field_json <leg-index-or-empty> <field> <str|nu
 	esac
 }
 
-# config_foreach callback: one JSON object per configured WAN uplink.
+# config_foreach callback: record a `config uplink` section as "section interface
+# weight" lines, collected ONCE per get_config. config_foreach runs its callback
+# in THIS shell (it does not fork), so the append survives to the lookup below.
+#
+# These sections no longer DEFINE the leg list (the resolver does); they are kept
+# only so a resolver-sourced interface can be matched back to the section naming
+# it, for its `section`/`weight` fields.
+UPLINK_DECLARED=""
+collect_uplink() {
+	local cfg="$1" interface weight
+	config_get interface "$cfg" interface
+	[ -z "$interface" ] && return 0
+	config_get weight "$cfg" weight
+	UPLINK_DECLARED="${UPLINK_DECLARED}${cfg} ${interface} ${weight}
+"
+}
+
+# One JSON object per WAN link, keyed on the interface name.
 #
 # READ-ONLY to callers by design: which physical links exist, and how traffic is
 # shared across them, is the router's own business and is configured locally. It
 # is reported only so a client can SHOW what a bridge is bonded across.
 #
-# The DECLARED leg (section/interface/weight) and its OBSERVED state (the passive
-# helper's per-leg figures) are merged into ONE object, so a single get_config
-# shows both without a second call.
-emit_uplink() {
-	local cfg="$1" interface weight present idx
-	config_get interface "$cfg" interface
-	config_get weight    "$cfg" weight
-	[ -z "$interface" ] && return 0
+# The leg list comes from the RESOLVER (the shared definition of this box's WAN
+# links), NOT from the helper -- so even a missing or garbage helper still yields
+# the WAN links, with the measured fields null. It is also not taken from the
+# declared sections alone, which are EMPTY on the production box (nothing declares
+# `config uplink`), the very blindness DT-27 fixed elsewhere.
+#
+# `section`/`weight` come from a `config uplink` section that names THIS interface,
+# and stay the empty string when none does -- a network WAN need have no
+# declaration. The DECLARED leg and its OBSERVED state (the passive helper's
+# per-leg figures) are merged into ONE object, so a single get_config shows both.
+emit_uplink() { # emit_uplink <interface>
+	local interface="$1" section="" weight="" idx present sec have w
+	while read -r sec have w; do
+		[ "$have" = "$interface" ] || continue
+		section="$sec"; weight="$w"
+		break
+	done <<UPLINK_DECLARED_EOF
+$UPLINK_DECLARED
+UPLINK_DECLARED_EOF
 	idx=$(measure_leg_index "$interface")
 	# `present` prefers the snapshot when the helper covered this leg, so it is the
 	# SAME observation as the merged figures and the two cannot disagree. It falls
-	# back to the interface's existence -- the plugin's own definition, which is
+	# back to the interface's existence -- the resolver's own definition, which is
 	# also what lets a leg be configured and legitimately idle -- when there is no
 	# snapshot, or the helper reported no usable boolean.
 	present=$(measure_field_json "$idx" present num)
 	case "$present" in
 		true|false) ;;
-		*) [ -e "/sys/class/net/${interface}" ] && present=true || present=false ;;
+		*) [ -e "${WAN_LIB_SYSFS:-/sys/class/net}/${interface}" ] && present=true || present=false ;;
 	esac
 	printf '{"section":"%s","interface":"%s","weight":"%s","present":%s,' \
-		"$(json_str "$cfg")" "$(json_str "$interface")" \
+		"$(json_str "$section")" "$(json_str "$interface")" \
 		"$(json_str "$weight")" "$present"
 	printf '"state":%s,"shaped_kbps":%s,"tx_bytes":%s,"rx_bytes":%s,' \
 		"$(measure_field_json "$idx" state str)" \
@@ -219,7 +264,7 @@ method_get_config() {
 	local listen_url profile out_profile managed claimed
 	local enabled verbose_log loglevel
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
-	local outputs uplinks token_hash
+	local outputs uplinks token_hash iface sec w
 
 	config_load "$CONFIG"
 
@@ -245,7 +290,35 @@ method_get_config() {
 	load_measure
 
 	outputs=$(config_foreach emit_output destination)
-	uplinks=$(config_foreach emit_uplink uplink)
+
+	# The `config uplink` sections, collected once so an interface can be matched
+	# back to the section (if any) that names it for its section/weight fields.
+	UPLINK_DECLARED=""
+	config_foreach collect_uplink uplink
+
+	# The leg list is the RESOLVER's WAN links -- the SAME shared definition the
+	# init and the helper use -- NOT the declared sections (empty on the production
+	# box) and NOT the helper (a missing/garbage helper must still yield the links,
+	# with null measured fields).
+	uplinks=""
+	if [ "$WAN_LIB_LOADED" -eq 1 ]; then
+		while IFS= read -r iface; do
+			[ -n "$iface" ] || continue
+			uplinks="${uplinks}$(emit_uplink "$iface")"
+		done <<WAN_LINKS_EOF
+$(wan_links)
+WAN_LINKS_EOF
+	else
+		# Resolver absent (a partial/older install): fall back to the declared
+		# `config uplink` sections -- the pre-DT-27 behaviour -- so the response is
+		# never empty on a box that never had the resolver.
+		while read -r sec iface w; do
+			[ -n "$iface" ] || continue
+			uplinks="${uplinks}$(emit_uplink "$iface")"
+		done <<UPLINK_DECLARED_EOF
+$UPLINK_DECLARED
+UPLINK_DECLARED_EOF
+	fi
 
 	printf '{'
 	printf '"ok":true,'

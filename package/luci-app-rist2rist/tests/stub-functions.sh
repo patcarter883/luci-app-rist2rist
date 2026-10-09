@@ -32,6 +32,10 @@ config_foreach() {
 			eval "$cb dst_eu"
 			;;
 		uplink)
+			# STUB_UPLINKS=0 models a box with NO declared `config uplink`
+			# (the production shape), so the resolver's uplinks[] can be
+			# exercised without a declaration present.
+			[ "${STUB_UPLINKS:-1}" = "0" ] && return 0
 			eval "$cb up_a"
 			eval "$cb up_b"
 			;;

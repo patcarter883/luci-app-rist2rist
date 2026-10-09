@@ -12,7 +12,11 @@
 #
 # A WAN link is, BY DEFINITION, the UNION of:
 #   (a) every interface named in a `config uplink` section -- the operator's
-#       explicit bonding selection, which must never be dropped from the set; and
+#       explicit selection. `config uplink` was the ONLY such mechanism before the
+#       network-derived set existed, so a declaration still CONTRIBUTES to the
+#       union and MAY ADD an interface that /etc/config/network does not mark as a
+#       WAN. It can never make an interface EXIST, though: an absent one is
+#       reported absent by the presence check and is never bound; and
 #   (b) every /etc/config/network interface whose proto is a WAN proto
 #       (modemmanager|dhcp|pppoe|ppp|ncm|qmi|3g) -- the links the router itself
 #       has. `lan`/`loopback` declare proto `static`, so they fall out WITHOUT
@@ -57,6 +61,11 @@ _wan_declared_iface() {
 # binding this file exists to provide. So a path-like value is skipped and the
 # section name is used, which is `wwan0`/`wwan1` there.
 #
+# The value must ALSO look like a netdev name (`^[A-Za-z0-9_.:-]+$`): anything with
+# a space, a comma, an `=` or other punctuation is not a netdev, so it is ignored
+# and the section name is used rather than echoed verbatim as a leg the presence
+# check could then never satisfy.
+#
 # Anonymous `@interface[n]` keys are not valid netifd config and are left in only
 # to be dropped later by the presence check.
 _wan_network_iface() {
@@ -72,11 +81,11 @@ _wan_network_iface() {
         }
         /^network\.[^.=]+\.device=/ {
             key = $1; sub(/^network\./, "", key); sec = key; sub(/\..*$/, "", sec)
-            if ($2 !~ /\// && dev[sec] == "") dev[sec] = $2; next
+            if ($2 !~ /\// && $2 ~ /^[A-Za-z0-9_.:-]+$/ && dev[sec] == "") dev[sec] = $2; next
         }
         /^network\.[^.=]+\.ifname=/ {
             key = $1; sub(/^network\./, "", key); sec = key; sub(/\..*$/, "", sec)
-            if ($2 !~ /\// && dev[sec] == "") dev[sec] = $2; next
+            if ($2 !~ /\// && $2 ~ /^[A-Za-z0-9_.:-]+$/ && dev[sec] == "") dev[sec] = $2; next
         }
         END {
             for (i = 0; i < n; i++) {
