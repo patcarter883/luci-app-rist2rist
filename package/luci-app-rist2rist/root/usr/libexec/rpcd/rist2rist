@@ -481,6 +481,20 @@ shape_up() { # shape_up <iface>
 	tc -s qdisc show dev "ifb4$1" 2>/dev/null | grep -q 'qdisc cake'
 }
 
+# Is a shaper actually IN FORCE on this leg? A cake qdisc on the leg itself (the
+# egress we set) or on SQM's ingress IFB. This is the check that was missing: the
+# confirmation compared the ramp's break to the shaper's value and called the
+# answer a verdict about the SHAPER, when a box whose SQM is not running has no
+# shaper at all and the break is simply the link's own limit. Measured on the
+# bridge: SQM inactive, wwan0 carrying nothing but the default fq_codel.
+shaper_active() { # shaper_active <iface>
+	local iface="$1"
+
+	tc -s qdisc show dev "$iface" 2>/dev/null | grep -q 'qdisc cake' && return 0
+	shape_up "$iface" && return 0
+	return 1
+}
+
 shape_suspend() { # shape_suspend "<ifaces>" -> echoes the ifaces it CLEARED
 	local iface cleared=""
 
@@ -610,34 +624,40 @@ CONFIRM_EOF
 		# report can be read without doing the arithmetic yourself.
 		sv=""
 		if [ -n "$sc" ] && [ "$sh" -ge 1 ] 2>/dev/null; then
-		if [ -n "$sfa" ] && [ "$sfa" -ge 1 ] 2>/dev/null; then
-			# The BREAK point is the comparison, NOT the last clean step. The ramp
-			# steps in 1.5x jumps, so the clean step below the shaper is always well
-			# under it -- comparing THAT to the shaper reports a working shaper as too
-			# tight. Observed on the bridge: held 505, broke at 675 against a 675
-			# shaper, i.e. the shaper was the binding constraint exactly, and the old
-			# comparison called it too_tight. Where the ramp BROKE is where it bit.
-			if [ "$sfa" -lt "$sh" ]; then
-				sv=too_tight
-			elif [ "$sfa" -gt $((sh * 150 / 100)) ]; then
-				sv=not_shaping
+			if ! shaper_active "$c_if"; then
+				# The shaper is not IN FORCE, so the ramp measured the LINK --
+				# whatever it broke at says nothing about a shaper that is not
+				# there. Every verdict below assumes the shaper is what stopped the
+				# ramp, so this has to come first rather than only when the ramp
+				# happens to run clean. Measured on the bridge: SQM inactive, the
+				# leg carrying nothing but the kernel's default fq_codel, and a
+				# report that would otherwise have called the link's own limit a
+				# confirmed shaper.
+				sv=shaper_not_active
+			elif [ -n "$sfa" ] && [ "$sfa" -ge 1 ] 2>/dev/null; then
+				# The BREAK point is the comparison, NOT the last clean step. The
+				# ramp steps in 1.5x jumps, so the clean step below the shaper is
+				# always well under it -- comparing THAT to the shaper reports a
+				# working shaper as too tight. Observed on the bridge: held 505,
+				# broke at 675 against a 675 shaper, i.e. the shaper was the
+				# binding constraint exactly, and the old comparison called it
+				# too_tight. Where the ramp BROKE is where it bit.
+				if [ "$sfa" -lt "$sh" ]; then
+					sv=too_tight
+				elif [ "$sfa" -gt $((sh * 150 / 100)) ]; then
+					sv=not_shaping
+				else
+					sv=confirmed
+				fi
 			else
-				sv=confirmed
+				# No break: the ramp climbed to its ceiling and every step was
+				# clean. Its ceiling IS the shaper (the ramp is capped there), so
+				# the shaper did not limit the link -- a finding about the setting,
+				# not a value we failed to compute. Left as null it read as though
+				# the confirmation had not run.
+				sv=not_shaping
 			fi
-		else
-			# The ramp never broke: it climbed to its ceiling and every step was clean.
-			# Its ceiling IS the shaper (the ramp is capped there), so the shaper did not
-			# limit the link -- a finding about the setting, not a value we failed to
-			# compute. Left as null it read as though the confirmation had not run, which
-			# is what a report from the bridge showed: ramp clean to 675 against a 675
-			# shaper, and no verdict at all.
-			sv=not_shaping
 		fi
-		fi
-		# An unset verdict is null, not a hole: a field with no value takes the whole
-		# report with it, so a caller loses the calibration rather than one field.
-		# The bands are fixed tokens, so the JSON is the token in quotes; unset is
-		# null (never an unquoted word, which is what made the whole report invalid).
 		if [ -n "$sv" ]; then svj="\"$sv\""; else svj=null; fi
 		[ "$first" -eq 1 ] || out="$out,"
 		first=0
@@ -885,7 +905,14 @@ SEC_EOF
 $measured
 MEASURED_EOF
 
-	[ -n "$SHAPER_SET" ] && uci -q commit sqm
+	if [ -n "$SHAPER_SET" ]; then
+		uci -q commit sqm
+		# APPLY it. Writing the rate into uci shapes nothing on its own, and
+		# shape_resume only ever started SQM for a shaper that was ALREADY active
+		# before the run -- so on a leg with no shaper the derived rate was recorded
+		# and never took effect, while the report said the shaper was set.
+		"$SQM_INIT" start >/dev/null 2>&1
+	fi
 	# The budget the bridge SENDS with, derived from the link and from nothing
 	# else: the sum of what each leg's own shaper was just set to. `bandwidth=`
 	# has to sit above the stream rate and below the link, and this is the side
@@ -902,6 +929,13 @@ SHAPER_EOF
 
 	# Now the shaper goes back on -- with the value just derived, not the old one.
 	[ -n "$cleared" ] && shaper=$(shape_resume "$cleared")
+	# ...and if THIS RUN installed its own derived shaper, that is what is in force
+	# now, so that is what the report says. "restored" described the shaper we took
+	# away and said nothing about the one we left -- and whether the derived shaper
+	# is actually applied is the operator's real question, and the one this pass
+	# exists to answer. Measured on the bridge: the rate was written and never
+	# applied, and the report still claimed it had a shaper.
+	[ -n "$SHAPER_SET" ] && shaper=applied
 	[ -n "$cleared" ] && trap - EXIT INT TERM
 
 	# ---- confirm: re-measure each shaped leg WITH the shaper up ---------------

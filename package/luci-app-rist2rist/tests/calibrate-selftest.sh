@@ -101,7 +101,25 @@ case "$1" in
 		rm -f "$STUB_SHAPED_DIR"/*
 		printf 'sqm stop\n' >> "$PROBE_ARGV_LOG" ;;
 	start)
-		while read -r d; do [ -n "$d" ] && touch "$STUB_SHAPED_DIR/$d"; done < "$STUB_SHAPED_SAVE" 2>/dev/null
+		# SQM applies the CONFIGURED queues -- that is what `sqm start` does. This
+		# used to re-touch only the legs that were shaped BEFORE the run, which is
+		# the same mistake the plugin made: on a box with no shaper it started
+		# nothing, so a derived rate was recorded and never applied. A double that
+		# shares the code's wrong assumption reports the code as correct.
+		# What was shaped before, AND what the config now says -- `sqm start`
+		# applies the config, so a leg this run just shaped must come up as well.
+		while read -r d; do [ -n "$d" ] && touch "$STUB_SHAPED_DIR/$d" "$STUB_SHAPED_DIR/ifb4$d"; done < "$STUB_SHAPED_SAVE" 2>/dev/null
+		i=0
+		while [ "$i" -lt 8 ]; do
+			d=$(uci -q get "sqm.@queue[$i].interface" 2>/dev/null)
+			[ -n "$d" ] || break
+			# SQM shapes BOTH directions: egress on the leg itself and ingress on
+			# its IFB. A double that marks only the plain name makes the plugin's
+			# own check (which reads ifb4<leg>, as the real one does) believe no
+			# shaper came back.
+			touch "$STUB_SHAPED_DIR/$d" "$STUB_SHAPED_DIR/ifb4$d"
+			i=$((i + 1))
+		done
 		# A restore that does not come back, for the case that must be REPORTED
 		# rather than assumed.
 		[ "${STUB_SQM_START_BROKEN:-0}" = 1 ] && rm -f "$STUB_SHAPED_DIR"/*
@@ -379,6 +397,8 @@ assert "and it is not started again until the probing is done" \
 between=$(sed -n '/sqm stop/,/sqm start/p' "$PROBE_ARGV_LOG")
 assert "every leg is probed INSIDE the cleared window -- 2 legs x 3 repeats" \
 	"[ \"\$(printf '%s' \"\$between\" | grep -c -- '--psk-file')\" = 6 ]"
+# No shaper was CONFIGURED for these legs (their queues do not exist yet), so
+# there was none to apply and the run's answer is about the one it took away.
 assert "the run reports how the shaper was left" \
 	"[ \"\$(field \"\$out\" 'd[\"shaper\"]')\" = restored ]"
 
@@ -399,7 +419,7 @@ assert "and the error says so rather than leaving it unsaid" \
 unset PROBE_lo_RC PROBE_wwan1_RC
 
 echo
-echo "-- an UNSHAPED bridge: starting the service would install a shaper it never had --"
+echo "-- a bridge with nothing to shape: no shaper was configured, so none is started --"
 rm -f "$tmp/shaped"/*
 PROBE_lo_KBPS=2000
 PROBE_wwan1_KBPS=500
@@ -447,18 +467,22 @@ assert "the shaper change is committed, separately from the bridge's own config"
 	"printf '%s' \"\$log\" | grep -q 'commit sqm'"
 assert "the report says what each leg was shaped to" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaper_kbps\"]')\" = 1800 ]"
+assert "the shaper it derived is APPLIED, not just written into the config" \
+	"printf '%s' \"\$(cat \"\$PROBE_ARGV_LOG\")\" | grep -q 'sqm start'"
 assert "and the other leg's, from its own measurement" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][1][\"shaper_kbps\"]')\" = 450 ]"
 assert "the confirmation re-runs the test WITH the shaper up" \
 	"printf '%s' \"\$argvlog\" | grep -q 'shaped-lo.json'"
 assert "and it runs after the shaper is put back, never before" \
-	"[ \"\$(printf '%s' \"\$argvlog\" | grep -n 'shaped-lo.json' | cut -d: -f1)\" -gt \"\$(printf '%s' \"\$argvlog\" | grep -n 'sqm start' | cut -d: -f1)\" ]"
+	"[ \"\$(printf '%s' \"\$argvlog\" | grep -n 'shaped-lo.json' | cut -d: -f1)\" -gt \"\$(printf '%s' \"\$argvlog\" | grep -n 'sqm start' | cut -d: -f1 | head -1)\" ]"
 assert "it is the STANDARD test -- a ramp, not a held rate" \
 	"[ \"\$(printf '%s' \"\$argvlog\" | grep 'shaped-' | grep -c -- '-r ')\" = 0 ]"
 assert "the ramp starts BELOW the shaper, or it fails on its own first step" \
 	"printf '%s' \"\$argvlog\" | grep 'shaped-' | grep -q -- '--floor-kbps 225 --max-kbps 450'"
 assert "and the report says what the shaped leg then measured" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_measured_kbps\"]')\" = 2000 ]"
+assert "the report says THIS RUN applied a shaper, not merely that one was there" \
+	"[ \"\$(field \"\$out\" 'd[\"shaper\"]')\" = applied ]"
 assert "the budget the bridge will SEND with is the sum of the shapers" \
 	"printf '%s' \"\$log\" | grep -q 'set rist2rist.main.measured_budget_kbps=2250'"
 
