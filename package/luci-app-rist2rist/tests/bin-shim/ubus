@@ -1,21 +1,28 @@
 #!/bin/sh
 # `ubus` double for tests/shim-selftest.sh.
 #
-# Only the calls the shim makes are modelled, and the one that matters is
-# `ubus call rist2rist list`: the answer comes from the REAL plugin, not from a
-# copy kept here, so the suite fails if the shim's accepted set and the plugin's
-# advertised set ever diverge again. A stub that answered with a list of its own
-# would let exactly that bug through.
+# Two invocations are modelled, and both must match the real tool's shape, because
+# the shim is the code under test and a fixture that is more capable than the
+# target hides exactly the defects this suite exists to catch:
+#
+#   ubus -v list rist2rist   -> the object's REGISTERED surface. This is what the
+#                               shim asks. The names come from the REAL plugin's
+#                               `list` output -- which is what rpcd registers from
+#                               -- so the fixture cannot agree with itself and let
+#                               a divergence through.
+#   ubus call rist2rist <m>  -> the plugin's reply for a method call.
+#
+# `ubus call rist2rist list` deliberately FAILS: rpcd consumes the plugin's list
+# for registration and does not expose it as a method, which is precisely the
+# detail that made the first version of this fix wrong on the box.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 plugin="$here/../../root/usr/libexec/rpcd/rist2rist"
 
-# The plugin sources $FUNCTIONS_SH at load (its test hook for /lib/functions.sh),
-# so asking the plugin for its method list needs the stub on the same terms every
-# other suite uses. Without it the list cannot be read at all and this double
-# would answer nothing -- a fixture failing for a reason unrelated to the code
-# under test, which is its own kind of false signal.
+# The plugin sources $FUNCTIONS_SH at load (its test hook for /lib/functions.sh).
+# Without it the method list cannot be read at all, and this double would answer
+# nothing for a reason unrelated to the code under test.
 FUNCTIONS_SH="$here/../stub-functions.sh"
 export FUNCTIONS_SH
 
@@ -28,13 +35,27 @@ call)
 		exit 1
 	fi
 	if [ "$method" = "list" ]; then
-		# The plugin's own advertised surface.
-		exec sh "$plugin" list
+		# Faithful to the real thing. rpcd uses the plugin's `list` output to
+		# register the object and never exposes it as a callable method.
+		echo "Command failed: ubus call rist2rist list (Method not found)" >&2
+		exit 1
 	fi
-	# A method call: the plugin answers with a JSON object. The shim only has to
-	# see a successful `ubus call`, so the payload is minimal but object-shaped,
-	# exactly as the plugin's own replies are.
+	# A method call: the plugin answers with a JSON object.
 	printf '{"ok":true,"served":"%s"}\n' "$method"
+	;;
+-v)
+	if [ "${2:-}" = "list" ] && [ "${3:-}" = "rist2rist" ]; then
+		# The real shape: the object, then its methods as quoted keys.
+		echo "'rist2rist' @00000000"
+		sh "$plugin" list | python3 -c "
+import json, sys
+for name in sorted(json.load(sys.stdin)):
+    print('\t\"%s\":{}' % name)
+"
+		exit 0
+	fi
+	echo "ubus double: unsupported -v invocation: $*" >&2
+	exit 1
 	;;
 *)
 	echo "ubus double: unsupported invocation: $*" >&2

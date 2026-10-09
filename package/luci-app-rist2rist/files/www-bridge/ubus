@@ -50,18 +50,16 @@ if [ "$OBJ" != "rist2rist" ]; then
 	exit 0
 fi
 
-# ...but the METHOD list is not ours to keep. It is the plugin's public surface,
-# and the plugin already states it: its `list` method is the rpcd contract, and
-# rpcd requires it to name every method the object answers. Asking the plugin
-# means a method can never be reachable over `ubus` yet refused here because a
-# second list was edited in one place and not the other -- which is exactly what
-# happened to `calibrate`. One definition, one place.
-ADVERTISED="$(ubus call rist2rist list 2>/dev/null)"
-METHOD_OK="$(printf '%s' "$ADVERTISED" | jsonfilter -e "@.$METHOD" 2>/dev/null)"
-if [ -z "$METHOD_OK" ]; then
-	METHOD_OK="$(printf '%s' "$ADVERTISED" | jsonfilter -e "@.rist2rist.$METHOD" 2>/dev/null)"
-fi
-if [ -z "$METHOD_OK" ]; then
+# ...but the METHOD list is not ours to keep. It is the object's registered
+# surface -- the plugin's own `list` output, which rpcd consumes to register the
+# object -- so ask ubus for it rather than duplicating it. A method can then never
+# be reachable over `ubus` yet refused here because a second list was edited in one
+# place and not the other, which is exactly what happened to `calibrate`.
+#
+# `ubus call rist2rist list` is NOT the way: rpcd consumes that output for
+# registration and does not expose it as a method (it answers "Method not found").
+# `ubus -v list` reports what was REGISTERED, which is the same thing.
+if ! ubus -v list rist2rist 2>/dev/null | grep -q "^[[:space:]]*\"$METHOD\":"; then
 	fail "$ID" -32601 '"unknown method"'
 	exit 0
 fi
