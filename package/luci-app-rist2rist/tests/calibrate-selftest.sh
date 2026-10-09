@@ -471,7 +471,8 @@ PROBE_lo_SEQ="300 750 500"        # median 500: the first sample alone would say
 PROBE_wwan1_SEQ="250 200 200"     # median 200: the first sample alone would say 250
 PROBE_lo_KBPS=2000                # what the SHAPED run then reports (not_shaping)
 PROBE_wwan1_KBPS=2000
-export PROBE_lo_SEQ PROBE_wwan1_SEQ PROBE_lo_KBPS PROBE_wwan1_KBPS
+PROBE_lo_FAILED_AT=3000           # and where it broke: the shaper sits between the two
+export PROBE_lo_SEQ PROBE_wwan1_SEQ PROBE_lo_KBPS PROBE_wwan1_KBPS PROBE_lo_FAILED_AT
 out=$(run_cal)
 argvlog=$(cat "$PROBE_ARGV_LOG")
 log=$(cat "$UCI_STUB_LOG")
@@ -488,7 +489,9 @@ assert "the shaper is set from the MEDIAN, not from a single sample" \
 	"printf '%s' \"\$log\" | grep -q 'set sqm.@queue\[0\].upload=450'"
 assert "a shaped leg that climbs PAST its shaper is called out, not left to read" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_verdict\"]')\" = not_shaping ]"
-unset PROBE_lo_SEQ PROBE_wwan1_SEQ
+assert "where the shaped ramp BROKE is reported too -- the shaper sits between the two" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_failed_at_kbps\"]')\" = 3000 ]"
+unset PROBE_lo_SEQ PROBE_wwan1_SEQ PROBE_lo_FAILED_AT
 
 echo
 echo "-- a shaped leg that holds its shaper is confirmed --"
