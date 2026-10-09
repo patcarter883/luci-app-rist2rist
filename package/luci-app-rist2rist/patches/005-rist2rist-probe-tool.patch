@@ -1,0 +1,929 @@
+diff --color -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
+--- a/tools/meson.build	2026-07-30 13:39:06.000000000 +1000
++++ b/tools/meson.build	2026-10-09 17:40:21.128075291 +1100
+@@ -80,6 +80,19 @@
+ 	include_directories: inc,
+ 	install: should_install)
+ 
++# rist2rist-probe: the standalone per-leg ACTIVE probe (open-broadcast). It is
++# deliberately its own executable: rist2rist-measure is the passive snapshot,
++# this one puts traffic on the link and so must be runnable on its own, by an
++# operator, before a session starts.
++executable('rist2rist-probe',
++	['rist2rist-probe.c', tools_deps, rev_target],
++	dependencies: [
++		librist_dep,
++		threads,
++	],
++	include_directories: inc,
++	install: should_install)
++
+ executable('udp2udp',
+ 	['udp2udp.c', 'yamlparse.c', 'oob_shared.c', srp_shared, tools_deps, rev_target],
+ 	dependencies: [
+diff --color -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-probe.c
+--- a/tools/rist2rist-probe.c	1970-01-01 10:00:00.000000000 +1000
++++ b/tools/rist2rist-probe.c	2026-10-09 17:40:21.119199409 +1100
+@@ -0,0 +1,902 @@
++/*
++ * rist2rist-probe -- a standalone, operator-runnable ACTIVE probe of ONE WAN leg.
++ * SPDX-License-Identifier: AGPL-3.0-or-later
++ * Copyright (C) 2026 Pat Carter
++ *
++ * WHY THIS IS A SEPARATE TOOL. rist2rist-measure is the PASSIVE snapshot: it only
++ * reads, so it is free and may run at any time, including during a stream. It
++ * cannot see SPARE capacity, because it only ever observes the leg under the load
++ * already applied. This tool supplies the missing half by putting traffic on the
++ * link, and that single property dictates every rule below.
++ *
++ * THE RULES THIS TOOL OBEYS (design constraint, 2026-10-09):
++ *
++ *   1. PRE-START ONLY. A probe is active traffic, so it must never run against a
++ *      live stream -- it would steal capacity from the very thing it measures.
++ *      This is enforced, not documented: the tool REFUSES to start when the leg
++ *      is already carrying traffic (see the guard in main) and exits 3. A
++ *      requested probe during a stream is a refusal, not a de-prioritisation.
++ *
++ *   2. METERED BYTES ARE ACCOUNTED. These are mobile links. For a BOUND probe the
++ *      figure of record is the leg's own interface counter, because that is what
++ *      the carrier bills -- including the IP/link overhead a payload tally would
++ *      miss. librist's per-peer byte counters are PER-INTERVAL DELTAS, not totals
++ *      (measured: ~560 kB at both 3 s and 15 s while the wire moved ~13 MB), so
++ *      they are summed across callbacks and used only for bench runs that do not
++ *      traverse the leg. Either way the spend is added to a per-day total and the
++ *      tool refuses to exceed a budget. `metering` in the output names the source.
++ *
++ *   3. THE SECRET NEVER ENTERS THE URL OR THE LOG (house rule H2). The passphrase
++ *      is read from a 0600 file and written into the dedicated
++ *      rist_peer_config.secret field, never into the URL and never onto argv
++ *      (/proc/<pid>/cmdline is world-readable, so argv is not a safe channel).
++ *      The URL this tool prints is therefore loggable.
++ *
++ *   4. UNKNOWN IS NOT ZERO. A figure that could not be measured is reported as
++ *      null, never as 0 -- a consumer cannot tell a real 0 from a placeholder.
++ *
++ * WHAT IT MEASURES AND HOW. UDP send does not back-pressure, so the local send
++ * rate is NOT the achieved rate: pushing 20 Mbit at an 8 Mbit link looks
++ * identical locally to pushing 20 Mbit at a 200 Mbit link. The leg's real ceiling
++ * is found by RAMPPING the rate and watching librist's own per-peer view of the
++ * link:
++ *
++ *   * rtt              -- a saturated link queues, so RTT rises above the idle baseline;
++ *   * quality          -- librist's Q folds in retransmits and refused/skipped packets;
++ *   * retry_bandwidth  -- the share of the send rate being spent on repairs.
++ *
++ * The highest rate that is still CLEAN is the carried rate. That is a measurement
++ * of what the link carries on the transport that matters, and it is exactly the
++ * quantity the CAKE shaper and the RIST bandwidth= ceiling are derived from.
++ *
++ * Latency is reported as a PAIR (idle baseline and the RTT under load) because
++ * the next iteration is tuned on latency CONSISTENCY, not on raw throughput.
++ *
++ * Usage: rist2rist-probe <iface> -u rist://host:port [options]
++ *        rist2rist-probe --help
++ */
++
++#include <librist/librist.h>
++
++#include <arpa/inet.h>
++#include <errno.h>
++#include <getopt.h>
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#define DEFAULT_PSK_FILE   "/etc/rist2rist.link_secret"
++#define DEFAULT_STATE_FILE "/var/run/rist2rist/probe.json"
++#define DEFAULT_BUDGET     "/var/lib/rist2rist/probe-bytes"
++#define DEFAULT_KEYBITS    256
++#define SAMPLE_PACKET      1316
++
++/* Exit codes: a caller must be able to tell a refusal from a failure. */
++#define EXIT_OK        0
++#define EXIT_ERROR     1
++#define EXIT_USAGE     2
++#define EXIT_REFUSED   3
++
++static volatile sig_atomic_t g_stop = 0;
++
++static void on_signal(int sig)
++{
++	(void)sig;
++	g_stop = 1;
++}
++
++static int log_cb(void *arg, enum rist_log_level level, const char *msg)
++{
++	(void)arg;
++	/* stderr only: stdout carries the result, and a caller may pipe it. */
++	fprintf(stderr, "rist2rist-probe: %d: %s\n", (int)level, msg);
++	return 0;
++}
++
++static double now_s(void)
++{
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
++}
++
++/* Create the directory a runtime file lives in, if it does not exist yet. Best
++ * effort on purpose: a failure here is not fatal, it resurfaces as a file that
++ * cannot be written, and a probe must never fail because a state dir is missing
++ * -- the measurement it just took is the valuable part. */
++static void ensure_parent(const char *path)
++{
++	char tmp[512];
++	char *slash;
++
++	snprintf(tmp, sizeof(tmp), "%s", path);
++	slash = strrchr(tmp, '/');
++	if (slash == NULL || slash == tmp)
++		return;
++	*slash = '\0';
++	mkdir(tmp, 0755);
++}
++
++/* ------------------------------------------------------------------ */
++/* the latest librist view of the peer, filled by the stats callback    */
++/* ------------------------------------------------------------------ */
++
++struct sample {
++	unsigned long long bandwidth;
++	unsigned long long retry_bandwidth;
++	unsigned long long sent_bytes;
++	unsigned long long retransmitted_bytes;
++	double quality;
++	unsigned int rtt_ms;
++	int valid;
++};
++
++/* Written on librist's stats thread, read on ours.
++ *
++ * g_latest holds the LAST interval's figures. For quality and rtt that is exactly
++ * right -- they are point-in-time -- but the BYTE counters are a different matter:
++ * sent_bytes/retransmitted_bytes are per-INTERVAL DELTAS, not cumulative totals.
++ * Verified against the wire: at 20 Mbit/s the reported figure is ~560 kB whether
++ * the run lasts 3 s or 15 s, while br-lan actually moved ~13 MB. So the totals
++ * must be SUMMED across callbacks; treating the last value as the total would
++ * under-report a real probe by two orders of magnitude and every budget
++ * decision built on it would be fiction. */
++static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct sample g_latest;
++static unsigned long long g_sum_sent_bytes;
++static unsigned long long g_sum_retrans_bytes;
++
++static int stats_cb(void *arg, const struct rist_stats *s)
++{
++	(void)arg;
++	if (s != NULL && s->stats_type == RIST_STATS_SENDER_PEER) {
++		pthread_mutex_lock(&g_lock);
++		g_latest.bandwidth = (unsigned long long)s->stats.sender_peer.bandwidth;
++		g_latest.retry_bandwidth =
++			(unsigned long long)s->stats.sender_peer.retry_bandwidth;
++		g_latest.sent_bytes = (unsigned long long)s->stats.sender_peer.sent_bytes;
++		g_latest.retransmitted_bytes =
++			(unsigned long long)s->stats.sender_peer.retransmitted_bytes;
++		g_latest.quality = s->stats.sender_peer.quality;
++		g_latest.rtt_ms = (unsigned int)s->stats.sender_peer.rtt;
++		g_latest.valid = 1;
++		g_sum_sent_bytes += g_latest.sent_bytes;
++		g_sum_retrans_bytes += g_latest.retransmitted_bytes;
++		pthread_mutex_unlock(&g_lock);
++	}
++	/* librist hands ownership over: not freeing this leaks the stats JSON. */
++	rist_stats_free(s);
++	return 0;
++}
++
++/* Hand the socket whatever the target rate has earned since t0, then fold one
++ * sample into the caller's running min/max.
++ *
++ * Pacing is a token bucket: librist does not back-pressure, so the send rate is
++ * ours to hold -- which is the whole point of a ramp, and why the achieved rate
++ * cannot be inferred from the local socket. */
++static void pace_and_sample(struct rist_ctx *ctx, unsigned char *buf, double kbps,
++			    double t0, double *bytes, double *rtt_max, double *q_min)
++{
++	double target = kbps * 1000.0 / 8.0;
++	double due = target * (now_s() - t0) - *bytes;
++
++	while (due >= (double)SAMPLE_PACKET && !g_stop) {
++		struct rist_data_block b;
++
++		memset(&b, 0, sizeof(b));
++		b.payload = buf;
++		b.payload_len = SAMPLE_PACKET;
++		if (rist_sender_data_write(ctx, &b) < 0)
++			break;
++		*bytes += (double)SAMPLE_PACKET;
++		due -= (double)SAMPLE_PACKET;
++	}
++
++	pthread_mutex_lock(&g_lock);
++	if (g_latest.valid) {
++		if ((double)g_latest.rtt_ms > *rtt_max)
++			*rtt_max = (double)g_latest.rtt_ms;
++		/* 0 means librist has not computed a quality yet, which is "unknown"
++		 * rather than "bad" -- do not let it poison the minimum. */
++		if (g_latest.quality > 0.0 && g_latest.quality < *q_min)
++			*q_min = g_latest.quality;
++	}
++	pthread_mutex_unlock(&g_lock);
++}
++
++/* ------------------------------------------------------------------ */
++/* the leg: existence, address, and the pre-start guard                */
++/* ------------------------------------------------------------------ */
++
++static int read_ull(const char *path, unsigned long long *out)
++{
++	FILE *f = fopen(path, "r");
++	char buf[64];
++	char *end;
++
++	if (f == NULL)
++		return -1;
++	if (fgets(buf, sizeof(buf), f) == NULL) {
++		fclose(f);
++		return -1;
++	}
++	fclose(f);
++	errno = 0;
++	*out = strtoull(buf, &end, 10);
++	if (end == buf || errno != 0)
++		return -1;
++	return 0;
++}
++
++/* The leg's interface must EXIST before we bind to it: binding to a netdev the
++ * router does not have would silently send via the default route instead, which
++ * is the one thing a per-leg probe must never do. */
++static int leg_exists(const char *iface)
++{
++	char path[256];
++
++	snprintf(path, sizeof(path), "/sys/class/net/%s", iface);
++	return access(path, F_OK) == 0;
++}
++
++/* The leg's own IPv4 address, for reporting. Not required in order to bind
++ * (miface does that), but its absence means the leg is up with no address, which
++ * is worth saying rather than hiding. */
++static int leg_ipv4(const char *iface, char *buf, size_t len)
++{
++	struct ifaddrs *ifa = NULL, *p;
++	int found = -1;
++
++	if (getifaddrs(&ifa) != 0)
++		return -1;
++	for (p = ifa; p != NULL; p = p->ifa_next) {
++		struct sockaddr_in *sin;
++
++		if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET)
++			continue;
++		if (strcmp(p->ifa_name, iface) != 0)
++			continue;
++		sin = (struct sockaddr_in *)p->ifa_addr;
++		if (inet_ntop(AF_INET, &sin->sin_addr, buf, (socklen_t)len) == NULL)
++			continue;
++		found = 0;
++		break;
++	}
++	freeifaddrs(ifa);
++	return found;
++}
++
++/* The leg's egress rate over `window` seconds, plus the raw bytes it moved.
++ *
++ * This is the guard's input and it is deliberately about EGRESS ONLY: a RIST
++ * session on this leg is the bridge sending the programme out, so if the leg is
++ * moving real traffic then a stream is running and a probe must not compete with
++ * it. A modem idles at a trickle (keepalives), so the threshold -- not the raw
++ * counter -- is what separates "in use" from "idle". */
++static int leg_rate_kbps(const char *iface, double window, double *kbps_out,
++			 unsigned long long *bytes_out)
++{
++	char path[256];
++	unsigned long long a = 0, b = 0;
++	double t0;
++
++	snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/tx_bytes", iface);
++	if (read_ull(path, &a) != 0)
++		return -1;
++	t0 = now_s();
++	while (!g_stop && now_s() - t0 < window)
++		usleep(50000);
++	if (read_ull(path, &b) != 0)
++		return -1;
++	*kbps_out = (double)(b - a) * 8.0 / 1000.0 / window;
++	*bytes_out = b - a;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* the daily probe budget -- these are metered mobile links            */
++/* ------------------------------------------------------------------ */
++
++/* Today's already-spent probe bytes. A stored date that is not today means the
++ * counter is stale, so the day restarts at zero rather than carrying yesterday's
++ * spend into today's budget. */
++static unsigned long long budget_spent(const char *path)
++{
++	FILE *f = fopen(path, "r");
++	char day[16], stored[16];
++	unsigned long long bytes = 0;
++	time_t t = time(NULL);
++	struct tm tm_utc;
++
++	if (f == NULL)
++		return 0;
++	gmtime_r(&t, &tm_utc);
++	strftime(day, sizeof(day), "%Y-%m-%d", &tm_utc);
++	if (fscanf(f, "%15s %llu", stored, &bytes) != 2 || strcmp(stored, day) != 0)
++		bytes = 0;
++	fclose(f);
++	return bytes;
++}
++
++static void budget_add(const char *path, unsigned long long spent)
++{
++	FILE *f;
++	time_t t = time(NULL);
++	struct tm tm_utc;
++	char day[16], tmp[512];
++
++	gmtime_r(&t, &tm_utc);
++	strftime(day, sizeof(day), "%Y-%m-%d", &tm_utc);
++	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
++	f = fopen(tmp, "w");
++	if (f == NULL)
++		return;
++	fprintf(f, "%s %llu\n", day, budget_spent(path) + spent);
++	fclose(f);
++	/* Rename so a reader never sees a half-written counter. */
++	if (rename(tmp, path) != 0)
++		remove(tmp);
++}
++
++/* ------------------------------------------------------------------ */
++/* result reporting                                                    */
++/* ------------------------------------------------------------------ */
++
++/* JSON string escaping -- backslash and double quote. */
++static void json_str(FILE *out, const char *in)
++{
++	for (; *in != '\0'; in++) {
++		if (*in == '\\' || *in == '"')
++			fputc('\\', out);
++		fputc(*in, out);
++	}
++}
++
++struct result {
++	const char *iface;
++	const char *src_ip;
++	const char *url;         /* secret-free by construction */
++	const char *measured_at;
++	double baseline_rtt_ms;  /* -1 when unknown */
++	double loaded_rtt_ms;    /* -1 when unknown */
++	unsigned long long carried_kbps;
++	unsigned long long failed_kbps; /* 0 when the ceiling was reached */
++	unsigned long long sent_bytes;
++	unsigned long long retrans_bytes;
++	const char *metering;    /* "interface" (leg counter) or "librist" */
++	double quality;
++	unsigned long long budget_spent;
++	double duration_s;
++	int clean_to_ceiling;
++};
++
++static void print_json(FILE *out, const struct result *r)
++{
++	fprintf(out, "{\"interface\":\"");
++	json_str(out, r->iface);
++	fprintf(out, "\",\"source_ip\":\"");
++	json_str(out, r->src_ip);
++	fprintf(out, "\",\"endpoint\":\"");
++	json_str(out, r->url);
++	fprintf(out, "\",\"measured_at\":\"%s\"", r->measured_at);
++
++	/* The latency pair. An RTT librist never reported is null, not 0. */
++	fprintf(out, ",\"unloaded_rtt_ms\":");
++	if (r->baseline_rtt_ms >= 0.0)
++		fprintf(out, "%.1f", r->baseline_rtt_ms);
++	else
++		fprintf(out, "null");
++	fprintf(out, ",\"loaded_rtt_ms\":");
++	if (r->loaded_rtt_ms >= 0.0)
++		fprintf(out, "%.1f", r->loaded_rtt_ms);
++	else
++		fprintf(out, "null");
++
++	/* measured_kbps is the carried rate -- what the leg actually moved. */
++	fprintf(out, ",\"measured_kbps\":%llu", r->carried_kbps);
++	fprintf(out, ",\"failed_at_kbps\":");
++	if (r->failed_kbps != 0)
++		fprintf(out, "%llu", r->failed_kbps);
++	else
++		fprintf(out, "null");
++	fprintf(out, ",\"ceiling_reached\":%s", r->clean_to_ceiling ? "true" : "false");
++	fprintf(out, ",\"quality\":%.2f", r->quality);
++	fprintf(out, ",\"sent_bytes\":%llu", r->sent_bytes);
++	fprintf(out, ",\"retransmitted_bytes\":%llu", r->retrans_bytes);
++	/* Where the byte figure came from: the leg's own counter (true wire spend on
++	 * a metered link) or librist's summed intervals (bench runs). A consumer
++	 * must be able to see which, because they are not the same quantity. */
++	fprintf(out, ",\"metering\":\"%s\"", r->metering);
++	fprintf(out, ",\"duration_s\":%.1f", r->duration_s);
++	fprintf(out, ",\"budget_spent_bytes\":%llu}\n", r->budget_spent);
++}
++
++static void print_text(FILE *out, const struct result *r)
++{
++	fprintf(out, "leg          : %s (%s)\n", r->iface, r->src_ip);
++	fprintf(out, "endpoint     : %s\n", r->url);
++	fprintf(out, "measured_at  : %s\n", r->measured_at);
++	if (r->baseline_rtt_ms >= 0.0)
++		fprintf(out, "rtt idle     : %.1f ms\n", r->baseline_rtt_ms);
++	else
++		fprintf(out, "rtt idle     : unknown\n");
++	if (r->loaded_rtt_ms >= 0.0)
++		fprintf(out, "rtt loaded   : %.1f ms\n", r->loaded_rtt_ms);
++	else
++		fprintf(out, "rtt loaded   : unknown\n");
++	fprintf(out, "carried      : %llu kbit/s\n", r->carried_kbps);
++	if (r->failed_kbps != 0)
++		fprintf(out, "first bad    : %llu kbit/s (this rate did not hold)\n",
++			r->failed_kbps);
++	else
++		fprintf(out, "first bad    : none (ramp stopped at the ceiling)\n");
++	fprintf(out, "quality      : %.2f\n", r->quality);
++	fprintf(out, "bytes spent  : %llu (%llu of them retransmissions, metered by %s)\n",
++		r->sent_bytes, r->retrans_bytes, r->metering);
++	fprintf(out, "budget today : %llu bytes\n", r->budget_spent);
++}
++
++static void usage(FILE *out, const char *argv0)
++{
++	fprintf(out,
++		"Usage: %s <iface> -u rist://host:port [options]\n"
++		"\n"
++		"Actively probes ONE WAN leg's usable capacity and latency. PRE-START ONLY:\n"
++		"it refuses to run while the leg is already carrying a stream (exit 3).\n"
++		"\n"
++		"  -u, --url URL            probe endpoint (rist://host:port). Required.\n"
++		"      --psk-file FILE      session passphrase (default %s)\n"
++		"  -e, --aes N              AES strength, 128 or 256 (default %d)\n"
++		"  -r, --rate-kbps N        single-rate mode: hold this rate, do not ramp\n"
++		"      --floor-kbps N       ramp start (default 500)\n"
++		"      --max-kbps N         ramp ceiling (default 50000)\n"
++		"      --seconds N          seconds per rate step (default 4)\n"
++		"      --baseline-seconds N idle sample before ramping (default 2)\n"
++		"      --step-pct N         ramp growth per step, %% (default 50)\n"
++		"      --rise-pct N         saturation: RTT rise over idle, %% (default 50)\n"
++		"      --quality-floor N    saturation: minimum quality %% (default 99)\n"
++		"      --guard-window N     seconds to sample the leg before probing (default 2)\n"
++		"      --guard-kbps N       egress above this means a stream is running (default 1000)\n"
++		"      --max-bytes-per-day N  probe budget (default 2000000000)\n"
++		"      --budget-file FILE   budget counter (default %s)\n"
++		"      --state-file FILE    result JSON for the read-only surface (default %s)\n"
++		"      --no-bind            bench mode: do NOT bind to the leg\n"
++		"      --allow-while-streaming  override the pre-start guard (not for production)\n"
++		"  -j, --json               print the result as JSON\n"
++		"  -h, --help               this text\n"
++		"\n"
++		"Exit: 0 measured, 1 error, 2 usage, 3 refused (stream running or over budget)\n",
++		argv0, DEFAULT_PSK_FILE, DEFAULT_KEYBITS, DEFAULT_BUDGET, DEFAULT_STATE_FILE);
++}
++
++int main(int argc, char **argv)
++{
++	static const struct option longopts[] = {
++		{ "url", required_argument, NULL, 'u' },
++		{ "psk-file", required_argument, NULL, 1 },
++		{ "aes", required_argument, NULL, 'e' },
++		{ "rate-kbps", required_argument, NULL, 'r' },
++		{ "floor-kbps", required_argument, NULL, 2 },
++		{ "max-kbps", required_argument, NULL, 3 },
++		{ "seconds", required_argument, NULL, 4 },
++		{ "baseline-seconds", required_argument, NULL, 5 },
++		{ "step-pct", required_argument, NULL, 6 },
++		{ "rise-pct", required_argument, NULL, 7 },
++		{ "quality-floor", required_argument, NULL, 8 },
++		{ "guard-window", required_argument, NULL, 9 },
++		{ "guard-kbps", required_argument, NULL, 10 },
++		{ "max-bytes-per-day", required_argument, NULL, 11 },
++		{ "budget-file", required_argument, NULL, 12 },
++		{ "state-file", required_argument, NULL, 13 },
++		{ "no-bind", no_argument, NULL, 14 },
++		{ "allow-while-streaming", no_argument, NULL, 15 },
++		{ "json", no_argument, NULL, 'j' },
++		{ "help", no_argument, NULL, 'h' },
++		{ NULL, 0, NULL, 0 }
++	};
++
++	const char *iface = NULL;
++	const char *url = NULL;
++	const char *pskfile = DEFAULT_PSK_FILE;
++	const char *budgetfile = DEFAULT_BUDGET;
++	const char *statefile = DEFAULT_STATE_FILE;
++	unsigned int keybits = DEFAULT_KEYBITS;
++	int bound = 1;
++	int json = 0;
++	int allow_busy = 0;
++	unsigned long long fixed_rate = 0;
++	unsigned long long floor_kbps = 500, max_kbps = 50000, guard_kbps = 1000;
++	unsigned long long max_bytes_per_day = 2000000000ULL;
++	double seconds = 4.0, baseline_seconds = 2.0, guard_window = 2.0;
++	double step_growth = 1.5, rise_pct = 50.0, quality_floor = 99.0;
++
++	char psk[RIST_MAX_STRING_SHORT];
++	char fullurl[1024];
++	char src_ip[64];
++	char measured_at[32];
++	time_t now;
++	struct tm tm_utc;
++	struct rist_logging_settings *logset = NULL;
++	struct rist_ctx *ctx = NULL;
++	struct rist_peer_config *pc = NULL;
++	struct rist_peer *peer = NULL;
++	unsigned char *buf = NULL;
++	struct result res;
++	unsigned long long spent_before = 0;
++	unsigned long long leg_tx_before = 0;
++	double t_start;
++	int opt, rc = EXIT_OK;
++
++	memset(&res, 0, sizeof(res));
++	res.baseline_rtt_ms = -1.0;
++	res.loaded_rtt_ms = -1.0;
++
++	while ((opt = getopt_long(argc, argv, "u:e:r:jh", longopts, NULL)) != -1) {
++		switch (opt) {
++		case 'u': url = optarg; break;
++		case 'e': keybits = (unsigned int)strtoul(optarg, NULL, 10); break;
++		case 'r': fixed_rate = strtoull(optarg, NULL, 10); break;
++		case 'j': json = 1; break;
++		case 'h': usage(stdout, argv[0]); return EXIT_OK;
++		case 1: pskfile = optarg; break;
++		case 2: floor_kbps = strtoull(optarg, NULL, 10); break;
++		case 3: max_kbps = strtoull(optarg, NULL, 10); break;
++		case 4: seconds = atof(optarg); break;
++		case 5: baseline_seconds = atof(optarg); break;
++		case 6: step_growth = 1.0 + atof(optarg) / 100.0; break;
++		case 7: rise_pct = atof(optarg); break;
++		case 8: quality_floor = atof(optarg); break;
++		case 9: guard_window = atof(optarg); break;
++		case 10: guard_kbps = strtoull(optarg, NULL, 10); break;
++		case 11: max_bytes_per_day = strtoull(optarg, NULL, 10); break;
++		case 12: budgetfile = optarg; break;
++		case 13: statefile = optarg; break;
++		case 14: bound = 0; break;
++		case 15: allow_busy = 1; break;
++		default: usage(stderr, argv[0]); return EXIT_USAGE;
++		}
++
++	}
++	if (optind < argc)
++		iface = argv[optind];
++
++	if (iface == NULL || url == NULL) {
++		usage(stderr, argv[0]);
++		return EXIT_USAGE;
++	}
++	if (keybits != 128 && keybits != 256) {
++		fprintf(stderr, "rist2rist-probe: --aes must be 128 or 256\n");
++		return EXIT_USAGE;
++	}
++	if (seconds <= 0.0)
++		seconds = 4.0;
++	if (baseline_seconds < 0.0)
++		baseline_seconds = 0.0;
++	if (step_growth <= 1.0)
++		step_growth = 1.5;
++	if (floor_kbps == 0)
++		floor_kbps = 1;
++	if (max_kbps < floor_kbps)
++		max_kbps = floor_kbps;
++
++	signal(SIGTERM, on_signal);
++	signal(SIGINT, on_signal);
++
++	/* Runtime dirs (/var/run/rist2rist, /var/lib/rist2rist) are created here
++	 * rather than shipped: /var/run is a tmpfs that a reboot empties, so a
++	 * package-installed directory would be missing exactly when it is needed. */
++	ensure_parent(statefile);
++	ensure_parent(budgetfile);
++
++	/* ---- the leg must exist, or binding would silently use the default route */
++	if (!leg_exists(iface)) {
++		fprintf(stderr, "rist2rist-probe: no such interface: %s\n", iface);
++		return EXIT_ERROR;
++	}
++	if (leg_ipv4(iface, src_ip, sizeof(src_ip)) != 0)
++		snprintf(src_ip, sizeof(src_ip), "unknown");
++
++	/* ---- RULE 1: pre-start only --------------------------------------- */
++	if (bound) {
++		double busy_kbps = 0.0;
++		unsigned long long moved = 0;
++
++		if (leg_rate_kbps(iface, guard_window, &busy_kbps, &moved) != 0) {
++			fprintf(stderr,
++				"rist2rist-probe: cannot read %s's egress counter; refusing to "
++				"probe a leg whose state cannot be established\n", iface);
++			return EXIT_REFUSED;
++		}
++		if (busy_kbps > (double)guard_kbps && !allow_busy) {
++			fprintf(stderr,
++				"rist2rist-probe: REFUSED -- %s is carrying %.0f kbit/s "
++				"(> %llu kbit/s), so a stream is running and a probe would "
++				"compete with it. A probe is PRE-START ONLY.\n",
++				iface, busy_kbps, guard_kbps);
++			return EXIT_REFUSED;
++		}
++	}
++
++	/* ---- RULE 2: the metered budget ----------------------------------- */
++	spent_before = budget_spent(budgetfile);
++	if (max_bytes_per_day > 0 && spent_before >= max_bytes_per_day) {
++		fprintf(stderr,
++			"rist2rist-probe: REFUSED -- today's probe budget is spent "
++			"(%llu of %llu bytes).\n", spent_before, max_bytes_per_day);
++		return EXIT_REFUSED;
++	}
++
++	/* ---- RULE 3: the secret comes from a file, never the URL or argv --- */
++	{
++		FILE *f = fopen(pskfile, "r");
++		size_t n;
++
++		if (f == NULL) {
++			fprintf(stderr, "rist2rist-probe: cannot read the passphrase from %s\n",
++				pskfile);
++			return EXIT_ERROR;
++		}
++		if (fgets(psk, sizeof(psk), f) == NULL) {
++			fclose(f);
++			fprintf(stderr, "rist2rist-probe: %s is empty\n", pskfile);
++			return EXIT_ERROR;
++		}
++		fclose(f);
++		n = strlen(psk);
++		while (n > 0 && (psk[n - 1] == '\n' || psk[n - 1] == '\r' ||
++				 psk[n - 1] == ' ' || psk[n - 1] == '\t'))
++			psk[--n] = '\0';
++		if (n == 0) {
++			fprintf(stderr, "rist2rist-probe: %s holds no passphrase\n", pskfile);
++			return EXIT_ERROR;
++		}
++	}
++
++	/* Bind the leg with miface, exactly as the bridge's output leg does: CAKE is
++	 * applied per interface, so an unbound probe would not traverse the leg the
++	 * shaper controls and would measure something else entirely. */
++	if (bound) {
++		char sep = (strchr(url, '?') != NULL) ? '&' : '?';
++
++		snprintf(fullurl, sizeof(fullurl), "%s%cmiface=%s", url, sep, iface);
++	} else {
++		snprintf(fullurl, sizeof(fullurl), "%s", url);
++	}
++
++	/* The URL is deliberately secret-free, so printing it is safe (rule 3). */
++	res.iface = iface;
++	res.src_ip = src_ip;
++	res.url = fullurl;
++	now = time(NULL);
++	gmtime_r(&now, &tm_utc);
++	strftime(measured_at, sizeof(measured_at), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
++	res.measured_at = measured_at;
++
++	if (!json)
++		fprintf(stderr, "rist2rist-probe: probing %s via %s\n", iface, fullurl);
++
++	/* ---- librist ------------------------------------------------------ */
++	if (rist_logging_set(&logset, RIST_LOG_WARN, log_cb, NULL, NULL, NULL) != 0)
++		return EXIT_ERROR;
++	if (rist_sender_create(&ctx, RIST_PROFILE_MAIN, 0, logset) != 0) {
++		fprintf(stderr, "rist2rist-probe: could not create the sender context\n");
++		rist_logging_unset_global();
++		return EXIT_ERROR;
++	}
++	/* librist returns 0 on success for a URL with no query parameters (the
++	 * header's "number of parameters" wording is misleading), so only a negative
++	 * value is a failure -- `<= 0` is a bug that appears once a URL is bare. */
++	if (rist_parse_address2(fullurl, &pc) < 0 || pc == NULL) {
++		fprintf(stderr, "rist2rist-probe: could not parse the endpoint URL\n");
++		rist_destroy(ctx);
++		rist_logging_unset_global();
++		return EXIT_ERROR;
++	}
++	/* AFTER the parse: parsing mutates the config and may hand back its own, so
++	 * a secret set beforehand can be silently lost. */
++	snprintf(pc->secret, sizeof(pc->secret), "%s", psk);
++	pc->key_size = keybits;
++
++	if (rist_peer_create(ctx, &peer, pc) != 0) {
++		fprintf(stderr, "rist2rist-probe: could not create the peer\n");
++		rist_peer_config_free2(&pc);
++		rist_destroy(ctx);
++		rist_logging_unset_global();
++		return EXIT_ERROR;
++	}
++	rist_peer_config_free2(&pc);
++	rist_stats_callback_set(ctx, 200, stats_cb, NULL);
++	if (rist_start(ctx) != 0) {
++		fprintf(stderr, "rist2rist-probe: could not start the sender\n");
++		rist_destroy(ctx);
++		rist_logging_unset_global();
++		return EXIT_ERROR;
++	}
++
++	buf = malloc(SAMPLE_PACKET);
++	if (buf == NULL) {
++		rist_destroy(ctx);
++		rist_logging_unset_global();
++		return EXIT_ERROR;
++	}
++	memset(buf, 0x5a, SAMPLE_PACKET);
++
++	/* The leg's own counter is the metering source of record for a bound probe:
++	 * the billed question on a metered mobile link is "how many bytes did this
++	 * cost", and the interface counter answers exactly that. Read it here, at the
++	 * last moment before the first probe byte goes out. */
++	if (bound) {
++		char path[256];
++
++		snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/tx_bytes", iface);
++		read_ull(path, &leg_tx_before);
++	}
++
++	t_start = now_s();
++
++	/* ---- phase 1: the idle baseline ----------------------------------- */
++	{
++		double step_t0 = now_s();
++		double step_bytes = 0.0;
++		double rtt_max = 0.0, q_min = 100.0;
++		double rtt_sum = 0.0;
++		int rtt_n = 0;
++
++		if (baseline_seconds > 0.0) {
++			while (!g_stop && now_s() - step_t0 < baseline_seconds) {
++				pace_and_sample(ctx, buf, (double)floor_kbps, step_t0,
++						&step_bytes, &rtt_max, &q_min);
++				pthread_mutex_lock(&g_lock);
++				if (g_latest.valid && g_latest.rtt_ms > 0) {
++					rtt_sum += (double)g_latest.rtt_ms;
++					rtt_n++;
++				}
++				pthread_mutex_unlock(&g_lock);
++				usleep(100000);
++			}
++		}
++		if (rtt_n > 0)
++			res.baseline_rtt_ms = rtt_sum / (double)rtt_n;
++	}
++
++	if (fixed_rate != 0) {
++		/* A RATE-ONLY PROBE: hold one rate for one period and report. This is the
++		 * form the modem WAN test uses when the operator wants a specific rate
++		 * tested rather than a ceiling found. */
++		double t0 = now_s();
++		double bytes = 0.0, rtt_max = 0.0, q_min = 100.0;
++
++		while (!g_stop && now_s() - t0 < seconds) {
++			pace_and_sample(ctx, buf, (double)fixed_rate, t0, &bytes,
++					&rtt_max, &q_min);
++			usleep(100000);
++		}
++		res.carried_kbps = fixed_rate;
++		res.loaded_rtt_ms = rtt_max > 0.0 ? rtt_max : -1.0;
++		res.quality = q_min;
++	} else {
++		/* ---- phase 2: ramp until the leg stops carrying it ----------- */
++		double rate_f = (double)floor_kbps;
++
++		for (;;) {
++			double t0 = now_s();
++			double bytes = 0.0, rtt_max = 0.0, q_min = 100.0;
++			int clean;
++
++			if (rate_f > (double)max_kbps)
++				rate_f = (double)max_kbps;
++
++			while (!g_stop && now_s() - t0 < seconds) {
++				pace_and_sample(ctx, buf, rate_f, t0, &bytes, &rtt_max,
++						&q_min);
++				usleep(100000);
++			}
++
++			/* A step is CLEAN while latency has not risen materially above idle
++			 * and librist's quality has not started to degrade. When RTT is
++			 * unknown the quality signal alone decides -- the probe must not
++			 * call a leg good because a number was missing. */
++			clean = 1;
++			if (res.baseline_rtt_ms > 0.0 && rtt_max > 0.0 &&
++			    rtt_max > res.baseline_rtt_ms * (1.0 + rise_pct / 100.0))
++				clean = 0;
++			if (q_min < quality_floor)
++				clean = 0;
++
++			if (!clean) {
++				res.failed_kbps = (unsigned long long)rate_f;
++				break;
++			}
++			res.carried_kbps = (unsigned long long)rate_f;
++			res.loaded_rtt_ms = rtt_max > 0.0 ? rtt_max : -1.0;
++			res.quality = q_min;
++			if (rate_f >= (double)max_kbps) {
++				res.clean_to_ceiling = 1;
++				break;
++			}
++			rate_f *= step_growth;
++			if (g_stop)
++				break;
++		}
++	}
++
++	/* ---- the metered total --------------------------------------------- *
++	 * On a BOUND probe the leg's own interface counter is the source of record:
++	 * the billed question on a metered link is "how many bytes did this cost",
++	 * and the interface counter answers exactly that -- including the IP and link
++	 * overhead a payload tally would miss. It also picks up the leg's other
++	 * traffic during the run, which errs toward over-reporting: the safe
++	 * direction when the figure guards a data budget.
++	 *
++	 * UNBOUND (bench) runs do not traverse the leg, so its counter means nothing
++	 * there; the summed librist intervals are the best available figure and
++	 * `metering` says which one was used rather than passing them off as equal. */
++	{
++		unsigned long long sent = 0, retrans = 0;
++
++		pthread_mutex_lock(&g_lock);
++		sent = g_sum_sent_bytes;
++		retrans = g_sum_retrans_bytes;
++		pthread_mutex_unlock(&g_lock);
++
++		if (bound) {
++			unsigned long long after = 0;
++			char path[256];
++
++			snprintf(path, sizeof(path),
++				 "/sys/class/net/%s/statistics/tx_bytes", iface);
++			if (read_ull(path, &after) == 0 && after >= leg_tx_before) {
++				sent = after - leg_tx_before;
++				res.metering = "interface";
++			}
++		}
++		if (res.metering == NULL) {
++			res.metering = "librist";
++			if (sent == 0) {
++				/* No stats callback arrived at all: report the payload we know
++				 * we pushed rather than a fabricated total. */
++				sent = (unsigned long long)((double)res.carried_kbps * 1000.0 /
++							    8.0 * (now_s() - t_start));
++			}
++		}
++		res.sent_bytes = sent;
++		res.retrans_bytes = retrans;
++		budget_add(budgetfile, sent);
++		res.budget_spent = spent_before + sent;
++	}
++	res.duration_s = now_s() - t_start;
++
++	if (json) {
++		print_json(stdout, &res);
++	} else {
++		print_text(stdout, &res);
++	}
++	fflush(stdout);
++
++	/* The state file is what the bridge's read-only surface (wan_status) reads,
++	 * so the pre-flight advisory can show the last PRE-START measurement with its
++	 * age, rather than implying it is live. */
++	{
++		FILE *f = fopen(statefile, "w");
++
++		if (f != NULL) {
++			print_json(f, &res);
++			fclose(f);
++		}
++	}
++
++	rist_destroy(ctx);
++	rist_logging_unset_global();
++	free(buf);
++	return rc;
++}
