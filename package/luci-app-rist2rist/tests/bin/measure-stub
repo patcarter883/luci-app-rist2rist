@@ -1,0 +1,26 @@
+#!/bin/sh
+# Test double for the passive measurement helper (files/rist2rist-measure).
+#
+# Prints the SAME JSON shape the real helper emits, so the rpcd plugin's
+# wan_status pass-through and its get_config merge can be asserted off-device
+# without a router. The two legs match the stub uplinks (lo present, wwan1 absent)
+# used by stub-functions.sh, so the interface join is exercised for both a present
+# and an absent leg.
+#
+# MEASURE_STUB_MODE=garbage models a helper whose output is not a JSON object.
+# MEASURE_STUB_MODE=garbage-object models the subtler case: output that LOOKS like
+# an object (braces at both ends) but does not parse, which a brace test alone
+# would wrongly accept.
+case "${MEASURE_STUB_MODE:-ok}" in
+	garbage)
+		printf 'not json\n'
+		exit 0
+		;;
+	garbage-object)
+		printf '{garbage}\n'
+		exit 0
+		;;
+esac
+
+printf '%s\n' '{"generated_at":"2026-01-01T00:00:00Z","legs":[{"interface":"lo","present":true,"state":"ok","shaped_kbps":8000,"tx_bytes":100,"rx_bytes":200,"tx_dropped":0,"tx_overlimits":1,"backlog_bytes":0,"signal_dbm":-70,"rtt_ms":null,"jitter_ms":null,"quality":null,"measured_kbps":null,"measured_at":null},{"interface":"wwan1","present":false,"state":"absent","shaped_kbps":null,"tx_bytes":null,"rx_bytes":null,"tx_dropped":null,"tx_overlimits":null,"backlog_bytes":null,"signal_dbm":null,"rtt_ms":null,"jitter_ms":null,"quality":null,"measured_kbps":null,"measured_at":null}],"aggregate":{"shaped_kbps":8000,"measured_kbps":null}}'
+exit 0

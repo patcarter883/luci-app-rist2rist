@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-rist2rist
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=15
+PKG_RELEASE:=46
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 include $(INCLUDE_DIR)/package.mk
@@ -42,17 +42,19 @@ define Build/Prepare
 	$(Build/Patch)
 endef
 
-# Build only tools/rist2rist; ninja's dep graph stops at librist.a + its objects,
-# so ristsender/ristreceiver/udp2udp/risttunnel/ristsrppasswd never link.
+# Build only the two binaries this package SHIPS; ninja's dep graph stops at
+# librist.a + its objects, so ristsender/ristreceiver/udp2udp/risttunnel/
+# ristsrppasswd never link.
 define Build/Compile
-	$(call Build/Compile/Meson,tools/rist2rist)
+	$(call Build/Compile/Meson,tools/rist2rist tools/rist2rist-probe)
 endef
 
 # Bypass the default `ninja install` (which would re-link every tool with install: true).
-# Stage just the one binary into $(PKG_INSTALL_DIR) for Package/install to consume.
+# Stage just the two binaries into $(PKG_INSTALL_DIR) for Package/install to consume.
 define Build/Install
 	$(INSTALL_DIR) $(PKG_INSTALL_DIR)/usr/bin
 	$(INSTALL_BIN) $(MESON_BUILD_DIR)/tools/rist2rist $(PKG_INSTALL_DIR)/usr/bin/rist2rist
+	$(INSTALL_BIN) $(MESON_BUILD_DIR)/tools/rist2rist-probe $(PKG_INSTALL_DIR)/usr/bin/rist2rist-probe
 endef
 
 define Package/luci-app-rist2rist/install
@@ -86,6 +88,24 @@ define Package/luci-app-rist2rist/install
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) ./root/usr/libexec/rpcd/rist2rist $(1)/usr/libexec/rpcd/rist2rist
 
+	# Passive per-WAN measurement snapshot: a one-shot admin tool. It only reads
+	# (sysfs, tc, mmcli, uci) -- it is never a service. /usr/sbin matches the sbin
+	# convention for admin tools.
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_BIN) ./files/rist2rist-measure $(1)/usr/sbin/rist2rist-measure
+
+	# The ACTIVE per-leg probe: the other half of the measurement, and the
+	# instrument the modem WAN test is run with. It puts traffic on the link, so
+	# it is an operator-invoked sbin tool and never a service -- it refuses to run
+	# while a session is up. Installed from the meson build, beside rist2rist.
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/rist2rist-probe $(1)/usr/sbin/rist2rist-probe
+
+	# Shared WAN-link resolver (DT-27.3): ONE definition of "this box's WAN links",
+	# SOURCED by both the init (to bind the output leg) and the measurement helper
+	# (to enumerate legs). Not executable -- it is sourced, so plain data mode.
+	$(INSTALL_DIR) $(1)/usr/lib/rist2rist
+	$(INSTALL_DATA) ./files/rist2rist-wan.sh $(1)/usr/lib/rist2rist/wan.sh
+
 	# The HTTP face of that same API. LuCI's uhttpd cannot serve it (its ubus
 	# plugin denies every call on this image) and uhttpd's -a would expose every
 	# ubus object on the LAN to reach this one, so the endpoint gets its own
@@ -101,6 +121,14 @@ endef
 define Package/luci-app-rist2rist/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
+# rpcd kills a script method at its timeout (30s by default, measured on the
+# bridge), and the plugin's calibrate measures every WAN leg and then confirms
+# the result -- about a minute. Leave the default and the bridge's own control
+# endpoint can never complete a calibration.
+if [ "$$(uci -q get rpcd.@rpcd[0].timeout)" != "300" ]; then
+	uci -q set rpcd.@rpcd[0].timeout=300
+	uci -q commit rpcd
+fi
 /etc/init.d/rpcd restart 2>/dev/null || true
 /etc/init.d/uhttpd reload 2>/dev/null || true
 # The control endpoint must be ENABLED, not merely installed: without this the

@@ -75,19 +75,23 @@ configured() { unset STUB_DESTINATIONS 2>/dev/null || true; }
 
 # run <managed 0|1> <method> [body] -- the exported state above is inherited.
 # LINK_SECRET_FILE is redirected into the sandbox: the real path is /etc, and a
-# test must never write there.
+# test must never write there. MEASURE_CMD is pointed at the stub helper only when
+# MEASURE_CMD_TEST is set, so by default the passive read finds no helper (the
+# real absolute path is not executable off-device) and reports unknown.
 run() {
 	if [ -n "${3:-}" ]; then
 		printf '%s' "$3" | env UCI_STUB_LOG="$tmp/uci" STUB_MAIN_MANAGED="$1" \
 			FUNCTIONS_SH="$stub" RELOAD_CMD="$here/bin/reload-stub" \
 			RELOAD_STUB_LOG="$tmp/reload" LINK_SECRET_FILE="$tmp/link_secret" \
 			PROC_ROOT="$tmp/proc" \
+			MEASURE_CMD="${MEASURE_CMD_TEST:-/usr/sbin/rist2rist-measure}" \
 			sh "$plugin" call "$2" || true
 	else
 		env UCI_STUB_LOG="$tmp/uci" STUB_MAIN_MANAGED="$1" \
 			FUNCTIONS_SH="$stub" RELOAD_CMD="$here/bin/reload-stub" \
 			RELOAD_STUB_LOG="$tmp/reload" LINK_SECRET_FILE="$tmp/link_secret" \
 			PROC_ROOT="$tmp/proc" \
+			MEASURE_CMD="${MEASURE_CMD_TEST:-/usr/sbin/rist2rist-measure}" \
 			sh "$plugin" call "$2" </dev/null || true
 	fi
 }
@@ -109,6 +113,7 @@ check "list enumerates the read methods" "$out" "'status' in d and 'get_config' 
 check "list enumerates the write methods" "$out" \
 	"'set_config' in d and 'reconcile' in d and 'reload' in d"
 check "list enumerates the claim and release" "$out" "'claim' in d and 'release' in d"
+check "list enumerates the read-only wan_status" "$out" "'wan_status' in d"
 
 # --- unknown method must not crash (and is refused before auth, like any method) ---
 out=$(FUNCTIONS_SH="$stub" sh "$plugin" call nope)
@@ -410,6 +415,142 @@ if [ -f "$tmp/link_secret" ]; then
 else
 	echo "  OK   clearing removes the secret file"
 fi
+
+echo
+echo "-- wan_status (passive, read-only, per-leg snapshot) --"
+
+configured; claimed
+
+# With no helper the read is an ERROR object, never an empty object: a caller must
+# be able to tell "no measurement" from "all zero". By default MEASURE_CMD_TEST is
+# unset, so run() points the hook at the real absolute path -- not executable
+# off-device, which is exactly the missing-helper case.
+rm -f "$tmp/uci"*
+out=$(run 1 wan_status "$(tb '{}')")
+check "wan_status with no helper returns an error object, not {}" "$out" \
+	"d.get('ok') is False and d.get('error') == 'measure_unavailable' and d != {}"
+if [ -f "$tmp/uci" ]; then
+	echo "  FAIL wan_status wrote configuration"
+	fails=$((fails + 1))
+else
+	echo "  OK   wan_status is read-only (no uci writes)"
+fi
+
+# A present, executable helper: its JSON passes through UNCHANGED.
+export MEASURE_CMD_TEST="$here/bin/measure-stub"
+out=$(run 1 wan_status "$(tb '{}')")
+check "wan_status passes the helper's JSON through" "$out" \
+	"d['generated_at']=='2026-01-01T00:00:00Z' and len(d['legs'])==2 and d['aggregate']['shaped_kbps']==8000"
+check "wan_status preserves the helper's nulls (unknown), never 0" "$out" \
+	"d['legs'][0]['measured_kbps'] is None and d['legs'][0]['rtt_ms'] is None and d['legs'][1]['shaped_kbps'] is None"
+check "wan_status reports an absent leg as a normal present:false" "$out" \
+	"d['legs'][1]['present'] is False and d['legs'][1]['state']=='absent'"
+
+# Output that is not a JSON object is refused, not echoed back.
+MEASURE_STUB_MODE=garbage
+export MEASURE_STUB_MODE
+out=$(run 1 wan_status "$(tb '{}')")
+check "wan_status refuses a helper whose output is unusable" "$out" \
+	"d.get('ok') is False and d.get('error') == 'measure_unavailable'"
+
+# Object-shaped but NOT valid JSON must be refused as well: a brace test alone
+# would accept it and hand the caller malformed JSON while claiming to have
+# checked it, which is exactly what the contract forbids.
+MEASURE_STUB_MODE=garbage-object
+export MEASURE_STUB_MODE
+out=$(run 1 wan_status "$(tb '{}')")
+check "wan_status refuses object-shaped but unparseable output" "$out" \
+	"d.get('ok') is False and d.get('error') == 'measure_unavailable'"
+unset MEASURE_STUB_MODE
+
+# get_config now carries the OBSERVED figures beside the DECLARED leg, so one call
+# shows both.
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config merges the measured state into uplinks[]" "$out" \
+	"d['uplinks'][0]['state']=='ok' and d['uplinks'][0]['shaped_kbps']==8000 and d['uplinks'][0]['signal_dbm']==-70"
+check "get_config: an absent leg's measured fields are null, not 0" "$out" \
+	"d['uplinks'][1]['state']=='absent' and d['uplinks'][1]['shaped_kbps'] is None and d['uplinks'][1]['tx_bytes'] is None"
+check "get_config: present stays consistent with the merged leg" "$out" \
+	"d['uplinks'][0]['present'] is True and d['uplinks'][1]['present'] is False"
+check "get_config: the declared fields are unchanged" "$out" \
+	"d['uplinks'][0]['interface']=='lo' and d['uplinks'][1]['weight']=='3'"
+
+unset MEASURE_CMD_TEST
+out=$(run 1 wan_status '{}')
+check "wan_status requires a token, like every other method" "$out" \
+	"d['ok'] is False and d['error'] == 'token_required'"
+
+# Back to no helper: get_config still succeeds, and the unobserved fields are the
+# honest null rather than a fabricated 0.
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config without a helper reports unknown, not 0" "$out" \
+	"d['ok'] is True and d['uplinks'][0]['state'] is None and d['uplinks'][0]['shaped_kbps'] is None"
+
+echo
+echo "-- get_config uplinks[] comes from the RESOLVER (DT-27 read surface) --"
+
+# Production shape: NOTHING declares `config uplink` (`uci show rist2rist` lists
+# only main and @destination), so the WAN links live ONLY in the network config.
+# The read surface must enumerate them from the shared resolver -- the same
+# definition the init and the helper use -- not from the empty declared set. This
+# is the blindness DT-27 fixed in the init and the helper, left on the read side.
+wanlib="$here/../files/rist2rist-wan.sh"
+wan_sysfs="$tmp/wan-sysfs"
+mkdir -p "$wan_sysfs/wwan1"
+wan_net="$tmp/wan-network.show"
+cat > "$wan_net" <<'EOF'
+network.wwan0.proto='modemmanager'
+network.wwan1.device='/sys/devices/pci0000:00/0000:00:15.0/usb1/1-2'
+network.wwan1.proto='modemmanager'
+EOF
+
+export RIST2RIST_WAN_LIB="$wanlib"
+export WAN_LIB_NETWORK_FIXTURE="$wan_net"
+export WAN_LIB_SYSFS="$wan_sysfs"
+export STUB_UPLINKS=0
+
+# The resolver is the source of the LEG LIST; the helper only fills the figures.
+export MEASURE_CMD_TEST="$here/bin/measure-stub"
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config: with NO declared uplink, uplinks[] lists the resolver's WAN links" "$out" \
+	"{l['interface'] for l in d['uplinks']} == {'wwan0','wwan1'}"
+check "get_config: a network-only link carries an empty section and weight" "$out" \
+	"all(l['section']=='' and l['weight']=='' for l in d['uplinks'])"
+check "get_config: a network-only link's measured figures are null when the helper omits it" "$out" \
+	"any(l['interface']=='wwan0' and l['state'] is None and l['shaped_kbps'] is None and l['tx_bytes'] is None for l in d['uplinks'])"
+
+# The leg list must come from the RESOLVER, NOT the helper: a MISSING helper still
+# yields the WAN links, with every measured field null.
+unset MEASURE_CMD_TEST
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config: a missing helper does NOT empty uplinks[] (resolver is the source)" "$out" \
+	"d['ok'] is True and {l['interface'] for l in d['uplinks']} == {'wwan0','wwan1'} and all(l['shaped_kbps'] is None for l in d['uplinks'])"
+
+# The biting counter-example: NO declared uplink AND no resolver must still be []
+# (the exact blindness the resolver-driven construction fixes). It also proves the
+# partial-install fallback is intact rather than a crash.
+export RIST2RIST_WAN_LIB="$tmp/absent-resolver.sh"
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config: no declaration AND no resolver -> [] (the blindness this fixes)" "$out" \
+	"d['ok'] is True and d['uplinks'] == []"
+
+# Resolver present but the network declares no WAN link -> empty, well-formed.
+wan_empty="$tmp/wan-empty.show"
+: > "$wan_empty"
+export RIST2RIST_WAN_LIB="$wanlib"
+export WAN_LIB_NETWORK_FIXTURE="$wan_empty"
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config: a resolver with no WAN links yields [] without crashing" "$out" \
+	"d['ok'] is True and d['uplinks'] == []"
+
+# A declared `config uplink` is matched back to the resolver's link for its
+# section/weight -- the declaration contributes, it is not the source of the list.
+unset STUB_UPLINKS
+out=$(run 1 get_config "$(tb '{}')")
+check "get_config: a declaration supplies section/weight for a resolver link" "$out" \
+	"any(l['interface']=='wwan1' and l['section']=='up_b' and l['weight']=='3' for l in d['uplinks'])"
+
+unset RIST2RIST_WAN_LIB WAN_LIB_NETWORK_FIXTURE WAN_LIB_SYSFS 2>/dev/null || true
 
 echo
 if [ "$fails" -eq 0 ]; then

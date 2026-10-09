@@ -1,0 +1,49 @@
+#!/bin/sh
+# Test double for `mmcli`, for measure-selftest.sh.
+#
+# Mirrors the production target: exactly ONE modem, at ModemManager index 0,
+# which owns the net interface wwan1 -- so wwan1 maps to `mmcli -m 0`, NOT
+# `mmcli -m 1`. The helper must resolve the owner by reading the modem's
+# `ports:` line, not by assuming the interface number is the modem index.
+#
+#   MMCLI_STUB_MODEM -- ModemManager index of the (single) modem (default 0)
+#   MMCLI_STUB_IFACE -- the net interface that modem owns (default wwan1)
+#   MMCLI_STUB_RSSI  -- the RSSI to report; unset means the modem returns no
+#                       RSSI line (the production state: signal not polled)
+#
+# Any modem index other than MMCLI_STUB_MODEM fails, exactly as the real mmcli
+# does when asked for a modem that does not exist.
+MODEM=${MMCLI_STUB_MODEM:-0}
+IFACE=${MMCLI_STUB_IFACE:-wwan1}
+
+case "$*" in
+    "-L")
+        printf '/org/freedesktop/ModemManager1/Modem/%s [Tri Cascade Inc.] VOS_5G\n' "$MODEM"
+        ;;
+    "-m $MODEM")
+        # The only place the interface->modem mapping is visible: the ports line.
+        printf '  System   |            primary port: cdc-wdm0\n'
+        printf '           |                   ports: cdc-wdm0 (mbim), %s (net)\n' "$IFACE"
+        ;;
+    "-m $MODEM --signal-get")
+        printf '  -------------------------\n'
+        if [ -n "${MMCLI_STUB_RSSI:-}" ]; then
+            printf '  Signal quality: 71%% (good)\n'
+            printf '  -------------------------\n'
+            printf '  RSSI: %s dBm\n' "$MMCLI_STUB_RSSI"
+            printf '  RSRQ: -11 dBm\n'
+            printf '  RSRP: -78 dBm\n'
+        else
+            # Signal config only, no RSSI line: ModemManager is not polling.
+            printf '  Signal | refresh rate: 0 seconds\n'
+            printf '         | rssi threshold: 0 dBm\n'
+            printf '         | error rate threshold: 0\n'
+        fi
+        printf '  -------------------------\n'
+        ;;
+    *)
+        echo "mmcli stub: unsupported call: $*" >&2
+        exit 1
+        ;;
+esac
+exit 0

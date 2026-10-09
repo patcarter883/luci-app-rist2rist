@@ -1,0 +1,363 @@
+#!/bin/sh
+##########################################################################
+# rist2rist-measure -- a one-shot PASSIVE snapshot of every WAN leg.
+#
+# Prints ONE JSON object on stdout and exits 0.
+#
+# PASSIVE BY CONSTRUCTION. This helper only reads: sysfs counters, the live
+# qdisc, ModemManager signal, and the local UCI uplinks. It never writes config,
+# never reconfigures anything, and never generates network traffic. Sending probe
+# traffic -- the only thing that can produce a real throughput figure -- belongs
+# to a separate tool.
+#
+# "Unknown" is a first-class state. A value that cannot be read is emitted as
+# null with a state of "unknown"; it is NEVER emitted as 0. A fabricated number
+# is worse than an honest null, because a consumer cannot tell a real 0 from a
+# placeholder. An absent interface is the ordinary bench state (no modem
+# attached), reported as present:false / state "absent" without aborting the run
+# and without logging on every invocation.
+#
+# Two layers, deliberately:
+#   * emit_measurement() is the PURE core. It takes already-gathered text and
+#     returns the JSON decision. It reads no files and runs no external command,
+#     so it is fully unit-testable off-device.
+#   * the shell below it gathers the inputs and calls the core. All the contact
+#     with the system lives here.
+##########################################################################
+
+# Test hook: lets the package's own test harness stub /lib/functions.sh, exactly
+# as the rpcd plugin does. NO `set -u`: /lib/functions.sh reads $IPKG_INSTROOT
+# unguarded, and under set -u that aborts the shell (exit 2) before any work runs.
+FUNCTIONS_SH=${FUNCTIONS_SH:-/lib/functions.sh}
+. "$FUNCTIONS_SH"
+
+CONFIG=rist2rist
+
+# The shared WAN-link resolver (DT-27.3) -- the ONE definition of this box's WAN
+# links, also sourced by the init script. Absent (an older or partial install) is
+# NOT fatal: main falls back to the declared `config uplink` interfaces, so this
+# helper never crashes and never invents a link.
+WAN_LIB="${RIST2RIST_WAN_LIB:-/usr/lib/rist2rist/wan.sh}"
+WAN_LIB_LOADED=0
+if [ -r "$WAN_LIB" ]; then
+    # shellcheck source=/dev/null
+    . "$WAN_LIB" && WAN_LIB_LOADED=1
+fi
+
+# The netdev root. This is the SAME WAN_LIB_SYSFS override the resolver honours, so
+# a test can model a present or absent WAN link with no modem attached.
+WAN_SYSFS="${WAN_LIB_SYSFS:-/sys/class/net}"
+
+# ======================================================================
+# the pure core
+# ======================================================================
+
+# json_str <text> -- JSON string escaping. Pure shell, no external process, so
+# the core stays free of command execution. Same escaping as the rpcd plugin's
+# json_str (backslash and double-quote), applied here without sed.
+json_str() {
+    local in="$1" out="" ch
+    while [ -n "$in" ]; do
+        ch=${in%"${in#?}"}
+        case "$ch" in
+            '\') out="${out}\\\\" ;;
+            '"') out="${out}\\\"" ;;
+            *)   out="${out}${ch}" ;;
+        esac
+        in=${in#?}
+    done
+    printf '%s' "$out"
+}
+
+# jnum <text> -- render an integer as a bare JSON number, or null when it is
+# empty or not a plain integer. This is the ONE place unknown becomes null, so
+# no caller can accidentally emit a placeholder 0.
+jnum() {
+    local v="$1" neg=""
+    case "$v" in
+        -*) neg="-"; v=${v#-} ;;
+    esac
+    case "$v" in
+        ''|*[!0-9]*) printf 'null'; return ;;
+    esac
+    printf '%s%s' "$neg" "$v"
+}
+
+# emit_measurement <generated_at> <records>
+#
+# `records` is one line per configured uplink, fields '|'-separated (a
+# non-whitespace delimiter, so empty middle fields survive `read`):
+#   interface|present|shaped_kbps|tx_bytes|rx_bytes|tx_dropped|tx_overlimits|backlog_bytes|signal_dbm
+# An empty field means "could not be read" -> null. `present` is literal
+# true/false. The state rule: absent -> "absent"; present with a live shaper ->
+# "ok"; present with no shaper -> "unknown".
+emit_measurement() {
+    local generated_at="$1" records="$2"
+    local legs="" leg iface present shaped tx rx dropped overlimits backlog signal
+    local state pjson has_present=0 shaped_known=1 shaped_sum=0
+
+    # rtt_ms/jitter_ms/quality/measured_kbps/measured_at are always null: the
+    # per-leg RTT/quality live only in the running daemon's stats_json, which the
+    # init does NOT start it emitting (rist2rist needs `-S <statsinterval>`); that
+    # log line is the future source. measured_kbps likewise needs active probing,
+    # which this passive helper deliberately does not do.
+    while IFS='|' read -r iface present shaped tx rx dropped overlimits backlog signal; do
+        [ -z "$iface" ] && continue
+
+        if [ "$present" = "true" ]; then
+            pjson=true
+            has_present=$((has_present + 1))
+            if [ -n "$shaped" ]; then
+                state=ok
+                shaped_sum=$((shaped_sum + shaped))
+            else
+                state=unknown
+                shaped_known=0
+            fi
+        else
+            # An absent leg reports nothing. Force every field null rather than
+            # trust the caller -- a stray 0 here would be read as a measurement.
+            pjson=false
+            state=absent
+            shaped=""; tx=""; rx=""
+            dropped=""; overlimits=""; backlog=""; signal=""
+        fi
+
+        leg=$(printf '{"interface":"%s","present":%s,"state":"%s","shaped_kbps":%s,"tx_bytes":%s,"rx_bytes":%s,"tx_dropped":%s,"tx_overlimits":%s,"backlog_bytes":%s,"signal_dbm":%s,"rtt_ms":null,"jitter_ms":null,"quality":null,"measured_kbps":null,"measured_at":null}' \
+            "$(json_str "$iface")" "$pjson" "$state" \
+            "$(jnum "$shaped")" "$(jnum "$tx")" "$(jnum "$rx")" \
+            "$(jnum "$dropped")" "$(jnum "$overlimits")" "$(jnum "$backlog")" \
+            "$(jnum "$signal")")
+        legs="${legs:+$legs,}$leg"
+    done <<RECORDS_EOF
+$records
+RECORDS_EOF
+
+    # The aggregate carries a STATE so a consumer can tell the two kinds of
+    # "no usable total" apart: no leg is present at all ("unknown"), versus a
+    # present leg whose shaper could not be read ("partial"). The state also
+    # gates the sum, keeping the total honest:
+    #   no present legs                 -> "unknown", shaped_kbps null
+    #   every present leg shaped        -> "ok",      shaped_kbps = the total
+    #   some present legs shaped        -> "partial", shaped_kbps null
+    # A partial sum presented as a whole is a fabrication just like a placeholder
+    # 0, so shaped_kbps stays null unless the total is COMPLETE.
+    local agg_state=unknown agg_shaped=null
+    if [ "$has_present" -gt 0 ]; then
+        if [ "$shaped_known" -eq 1 ]; then
+            agg_state=ok
+            agg_shaped=$shaped_sum
+        else
+            agg_state=partial
+        fi
+    fi
+    # measured_kbps is per-leg null, and a total is null when any input is null.
+    local agg_measured=null
+
+    printf '{"generated_at":"%s","legs":[%s],"aggregate":{"state":"%s","shaped_kbps":%s,"measured_kbps":%s}}\n' \
+        "$(json_str "$generated_at")" "$legs" "$agg_state" "$agg_shaped" "$agg_measured"
+}
+
+# ======================================================================
+# the I/O shell
+# ======================================================================
+
+# Records accumulated by collect_leg, read back by main. A global because
+# config_foreach runs its callback in THIS shell, not a subshell (see the init
+# script): the callback appends, main reads back afterwards.
+RECORDS=""
+
+# append_leg <iface> <present> <shaped> <tx> <rx> <dropped> <over> <backlog> <signal>
+append_leg() {
+    RECORDS="${RECORDS}${1}|${2}|${3}|${4}|${5}|${6}|${7}|${8}|${9}
+"
+}
+
+# A cumulative sysfs counter, or nothing if it cannot be read.
+sysfs_counter() { # sysfs_counter <iface> <stat>
+    local f="/sys/class/net/$1/statistics/$2"
+    [ -r "$f" ] || return 0
+    cat "$f" 2>/dev/null
+}
+
+# scale <number> <kbit-factor> -- integer kbit/s. awk so a fractional value (a
+# CAKE bandwidth can be, e.g. 9.5Mbit) is handled without shell float math.
+scale_kbps() { # scale_kbps <number> <factor>
+    printf '%s\n' "$1" | awk -v f="$2" '{ printf "%d", $1 * f }'
+}
+
+# tc_fill <iface> -- set TC_SHAPED/TC_DROPPED/TC_OVERLIMITS/TC_BACKLOG from the
+# live qdisc. Empty means "could not be read".
+#
+# The configured rate is the `bandwidth <N><unit>bit` value on the qdisc line.
+# It is deliberately read from THAT line and not from the `capacity estimate:`
+# line: tc -s prints a capacity estimate that merely echoes CAKE's OWN configured
+# bandwidth back, and presenting it as a link measurement would be a lie.
+#
+# If there is no bandwidth token the qdisc is not our shaper (e.g. noqueue), so
+# the counters are not CAKE's either and stay unknown -- again, not 0.
+tc_fill() { # tc_fill <iface>
+    TC_SHAPED=""; TC_DROPPED=""; TC_OVERLIMITS=""; TC_BACKLOG=""
+    command -v tc >/dev/null 2>&1 || return 0
+
+    local out bw num unit
+    out=$(tc -s qdisc show dev "$1" 2>/dev/null) || return 0
+    [ -n "$out" ] || return 0
+
+    bw=$(printf '%s\n' "$out" \
+        | sed -n 's/.*[[:space:]]bandwidth[[:space:]]\([0-9][0-9.]*\)\([KMG]*\)bit.*/\1 \2/p' \
+        | head -n 1)
+    if [ -n "$bw" ]; then
+        num=${bw% *}
+        unit=${bw#* }
+        case "$unit" in
+            G) TC_SHAPED=$(scale_kbps "$num" 1000000) ;;
+            M) TC_SHAPED=$(scale_kbps "$num" 1000) ;;
+            K) TC_SHAPED=$(scale_kbps "$num" 1) ;;
+            *) TC_SHAPED=$(scale_kbps "$num" 0.001) ;;
+        esac
+    fi
+
+    if [ -z "$TC_SHAPED" ]; then
+        return 0
+    fi
+
+    TC_DROPPED=$(printf '%s\n' "$out" \
+        | sed -n 's/.*(dropped \([0-9][0-9]*\).*/\1/p' | head -n 1)
+    TC_OVERLIMITS=$(printf '%s\n' "$out" \
+        | sed -n 's/.*overlimits \([0-9][0-9]*\).*/\1/p' | head -n 1)
+    TC_BACKLOG=$(printf '%s\n' "$out" \
+        | sed -n 's/^[[:space:]]*backlog \([0-9][0-9]*\)b.*/\1/p' | head -n 1)
+}
+
+# modem_index_for_iface <iface> -- the ModemManager index whose modem owns this
+# net interface, or nothing.
+#
+# The interface number is NOT the modem index: on the target wwan1 belongs to
+# ModemManager Modem/0, so `wwanN -> N` is wrong and `mmcli -m N` fails. There
+# is no mapping in `mmcli -L`; the owner is only in the per-modem detail, whose
+# `ports:` line names every interface the modem exposes, e.g.
+#   ports: cdc-wdm0 (mbim), wwan1 (net)
+# so we enumerate the modems `mmcli -L` lists and ask each one. If no modem
+# claims the interface, the result is empty -- never a numeric guess.
+modem_index_for_iface() { # modem_index_for_iface <iface>
+    local iface="$1" n ports w
+    [ -n "$iface" ] || return 0
+    mmcli -L 2>/dev/null \
+        | sed -n 's#.*/Modem/\([0-9][0-9]*\).*#\1#p' \
+        | while IFS= read -r n; do
+            [ -n "$n" ] || continue
+            # Compare the interface as a LITERAL word, never as a regex: the name
+            # comes from UCI, so a regex metacharacter in it could otherwise match
+            # a DIFFERENT modem's port and return a WRONG index -- strictly worse
+            # than reporting nothing. Splitting on commas and spaces leaves the
+            # bare interface names out of a line like
+            #   ports: cdc-wdm0 (mbim), wwan1 (net)
+            # mmcli prints a detail table, so the field sits after a '|' rather
+            # than at the start of the line -- anchor on 'ports:' itself, not on
+            # the line start, or nothing matches and the lookup silently fails.
+            ports=$(mmcli -m "$n" 2>/dev/null \
+                | sed -n 's/.*ports:[[:space:]]*//p')
+            for w in $(printf '%s' "$ports" | tr ',' ' '); do
+                if [ "$w" = "$iface" ]; then
+                    printf '%s\n' "$n"
+                    break
+                fi
+            done
+        done
+}
+
+# modem_signal <iface> -- RSSI in dBm for the modem backing this WWAN leg, or
+# nothing.
+#
+# The modem index is RESOLVED from the interface (see modem_index_for_iface); if
+# no modem owns the interface, or mmcli is absent or reports no such modem, the
+# signal is left unknown rather than guessed. The value is only present when
+# ModemManager is actually polling the signal: with a 0-second refresh rate the
+# `-m <n> --signal-get` output carries config only and no RSSI line, in which
+# case the result is legitimately empty and stays null. We never trigger a
+# refresh -- this helper changes nothing.
+modem_signal() { # modem_signal <iface>
+    command -v mmcli >/dev/null 2>&1 || return 0
+    local n
+    n=$(modem_index_for_iface "$1")
+    [ -n "$n" ] || return 0
+    mmcli -m "$n" --signal-get 2>/dev/null \
+        | sed -n 's/.*RSSI:[[:space:]]*\(-\)\?\([0-9][0-9]*\)[[:space:]]*dBm.*/\1\2/p' \
+        | head -n 1
+}
+
+# Gather one leg by INTERFACE NAME. (The per-leg body is unchanged from the old
+# config_foreach callback -- only WHICH interfaces it is called for changed: DT-27
+# measures this box's WAN links, not only the declared `config uplink` set, and
+# absence is a property of the interface, not of a config section.)
+collect_leg_iface() {
+    local interface="$1"
+    [ -n "$interface" ] || return 0
+
+    if [ ! -e "${WAN_SYSFS}/${interface}" ]; then
+        # The NORMAL bench state with no modem attached. Report it as absent and
+        # carry on. No logger call: a missing leg must not fill the log on every
+        # invocation.
+        append_leg "$interface" false "" "" "" "" "" "" ""
+        return 0
+    fi
+
+    tc_fill "$interface"
+    append_leg "$interface" true "$TC_SHAPED" \
+        "$(sysfs_counter "$interface" tx_bytes)" \
+        "$(sysfs_counter "$interface" rx_bytes)" \
+        "$TC_DROPPED" "$TC_OVERLIMITS" "$TC_BACKLOG" \
+        "$(modem_signal "$interface")"
+}
+
+# The declared `config uplink` interfaces, one per line. Used ONLY when the shared
+# resolver is not installed, so an older box keeps measuring exactly what it did.
+print_declared_uplink() {
+    local cfg="$1" interface
+    config_get interface "$cfg" 'interface'
+    [ -n "$interface" ] && printf '%s\n' "$interface"
+    return 0
+}
+
+main() {
+    config_load "$CONFIG"
+    RECORDS=""
+
+    # DT-27: the legs to measure are THIS BOX's WAN links (the union the shared
+    # resolver defines), NOT only the `config uplink` bonding selection -- CAKE is
+    # configured per interface, so a single-WAN box is a leg set of ONE, not an
+    # empty one. If the resolver is not installed, fall back to the declared
+    # uplinks so an older box keeps measuring what it always did.
+    local links iface
+    if [ "$WAN_LIB_LOADED" -eq 1 ]; then
+        links="$(wan_links)"
+    else
+        links="$(config_foreach print_declared_uplink uplink)"
+    fi
+
+    # Iterate with a here-doc, NOT a pipe: a pipe would run this loop -- and thus
+    # append_leg -- in a subshell, and the accumulated RECORDS would be lost.
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        collect_leg_iface "$iface"
+    done <<WAN_LINKS_EOF
+$links
+WAN_LINKS_EOF
+
+    emit_measurement "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RECORDS"
+}
+
+# Run by default -- when executed as a file, and equally when piped in as
+# `sh -s`, where $0 is just "sh" and no filename can be matched. Sourcing must
+# therefore OPT OUT explicitly rather than opt in: a run that silently prints
+# nothing and exits 0 is the worst failure mode, because a consumer parses an
+# empty string as "nothing to report" instead of "the tool did not run". Tests
+# set RIST2RIST_MEASURE_LIB_ONLY=1 to reach the pure core.
+#
+# Reaching EOF already exits, so there is deliberately no `exit` here: an `exit`
+# would terminate the CALLER when this file is sourced without the opt-out,
+# turning a forgotten env var into a killed shell instead of stray output.
+if [ -z "${RIST2RIST_MEASURE_LIB_ONLY:-}" ]; then
+    main "$@"
+fi

@@ -1,0 +1,40 @@
+#!/bin/sh
+# Test double for `tc`, for measure-selftest.sh.
+#
+# The helper only ever runs `tc -s qdisc show dev <iface>`, so the shape it sees
+# is driven by TC_STUB_MODE:
+#   cake    -- a live CAKE shaper: a "bandwidth 8Mbit" rate on the qdisc line plus
+#              the Sent/backlog counters. The trailing "capacity estimate:" line
+#              echoes CAKE's OWN configured rate and must be IGNORED, so it is
+#              present here exactly as a real kernel prints it.
+#   noqueue -- a qdisc with NO bandwidth token (no shaper installed). The helper
+#              must report an unknown shape, never 0.
+#
+# Anything other than the one call the helper makes fails loudly.
+if [ "$1 $2" != "-s qdisc" ] || [ "$3 $4" != "show dev" ]; then
+    echo "tc stub: unsupported call: $*" >&2
+    exit 1
+fi
+
+case "${TC_STUB_MODE:-cake}" in
+    cake)
+        cat <<'EOF'
+qdisc cake 8001: root refcnt 2 bandwidth 8Mbit diffserv3 triple-isolate nonat nowash no-ack-filter rtt 100.0ms
+ Sent 4096 bytes 32 pkt (dropped 3, overlimits 7 requeues 0)
+ backlog 1337b 2p requeues 0
+ capacity estimate: 8Mbit
+EOF
+        ;;
+    noqueue)
+        cat <<'EOF'
+qdisc noqueue 0: root refcnt 2
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+EOF
+        ;;
+    *)
+        echo "tc stub: unknown TC_STUB_MODE: $TC_STUB_MODE" >&2
+        exit 1
+        ;;
+esac
+exit 0

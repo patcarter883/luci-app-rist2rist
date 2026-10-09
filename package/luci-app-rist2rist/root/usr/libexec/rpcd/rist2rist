@@ -6,13 +6,16 @@
 #   rist2rist.release     (token)    return the bridge to unclaimed
 #   rist2rist.status      (token)    running state, pid and the REAL effective argv
 #   rist2rist.get_config  (token)    the UCI configuration as structured JSON
+#   rist2rist.wan_status  (token)    the passive per-leg measurement snapshot (read-only)
 #   rist2rist.set_config  (token)    apply a whitelisted config object, then commit
 #   rist2rist.reconcile   (token)    apply listen_url + outputs only (the "adopt" action)
 #
 # A destination is an ADDRESS ONLY. The encoder names the cloud POP to send to;
-# which of this router's WAN links carry it, and their weights, are local `config
-# uplink` sections and are NOT settable through this API -- they are reported
-# read-only in get_config's `uplinks` array so a client can display them.
+# which of this router's WAN links carry it, and their weights, are resolved
+# locally -- the WAN links from the shared resolver, their weights from any
+# `config uplink` section naming them -- and are NOT settable through this API.
+# They are reported read-only in get_config's `uplinks` array so a client can
+# display them.
 #   rist2rist.reload      (token)    restart the procd instance to activate the config
 #
 # AUTHENTICATION HAPPENS IN THIS PLUGIN, not by an rpcd session login. rpcd's exec
@@ -52,6 +55,59 @@ FUNCTIONS_SH=${FUNCTIONS_SH:-/lib/functions.sh}
 # cannot reach it.
 RELOAD_CMD=${RELOAD_CMD:-/etc/init.d/rist2rist}
 
+# Test hook: the passive per-leg measurement helper -- the READ path for the
+# observed figures. An absolute path, like RELOAD_CMD, so PATH stubbing cannot
+# reach it.
+MEASURE_CMD=${MEASURE_CMD:-/usr/sbin/rist2rist-measure}
+
+# Test hook: the ACTIVE probe tool -- the instrument the calibration run drives.
+# Absolute, like MEASURE_CMD, so PATH stubbing cannot reach it.
+PROBE_CMD=${PROBE_CMD:-/usr/sbin/rist2rist-probe}
+
+# The scale a measured leg's weight is expressed in: the fastest measured leg gets
+# this, every other leg a proportional share, floored at 1. libRIST balances by the
+# RATIO of weights (a weighted round-robin over ctx->total_weight in src/udp.c), so
+# the unit is arbitrary -- 100 is for granularity: a leg at a tenth of the fastest
+# still gets 10, and one at a hundredth still gets the floor rather than 0.
+# weight 0 is NOT "unused": RIST_PEER_WEIGHT_DUPLICATE (include/librist/peer.h)
+# means DUPLICATE every packet, so 0 is never written for a bonded leg.
+# A possibly-empty string as a JSON string, or null when empty -- for the
+# provenance fields, where "" would read as a value and null is the honest
+# "we have none".
+measure_json_str() {
+	if [ -z "$1" ]; then printf 'null'; else printf '"%s"' "$(json_str "$1")"; fi
+}
+
+CAPACITY_WEIGHT_SCALE=${CAPACITY_WEIGHT_SCALE:-100}
+
+# Where each leg's calibration result is kept. PER LEG, because the tool's default
+# is ONE file: a two-leg run would overwrite the first leg's figure with the
+# second's, and the leg that vanished from the record is the one a later reader
+# most wants.
+PROBE_STATE_DIR=${PROBE_STATE_DIR:-/var/run/rist2rist}
+
+# The probe's own credential, where the deployment puts it. This IS the default:
+# it lives here rather than only in /etc/config because a package upgrade does not
+# overwrite an existing config, so a bridge installed before `probe_psk_file`
+# existed has no such option and config_get would hand the tool an empty
+# `--psk-file ""`. The UCI option is the operator's override.
+DEFAULT_PROBE_PSK=${DEFAULT_PROBE_PSK:-/etc/rist2rist-probe/psk}
+
+# The shared WAN-link resolver (DT-27.3) -- the ONE definition of this box's WAN
+# links, also sourced by the init script and the measurement helper. An absolute
+# path with an override, like MEASURE_CMD, because it is a TEST hook too.
+#
+# Sourcing it is GUARDED: on a partial/older install the file is absent, and
+# WAN_LIB_LOADED stays 0. get_config then falls back to the declared `config
+# uplink` sections (the pre-DT-27 behaviour), so a partial install cannot turn the
+# uplinks array empty or break the response.
+WAN_LIB=${RIST2RIST_WAN_LIB:-/usr/lib/rist2rist/wan.sh}
+WAN_LIB_LOADED=0
+if [ -r "$WAN_LIB" ]; then
+	# shellcheck source=/dev/null
+	. "$WAN_LIB" && WAN_LIB_LOADED=1
+fi
+
 CONFIG=rist2rist
 
 # Minimal JSON string escaping for values (URLs/paths) that can contain quotes.
@@ -75,8 +131,28 @@ redact_url() { # redact_url <text>
 	printf '%s' "$1" | sed -E 's/(secret=)[^&"[:space:]]*/\1REDACTED/g'
 }
 
-err() { # err <code> <message>
-	printf '{"ok":false,"error":"%s","message":"%s"}\n' "$1" "$(json_str "$2")"
+# The shaper's service. Overridable so the off-device suite can supply one.
+SQM_INIT="${SQM_INIT:-/etc/init.d/sqm}"
+
+# A shaper is set to the measured usable capacity less this margin. It has to BE
+# the bottleneck: shaping AT the capacity still lets the link's own queue fill at
+# the top of every burst, and shaping ABOVE it -- what an untouched 8 Mbit shaper
+# is on a 500 kbit/s leg -- never engages at all.
+CAPACITY_MARGIN_PCT="${CAPACITY_MARGIN_PCT:-90}"
+
+# How many times the standard test is run per leg. A single raw sample on a mobile
+# leg is not a capacity: measured minutes apart, the same leg gave 500, 750, 500,
+# 750, and a shaper set from whichever one it caught inherits that whichever it is.
+# The MEDIAN of the repeats is used. An ODD count keeps the median an actually
+# measured value rather than an average of two that were never measured as such;
+# an even count takes the lower middle for the same reason.
+CALIBRATE_REPEATS="${CALIBRATE_REPEATS:-3}"
+
+err() { # err <code> <message> [legs-json] [shaper]
+	local extra=""
+	[ -n "$3" ] && extra="$extra,\"legs\":[$3]"
+	[ -n "$4" ] && extra="$extra,\"shaper\":\"$4\""
+	printf '{"ok":false,"error":"%s","message":"%s"%s}\n' "$1" "$(json_str "$2")" "$extra"
 }
 
 # ======================================================================
@@ -97,29 +173,157 @@ emit_output() {
 		"$(json_str "$cfg")" "$(json_str "$address")"
 }
 
-# config_foreach callback: one JSON object per configured WAN uplink.
+# ======================================================================
+# the passive measurement snapshot (the read path)
+# ======================================================================
+
+# Run the measurement helper and echo its JSON on success. Returns non-zero with
+# no output when the helper is missing or its output is not a valid JSON object.
+# This is the ONE definition of "the helper's result", so wan_status and
+# get_config validate it identically -- and neither can hand a caller a
+# fabricated value.
+#
+# The brace test alone would accept `{garbage}`, i.e. hand a caller malformed
+# JSON while this method claims to have checked it. jsonfilter is already how
+# this plugin reads JSON, so it is the honest check; `-e '@'` yields the document
+# itself and fails on anything unparseable.
+run_measure() {
+	local out
+	[ -x "$MEASURE_CMD" ] || return 1
+	out=$("$MEASURE_CMD" 2>/dev/null)
+	case "$out" in
+		"{"*"}") ;;
+		*) return 1 ;;
+	esac
+	printf '%s' "$out" | jsonfilter -e '@' >/dev/null 2>&1 || return 1
+	printf '%s' "$out"
+	return 0
+}
+
+# The snapshot read ONCE per get_config and reused for every leg: the helper is a
+# one-shot probe, not a cheap file read, so it must not run per section. Empty
+# when unavailable -- the measured fields then stay null, the honest "unknown".
+MEASURE_JSON=""
+load_measure() {
+	MEASURE_JSON=$(run_measure) || MEASURE_JSON=""
+}
+
+# The index in the current snapshot of the leg whose interface matches $1, or
+# empty when the snapshot carries no such leg. jsonfilter cannot match a key
+# against a value, so the legs are walked by index. Empty is a legitimate answer:
+# an absent leg is normal, not an error.
+measure_leg_index() { # measure_leg_index <iface>
+	local i=0 iface
+	[ -n "$MEASURE_JSON" ] || return 0
+	while :; do
+		iface=$(printf '%s' "$MEASURE_JSON" | jsonfilter -e "@.legs[$i].interface" 2>/dev/null)
+		[ -z "$iface" ] && break
+		if [ "$iface" = "$1" ]; then printf '%s' "$i"; return 0; fi
+		i=$((i + 1))
+	done
+}
+
+# One measured field as a JSON token. jsonfilter prints a string bare, so a string
+# is re-quoted and escaped here; a number/boolean is passed through. A value the
+# snapshot does not carry -- or a leg it does not cover -- is emitted as null,
+# NEVER 0 or a default, so "unknown" survives the read path.
+measure_field_json() { # measure_field_json <leg-index-or-empty> <field> <str|num>
+	local v=""
+	[ -n "$1" ] && v=$(printf '%s' "$MEASURE_JSON" | jsonfilter -e "@.legs[$1].$2" 2>/dev/null)
+	case "$v" in
+		''|null) printf 'null'; return 0 ;;
+	esac
+	case "$3" in
+		str) printf '"%s"' "$(json_str "$v")" ;;
+		*)   printf '%s' "$v" ;;
+	esac
+}
+
+# "interface shaper-kbps quality held" lines for the CONFIRMATION run each shaped
+# leg got, and "interface value" lines for what was applied. Reported, so the
+# result says what the box was actually configured to.
+SHAPER_SET=""
+CONFIRMED=""
+
+# config_foreach callback: record a `config uplink` section as "section interface
+# weight" lines, collected ONCE per get_config. config_foreach runs its callback
+# in THIS shell (it does not fork), so the append survives to the lookup below.
+#
+# These sections no longer DEFINE the leg list (the resolver does); they are kept
+# only so a resolver-sourced interface can be matched back to the section naming
+# it, for its `section`/`weight` fields.
+UPLINK_DECLARED=""
+collect_uplink() {
+	local cfg="$1" interface weight
+	config_get interface "$cfg" interface
+	[ -z "$interface" ] && return 0
+	config_get weight "$cfg" weight
+	UPLINK_DECLARED="${UPLINK_DECLARED}${cfg} ${interface} ${weight}
+"
+}
+
+# One JSON object per WAN link, keyed on the interface name.
 #
 # READ-ONLY to callers by design: which physical links exist, and how traffic is
 # shared across them, is the router's own business and is configured locally. It
 # is reported only so a client can SHOW what a bridge is bonded across.
-# `present` reflects whether the interface exists right now, which is why a leg
-# can be configured and legitimately idle.
-emit_uplink() {
-	local cfg="$1" interface weight present
-	config_get interface "$cfg" interface
-	config_get weight    "$cfg" weight
-	[ -z "$interface" ] && return 0
-	[ -e "/sys/class/net/${interface}" ] && present=true || present=false
-	printf '{"section":"%s","interface":"%s","weight":"%s","present":%s},' \
-		"$(json_str "$cfg")" "$(json_str "$interface")" \
+#
+# The leg list comes from the RESOLVER (the shared definition of this box's WAN
+# links), NOT from the helper -- so even a missing or garbage helper still yields
+# the WAN links, with the measured fields null. It is also not taken from the
+# declared sections alone, which are EMPTY on the production box (nothing declares
+# `config uplink`), the very blindness DT-27 fixed elsewhere.
+#
+# `section`/`weight` come from a `config uplink` section that names THIS interface,
+# and stay the empty string when none does -- a network WAN need have no
+# declaration. The DECLARED leg and its OBSERVED state (the passive helper's
+# per-leg figures) are merged into ONE object, so a single get_config shows both.
+emit_uplink() { # emit_uplink <interface>
+	local interface="$1" section="" weight="" idx present sec have w
+	while read -r sec have w; do
+		[ "$have" = "$interface" ] || continue
+		section="$sec"; weight="$w"
+		break
+	done <<UPLINK_DECLARED_EOF
+$UPLINK_DECLARED
+UPLINK_DECLARED_EOF
+	idx=$(measure_leg_index "$interface")
+	# `present` prefers the snapshot when the helper covered this leg, so it is the
+	# SAME observation as the merged figures and the two cannot disagree. It falls
+	# back to the interface's existence -- the resolver's own definition, which is
+	# also what lets a leg be configured and legitimately idle -- when there is no
+	# snapshot, or the helper reported no usable boolean.
+	present=$(measure_field_json "$idx" present num)
+	case "$present" in
+		true|false) ;;
+		*) [ -e "${WAN_LIB_SYSFS:-/sys/class/net}/${interface}" ] && present=true || present=false ;;
+	esac
+	printf '{"section":"%s","interface":"%s","weight":"%s","present":%s,' \
+		"$(json_str "$section")" "$(json_str "$interface")" \
 		"$(json_str "$weight")" "$present"
+	printf '"state":%s,"shaped_kbps":%s,"tx_bytes":%s,"rx_bytes":%s,' \
+		"$(measure_field_json "$idx" state str)" \
+		"$(measure_field_json "$idx" shaped_kbps num)" \
+		"$(measure_field_json "$idx" tx_bytes num)" \
+		"$(measure_field_json "$idx" rx_bytes num)"
+	printf '"tx_dropped":%s,"tx_overlimits":%s,"backlog_bytes":%s,"signal_dbm":%s,' \
+		"$(measure_field_json "$idx" tx_dropped num)" \
+		"$(measure_field_json "$idx" tx_overlimits num)" \
+		"$(measure_field_json "$idx" backlog_bytes num)" \
+		"$(measure_field_json "$idx" signal_dbm num)"
+	printf '"rtt_ms":%s,"jitter_ms":%s,"quality":%s,"measured_kbps":%s,"measured_at":%s},' \
+		"$(measure_field_json "$idx" rtt_ms num)" \
+		"$(measure_field_json "$idx" jitter_ms num)" \
+		"$(measure_field_json "$idx" quality num)" \
+		"$(measure_field_json "$idx" measured_kbps num)" \
+		"$(measure_field_json "$idx" measured_at str)"
 }
 
 method_get_config() {
 	local listen_url profile out_profile managed claimed
 	local enabled verbose_log loglevel
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
-	local outputs uplinks token_hash
+	local outputs uplinks token_hash iface sec w
 
 	config_load "$CONFIG"
 
@@ -141,8 +345,39 @@ method_get_config() {
 	# definition, so the two can never disagree.
 	[ -n "$token_hash" ] && claimed=1 || claimed=0
 
+	# The observed per-leg figures, read once and merged into each uplink below.
+	load_measure
+
 	outputs=$(config_foreach emit_output destination)
-	uplinks=$(config_foreach emit_uplink uplink)
+
+	# The `config uplink` sections, collected once so an interface can be matched
+	# back to the section (if any) that names it for its section/weight fields.
+	UPLINK_DECLARED=""
+	config_foreach collect_uplink uplink
+
+	# The leg list is the RESOLVER's WAN links -- the SAME shared definition the
+	# init and the helper use -- NOT the declared sections (empty on the production
+	# box) and NOT the helper (a missing/garbage helper must still yield the links,
+	# with null measured fields).
+	uplinks=""
+	if [ "$WAN_LIB_LOADED" -eq 1 ]; then
+		while IFS= read -r iface; do
+			[ -n "$iface" ] || continue
+			uplinks="${uplinks}$(emit_uplink "$iface")"
+		done <<WAN_LINKS_EOF
+$(wan_links)
+WAN_LINKS_EOF
+	else
+		# Resolver absent (a partial/older install): fall back to the declared
+		# `config uplink` sections -- the pre-DT-27 behaviour -- so the response is
+		# never empty on a box that never had the resolver.
+		while read -r sec iface w; do
+			[ -n "$iface" ] || continue
+			uplinks="${uplinks}$(emit_uplink "$iface")"
+		done <<UPLINK_DECLARED_EOF
+$UPLINK_DECLARED
+UPLINK_DECLARED_EOF
+	fi
 
 	printf '{'
 	printf '"ok":true,'
@@ -196,6 +431,526 @@ method_status() {
 
 	printf '{"ok":true,"running":%s,"pid":"%s","argv":"%s"}\n' \
 		"$running" "$(json_str "$pid")" "$(json_str "$argv")"
+}
+
+# READ-ONLY: the passive snapshot of this router's WAN legs. The helper's JSON is
+# passed through UNCHANGED -- its nulls are the honest "unknown" and must not be
+# turned into 0 or a default here. A missing helper, or output that is not a JSON
+# object, is a JSON error, never an empty object: a caller must be able to tell
+# "no measurement" from "all zero". Per-leg capacity stays here and NEVER reaches
+# the frozen wan_telemetry OOB message.
+method_wan_status() {
+	local out
+	if ! out=$(run_measure); then
+		err measure_unavailable "the measurement helper ($MEASURE_CMD) is missing or produced no usable output"
+		return 0
+	fi
+	printf '%s\n' "$out"
+}
+
+# ======================================================================
+# the ACTIVE calibration run (DT-28)
+# ======================================================================
+
+# Run the ACTIVE probe against the configured endpoint, one WAN leg at a time, and
+# report each leg's highest clean carried rate.
+#
+# PRE-START ONLY (DT-26). The probe PUTS TRAFFIC on the link, so while a session
+# is running it is a REFUSAL, not a de-prioritisation: it would steal capacity
+# from the very stream being measured. Enforced here as well as in the tool,
+# because THIS is the path an operator's button reaches.
+#
+# The run is the long pole -- a ramp spends tens of seconds per leg -- so a client
+# MUST allow a long call. Every leg is reported INCLUDING one that refused or
+# failed: a caller must be able to tell "no clean rate on wwan1" from "wwan1 was
+# never measured", so a leg is never silently dropped from the array, and a leg
+# that refused never hands back figures to shape from.
+# --- the shaper, cleared for the measurement --------------------------------
+# A leg measured THROUGH its own shaper is not measured. CAKE caps the rate and
+# flattens the queue, so the probe would read the qdisc's rate instead of the
+# link's, and a ramp behind a low shaper climbs to its own ceiling and calls that
+# `clean_to_ceiling`. Ordering -- calibrate before shaping -- only works the FIRST
+# time: a bridge arriving at a second event still shaped from the last one would
+# derive every weight from the shaper. So calibrate CLEARS it, measures, and puts
+# it back on EVERY exit including a failure, because the shaper belongs to the
+# operator and not to this run.
+#
+# CAKE on OpenWrt runs through an IFB (ifb4<iface>), the device the init also
+# names, so a cake qdisc there is the ONE signal that a leg is shaped.
+shape_up() { # shape_up <iface>
+	tc -s qdisc show dev "ifb4$1" 2>/dev/null | grep -q 'qdisc cake'
+}
+
+shape_suspend() { # shape_suspend "<ifaces>" -> echoes the ifaces it CLEARED
+	local iface cleared=""
+
+	[ -x "$SQM_INIT" ] || { printf '%s' ""; return 0; }
+	for iface in $1; do
+		shape_up "$iface" || continue
+		"$SQM_INIT" stop >/dev/null 2>&1
+		cleared="$cleared $iface"
+	done
+	printf '%s' "$cleared"
+}
+
+shape_resume() { # shape_resume "<cleared ifaces>" -> echoes "" / restored / restore_failed
+	local iface
+
+	[ -n "$1" ] || { printf '%s' ""; return 0; }
+	"$SQM_INIT" start >/dev/null 2>&1
+	# Do not CLAIM it came back -- check it. A calibration that silently leaves the
+	# operator's WAN unshaped is worse than one that says it could not restore it.
+	for iface in $1; do
+		shape_up "$iface" || { printf '%s' "restore_failed"; return 0; }
+	done
+	printf '%s' "restored"
+}
+
+# Run the standard test CALIBRATE_REPEATS times and keep the run whose rate is the
+# MEDIAN of the ones that measured. Echoes that repeat's index (0 when none of them
+# produced a rate); each repeat's own JSON and exit code are left beside the state
+# file as <sf>.r<i> and <sf>.rc<i>, so the caller can read the diagnostics of the run
+# it actually chose -- and so can anyone looking at the box afterwards.
+calibrate_ramp() { # calibrate_ramp <iface> <statefile> -> echoes the chosen index
+	local iface="$1" sf="$2" i=0 n="$CALIBRATE_REPEATS" med=""
+
+	[ "$n" -ge 1 ] 2>/dev/null || n=1
+	rm -f "${sf}.r"* 2>/dev/null
+	: > "${sf}.rates"
+	while [ "$i" -lt "$n" ]; do
+		i=$((i + 1))
+		"$PROBE_CMD" "$iface" -u "$endpoint" --psk-file "$pskfile" \
+			--state-file "$sf" -j > "${sf}.r${i}" 2>/dev/null
+		printf '%s' "$?" > "${sf}.rc${i}"
+		printf '%s\n' "$(jsonfilter -e '@.measured_kbps' < "${sf}.r${i}" 2>/dev/null)" \
+			>> "${sf}.rates"
+	done
+	# Nonzero rates only: a repeat that carried nothing did not measure, and it is not
+	# a zero to be medianed "away" -- it is reported in the array beside this.
+	med=$(grep -vE '^$|^0$|^null$' "${sf}.rates" 2>/dev/null \
+		| sort -n | awk '{ v[NR] = $1 } END { if (NR == 0) exit 1; print v[int((NR + 1) / 2)] }')
+	# No repeat measured: report the LAST one anyway, because its exit code is the
+	# whole answer. Returning 0 here would point the caller at a file that does not
+	# exist, lose the tool's exit code, and turn a deliberate refusal (exit 3) into
+	# a failed measurement -- exactly the distinction the exit codes exist to carry.
+	[ -n "$med" ] || { printf '%s' "$n"; return 0; }
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		i=$((i + 1))
+		[ "$(jsonfilter -e '@.measured_kbps' < "${sf}.r${i}" 2>/dev/null)" = "$med" ] && break
+	done
+	printf '%s' "$i"
+}
+
+sqm_queue_for() { # sqm_queue_for <iface> -> echoes the sqm queue's index, or ""
+	local i=0 q_if
+
+	while :; do
+		# `.interface`, NOT the bare section key: `uci get sqm.@queue[0]` returns the
+		# section's TYPE ("queue") and never the interface, so matching on the bare
+		# key finds no leg on ANY real box -- silently, leaving the shaper unset
+		# while the run reports success.
+		q_if=$(uci -q get "sqm.@queue[$i].interface" 2>/dev/null | head -1)
+		[ -n "$q_if" ] || break
+		[ "$q_if" = "$1" ] && { printf '%s' "$i"; return 0; }
+		i=$((i + 1))
+	done
+	printf '%s' ""
+}
+
+# Configure the shaper a leg was measured to need: its own SQM queue, set to the
+# measured usable capacity less the margin. The queue for a leg is the one whose
+# `interface` IS that leg -- a box with no queue for it is simply not shaped on
+# that leg, and inventing one would be a second opinion about the network config.
+shape_configure() { # shape_configure <iface> <kbps> -> echoes the kbps written
+	local iface="$1" kbps="$2" want q
+
+	[ -n "$kbps" ] || { printf '%s' ""; return 0; }
+	[ -x "$SQM_INIT" ] || { printf '%s' ""; return 0; }
+	want=$((kbps * CAPACITY_MARGIN_PCT / 100))
+	[ "$want" -ge 1 ] || { printf '%s' ""; return 0; }
+	q=$(sqm_queue_for "$iface")
+	[ -n "$q" ] || { printf '%s' ""; return 0; }
+	uci -q set "sqm.@queue[$q].upload=$want" || { printf '%s' ""; return 0; }
+	printf '%s' "$want"
+}
+
+# The per-leg report, built ONCE and used by BOTH exits. A calibration that
+# derives no weight still has to say, per leg, WHY -- otherwise the caller sees
+# only "measured nothing", which reads as a dead link, and that is exactly the
+# wrong reading for a leg that carried its rate and merely bloated. <best> empty
+# means no leg measured, so no weight is derivable and every weight is null.
+legs_json() { # legs_json <best-kbps|empty>
+	local best="$1" first=1 out="" iface state kbps at fak q lr fr reps w wj sh sc sq sl sv svj sfa s_if s_v c_if c_k c_half b_if b_v budget run
+
+	while IFS='|' read -r iface state kbps at fak q lr fr reps; do
+		[ -n "$iface" ] || continue
+		w=""
+		if [ -n "$kbps" ] && [ -n "$best" ]; then
+			w=$((kbps * CAPACITY_WEIGHT_SCALE / best))
+			[ "$w" -lt 1 ] && w=1
+		fi
+		[ -n "$w" ] && wj="$w" || wj=null
+		sh=""; sc=""; sq=""; sl=""; sfa=""
+		while read -r s_if s_v; do
+			[ "$s_if" = "$iface" ] && { sh="$s_v"; break; }
+		done <<SHAPER_EOF
+$SHAPER_SET
+SHAPER_EOF
+		while IFS='|' read -r c_if c_k sq sl sf; do
+			[ "$c_if" = "$iface" ] && { sc="$c_k"; sfa="$sf"; break; }
+		done <<CONFIRM_EOF
+$CONFIRMED
+CONFIRM_EOF
+		# The verdict on the setting, derived in ONE place from the one comparison
+		# that carries it: what the shaped leg then measured against what the shaper
+		# was set to. A leg that climbed past the shaper was not being shaped at all;
+		# one that stopped well under it is either too tight, or it was shaped from a
+		# raw figure the link has since gone below. Bands are named, not implied, so a
+		# report can be read without doing the arithmetic yourself.
+		sv=""
+		if [ -n "$sc" ] && [ "$sh" -ge 1 ] 2>/dev/null; then
+		if [ -n "$sfa" ] && [ "$sfa" -ge 1 ] 2>/dev/null; then
+			# The BREAK point is the comparison, NOT the last clean step. The ramp
+			# steps in 1.5x jumps, so the clean step below the shaper is always well
+			# under it -- comparing THAT to the shaper reports a working shaper as too
+			# tight. Observed on the bridge: held 505, broke at 675 against a 675
+			# shaper, i.e. the shaper was the binding constraint exactly, and the old
+			# comparison called it too_tight. Where the ramp BROKE is where it bit.
+			if [ "$sfa" -lt "$sh" ]; then
+				sv=too_tight
+			elif [ "$sfa" -gt $((sh * 150 / 100)) ]; then
+				sv=not_shaping
+			else
+				sv=confirmed
+			fi
+		else
+			# The ramp never broke: it climbed to its ceiling and every step was clean.
+			# Its ceiling IS the shaper (the ramp is capped there), so the shaper did not
+			# limit the link -- a finding about the setting, not a value we failed to
+			# compute. Left as null it read as though the confirmation had not run, which
+			# is what a report from the bridge showed: ramp clean to 675 against a 675
+			# shaper, and no verdict at all.
+			sv=not_shaping
+		fi
+		fi
+		# An unset verdict is null, not a hole: a field with no value takes the whole
+		# report with it, so a caller loses the calibration rather than one field.
+		# The bands are fixed tokens, so the JSON is the token in quotes; unset is
+		# null (never an unquoted word, which is what made the whole report invalid).
+		if [ -n "$sv" ]; then svj="\"$sv\""; else svj=null; fi
+		[ "$first" -eq 1 ] || out="$out,"
+		first=0
+		out="$out$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"shaper_kbps":%s,"measured_at":%s,"failed_at_kbps":%s,"failed_on_rtt":%s,"quality":%s,"loaded_rtt_ms":%s,"repeats_kbps":[%s],"shaped_measured_kbps":%s,"shaped_quality":%s,"shaped_held":%s,"shaped_failed_at_kbps":%s,"shaped_verdict":%s}' \
+			"$(json_str "$iface")" "$state" "$wj" "${kbps:-null}" "${sh:-null}" \
+			"$(measure_json_str "$at")" "${fak:-null}" "${fr:-null}" \
+			"${q:-null}" "${lr:-null}" "${reps:-null}" "${sc:-null}" "${sq:-null}" \
+			"${sl:-null}" "${sfa:-null}" "$svj")"
+	done <<LEGS_EOF
+$measured
+LEGS_EOF
+	printf '%s' "$out"
+}
+
+method_calibrate() {
+	local endpoint pskfile legs iface j rc state first=1
+	local statefile kbps at measured best total n_legs n_meas agg agg_state
+	local w sec s have hw sec_out out
+
+	config_load "$CONFIG"
+	config_get endpoint main probe_endpoint
+	config_get pskfile  main probe_psk_file "$DEFAULT_PROBE_PSK"
+
+	if [ -z "$endpoint" ]; then
+		err probe_unconfigured "no probe_endpoint is configured on this bridge; calibration is unavailable"
+		return 0
+	fi
+	if [ ! -x "$PROBE_CMD" ]; then
+		err probe_unavailable "the probe tool ($PROBE_CMD) is not installed"
+		return 0
+	fi
+
+	# NO pre-check here for "a session is running". The obvious one -- is the
+	# service up? -- is WRONG: the bridge daemon runs whenever the service is
+	# enabled, idle or not, so it would refuse every calibration on a healthy box.
+	# The only honest signal is traffic on the leg, which is exactly what the tool's
+	# own guard measures (a 2 s sample against --guard-kbps, well above the ~8 kbit/s
+	# of keepalive trickle an idle modem carries). That guard stays the ONE
+	# definition of "the link is busy"; this method reports the tool's refusal as a
+	# per-leg `refused` state rather than inventing a second, wrong answer.
+
+	# The leg set is the SHARED resolver's, exactly as the init and get_config use
+	# -- never a second answer to "what are this box's WAN links". Every present
+	# link is in it, by DT-29: nothing narrows the bond.
+	if [ "$WAN_LIB_LOADED" -ne 1 ]; then
+		err probe_unavailable "the WAN link resolver ($WAN_LIB) is unavailable, so the legs to measure cannot be named"
+		return 0
+	fi
+
+	# `wan_links_present`, NOT `wan_links`: the resolver lists every CONFIGURED WAN,
+	# including one whose device is absent (`wwan0` on this box), and only the present
+	# set is what the init actually bonds. Measuring an absent leg would spend probe
+	# bytes on a link that is not there, and -- because it cannot answer -- would make
+	# the aggregate `partial` and refuse a weight even when the one real leg measured
+	# perfectly. It would also write a weight for a leg that is never bonded.
+	legs=$(wan_links_present)
+	if [ -z "$legs" ]; then
+		err probe_no_legs "no WAN link is present to measure"
+		return 0
+	fi
+
+	# The sections naming a leg, collected once, so a derived weight updates the
+	# EXISTING section rather than adding a second one for the same interface.
+	UPLINK_DECLARED=""
+	config_foreach collect_uplink uplink
+
+	# Clear the shaper BEFORE the first probe byte, and arm the restore with it: a
+	# run that dies mid-measurement must not leave the operator's WAN unshaped.
+	shaper=none
+	cleared=$(shape_suspend "$legs")
+	[ -n "$cleared" ] && trap 'shape_resume "$cleared" >/dev/null; trap - EXIT INT TERM' EXIT INT TERM
+
+	# ---- pass 1: measure every leg -------------------------------------------
+	mkdir -p "$PROBE_STATE_DIR" 2>/dev/null
+	measured=""
+	n_legs=0
+	while IFS= read -r iface; do
+		[ -n "$iface" ] || continue
+		n_legs=$((n_legs + 1))
+		statefile="${PROBE_STATE_DIR}/probe-${iface}.json"
+		# The MEDIAN of CALIBRATE_REPEATS standard tests, not one sample.
+		run=$(calibrate_ramp "$iface" "$statefile")
+		rc=$(cat "${statefile}.rc${run}" 2>/dev/null)
+		j=$(cat "${statefile}.r${run}" 2>/dev/null)
+		# Every repeat's rate, so the spread is visible rather than hidden inside the
+		# median: a leg whose repeats disagree is a leg not to shape from.
+		# Built in the shell, NOT with paste: OpenWrt's busybox has no paste, and the
+		# box reported the spread as [null] while the off-device suite passed -- the
+		# host running the suite has it. A missing tool must not silently empty a
+		# reported field.
+		reps=""
+		while IFS= read -r r; do
+			[ -n "$r" ] || continue
+			reps="${reps}${reps:+,}${r}"
+		done < "${statefile}.rates" 2>/dev/null
+		[ -n "$reps" ] || reps=null
+		# The tool's exit codes ARE its contract: 3 is a deliberate refusal (a
+		# session on the leg, or the day's byte budget spent), 1 a failed
+		# measurement, 2 a usage mistake. Flattening them would cost a caller
+		# exactly the distinction it needs.
+		case "$rc" in
+			0) state=ok ;;
+			3) state=refused ;;
+			*) state=failed ;;
+		esac
+		# The probe's JSON is the record of what the run actually DID, and it is
+		# there whether or not the run produced a rate. Read the diagnostic fields
+		# too: on a run that derives nothing they are the only thing that says why,
+		# and why is the difference between a saturated leg and a dead one.
+		kbps=""; at=""; fak=""; q=""; lr=""; fr=""
+		if [ -n "$j" ] && printf '%s' "$j" | jsonfilter -e '@' >/dev/null 2>&1; then
+			kbps=$(printf '%s' "$j" | jsonfilter -e '@.measured_kbps' 2>/dev/null)
+			at=$(printf '%s' "$j" | jsonfilter -e '@.measured_at' 2>/dev/null)
+			fak=$(printf '%s' "$j" | jsonfilter -e '@.failed_at_kbps' 2>/dev/null)
+			q=$(printf '%s' "$j" | jsonfilter -e '@.quality' 2>/dev/null)
+			lr=$(printf '%s' "$j" | jsonfilter -e '@.loaded_rtt_ms' 2>/dev/null)
+			fr=$(printf '%s' "$j" | jsonfilter -e '@.failed_on_rtt' 2>/dev/null)
+		fi
+		# 0 is NOT a measurement. A leg that carried nothing has already refused
+		# (the tool's MIN_LEG_BYTES guard, exit 1) -- reporting 0 as a rate would
+		# hand the caller a figure to shape from for a link that moved nothing.
+		case "$kbps" in
+			''|0|null) kbps="" ;;
+		esac
+		# "ok" and no rate is a contradiction: a leg that carried nothing has not
+		# been measured, whatever the exit code said. Class it with the failed
+		# measurements rather than letting an unusable run report as a pass.
+		if [ "$state" = "ok" ] && [ -z "$kbps" ]; then
+			state=failed
+		fi
+		# `|`-delimited, NOT space-delimited: read() collapses runs of IFS
+		# whitespace, so a leg with no rate would promote the timestamp into its
+		# kbps field and the arithmetic would run on a date string.
+		measured="${measured}${iface}|${state}|${kbps}|${at}|${fak}|${q}|${lr}|${fr}|${reps}
+"
+	done <<WAN_LINKS_EOF
+$legs
+WAN_LINKS_EOF
+
+	# The shaper is NOT resumed here: the derivation below sets a NEW value for it,
+	# and bringing it back first would restore the old one -- leaving the box shaped
+	# to a rate this run just measured as wrong.
+
+	# ---- pass 2: derive, from ALL legs at once -------------------------------
+	#
+	# A weight is a leg's measured CONTRIBUTION to the aggregate, so it cannot be
+	# computed from one leg alone: it is a ratio, and the fastest measured leg
+	# defines the scale.
+	best=""
+	while IFS='|' read -r iface state kbps at fak q lr fr reps; do
+		[ -n "$kbps" ] || continue
+		if [ -z "$best" ] || [ "$kbps" -gt "$best" ]; then best="$kbps"; fi
+	done <<MEASURED_EOF
+$measured
+MEASURED_EOF
+
+	if [ -z "$best" ]; then
+		# Nothing measured means nothing to shape to, so the shaper goes back on the
+		# value it already had -- and it still goes back, on this path too.
+		[ -n "$cleared" ] && shaper=$(shape_resume "$cleared")
+		[ -n "$cleared" ] && trap - EXIT INT TERM
+		err calibration_measured_nothing "no leg produced a usable rate; no weight was derived and the previous ones are left as they were" "$(legs_json '')" "$shaper"
+		return 0
+	fi
+
+	# An aggregate is NOT a sum of the legs that happened to answer. It is only
+	# reported when EVERY present leg was measured; otherwise it is null and says
+	# which kind of incomplete it is, so a consumer can tell "no legs" from "a leg
+	# unreadable" instead of reading both as a number.
+	n_meas=0
+	total=0
+	while IFS='|' read -r iface state kbps at fak q lr fr reps; do
+		[ -n "$kbps" ] || continue
+		n_meas=$((n_meas + 1))
+		total=$((total + kbps))
+	done <<MEASURED_EOF
+$measured
+MEASURED_EOF
+	if [ "$n_meas" -lt "$n_legs" ]; then
+		# Reached only with at least one leg measured ($best was non-empty), so
+		# this is a PARTIAL sum -- some present leg is missing from it. A total
+		# covering no leg at all is the `calibration_measured_nothing` case above.
+		agg="null"
+		agg_state=partial
+	else
+		agg="$total"
+		agg_state=ok
+	fi
+
+	# The weights land in `config uplink` -- the ONE place the init already reads a
+	# per-leg weight from, so NOTHING in the start path changes: the process simply
+	# starts with the derived values. A measured leg gets a proportional share
+	# (floored at 1, never 0). A leg that was NOT measured gets no weight written at
+	# all, so libRIST's own default stands -- writing one would assert a share no
+	# measurement supports, and the default is already >= 1, so DT-29's invariant
+	# holds either way.
+	while IFS='|' read -r iface state kbps at fak q lr fr reps; do
+		[ -n "$iface" ] || continue
+		w=""
+		if [ -n "$kbps" ]; then
+			w=$((kbps * CAPACITY_WEIGHT_SCALE / best))
+			[ "$w" -lt 1 ] && w=1
+		fi
+
+		sec=""
+		while read -r s have hw; do
+			[ "$have" = "$iface" ] && { sec="$s"; break; }
+		done <<SEC_EOF
+$UPLINK_DECLARED
+SEC_EOF
+		if [ -n "$w" ]; then
+			[ -n "$sec" ] || sec="$iface"
+			if uci -q set "$CONFIG.${sec}=uplink" && \
+			   uci -q set "$CONFIG.${sec}.interface=${iface}"; then
+				# Provenance: the figure the weight came from, and when, so the
+				# number on the box traces back to the run that produced it.
+				uci -q set "$CONFIG.${sec}.weight=${w}"
+				[ -n "$kbps" ] && uci -q set "$CONFIG.${sec}.measured_kbps=${kbps}"
+				[ -n "$at" ]   && uci -q set "$CONFIG.${sec}.measured_at=${at}"
+			fi
+		elif [ -n "$sec" ]; then
+			# This leg produced no fresh measurement, but a section naming it
+			# carries a weight from an EARLIER run. A weight is only meaningful
+			# as a SET -- one ratio across every bonded leg -- so leaving a stale
+			# one here would mix an old measurement into this run's ratio and
+			# make the whole set incoherent. Clear it instead: libRIST's own
+			# default then stands, and that default is >= 1, so the leg is still
+			# bonded (DT-29). (A run where NO leg measured returns earlier and
+			# deliberately leaves the last coherent set alone.)
+			uci -q delete "$CONFIG.${sec}.weight"
+			uci -q delete "$CONFIG.${sec}.measured_kbps"
+			uci -q delete "$CONFIG.${sec}.measured_at"
+		fi
+
+		# The measurement sets the SHAPER too. Measuring a leg is only worth
+		# doing if the result shapes it, and this is the value the operator's
+		# latency depends on. Only a leg that actually MEASURED gets one -- a
+		# shaper is not something to guess at, and a leg that carried nothing
+		# has no capacity to shape to.
+		sv=$(shape_configure "$iface" "$kbps")
+		[ -n "$sv" ] && SHAPER_SET="${SHAPER_SET}${iface} ${sv}
+"
+
+	done <<MEASURED_EOF
+$measured
+MEASURED_EOF
+
+	[ -n "$SHAPER_SET" ] && uci -q commit sqm
+	# The budget the bridge SENDS with, derived from the link and from nothing
+	# else: the sum of what each leg's own shaper was just set to. `bandwidth=`
+	# has to sit above the stream rate and below the link, and this is the side
+	# of the link it can be read from -- the shaper IS the link, enforced.
+	budget=0
+	while read -r b_if b_v; do
+		[ -n "$b_if" ] || continue
+		budget=$((budget + b_v))
+	done <<SHAPER_EOF
+$SHAPER_SET
+SHAPER_EOF
+	[ "$budget" -ge 1 ] && uci -q set "$CONFIG.main.measured_budget_kbps=$budget"
+	uci -q commit "$CONFIG"
+
+	# Now the shaper goes back on -- with the value just derived, not the old one.
+	[ -n "$cleared" ] && shaper=$(shape_resume "$cleared")
+	[ -n "$cleared" ] && trap - EXIT INT TERM
+
+	# ---- confirm: re-measure each shaped leg WITH the shaper up ---------------
+	# A configured shaper that was never tested is an assumption. Hold each shaped
+	# leg at the rate it was just set to, with the shaper in place, and read back
+	# whether the path held its latency and what quality it carried. That is the
+	# difference between "the numbers were applied" and "the link does what the
+	# numbers say" -- and it is the ONE criterion, taken from the tool, not a
+	# second opinion computed here.
+	if [ -n "$SHAPER_SET" ]; then
+		while read -r c_if c_kbps; do
+			[ -n "$c_if" ] || continue
+			# The STANDARD test, re-run with the shaper up -- that IS the
+			# confirmation. Deliberately NOT a held rate: a held rate puts the
+			# payload onto the shaper's own limit, where the qdisc is obliged to
+			# police it, and reports a failure that is an artefact of the test
+			# (observed: quality 63.47 holding 450 kbit/s of payload under a 450
+			# shaper that was set exactly right). The ramp asks the link what it
+			# carries, and with the shaper configured the answer IS the shaper:
+			# stopping at the shaper's rate confirms it, climbing past it says
+			# it is not engaging, stopping well below says it is too tight. The
+			# budget is left alone so the ramp can climb and find where it bites.
+			# The ramp has to START BELOW the shaper and climb through it, or it
+			# fails on its own first step and confirms nothing: the tool's floor
+			# is 500 kbit/s, which is already over a 450 shaper, and the shaped
+			# run came back with measured 0. Half the shaper is a rate the link
+			# has been measured to carry; the shaper is the ceiling, so the ramp
+			# stops where the shaper bites and its measured lands just under it.
+			c_half=$((c_kbps / 2))
+			j=$("$PROBE_CMD" "$c_if" -u "$endpoint" --psk-file "$pskfile" \
+				--state-file "${PROBE_STATE_DIR}/shaped-${c_if}.json" \
+				--floor-kbps "$c_half" --max-kbps "$c_kbps" -j 2>/dev/null)
+			ck=$(printf '%s' "$j" | jsonfilter -e '@.measured_kbps' 2>/dev/null)
+			# Where the shaped ramp BROKE, as well as where it last held: the shaper
+			# sits between the two, and without the second number the verdict's band
+			# cannot be read off the report -- the ramp only localises it to a step.
+			cf=$(printf '%s' "$j" | jsonfilter -e '@.failed_at_kbps' 2>/dev/null)
+			cq=$(printf '%s' "$j" | jsonfilter -e '@.quality' 2>/dev/null)
+			ch=$(printf '%s' "$j" | jsonfilter -e '@.rtt_held' 2>/dev/null)
+			CONFIRMED="${CONFIRMED}${c_if}|${ck:-}|${cq:-}|${ch:-}|${cf:-}
+"
+		done <<SHAPER_EOF
+$SHAPER_SET
+SHAPER_EOF
+	fi
+
+	printf '{"ok":true,"endpoint":"%s","scale":%s,"aggregate_kbps":%s,"aggregate_state":"%s","legs":[%s],"shaper":"%s"}\n' \
+		"$(json_str "$endpoint")" "$CAPACITY_WEIGHT_SCALE" "$agg" "$agg_state" "$(legs_json "$best")" \
+		"$shaper"
 }
 
 # ======================================================================
@@ -352,6 +1107,7 @@ apply_config() {
 	local allowed="$1" j=0 present=""
 	local listen_url profile out_profile enabled
 	local buffer_min buffer_max rtt_min rtt_max reorder_buffer
+	local probe_endpoint
 	local i addr sec
 
 	body_has_secret_key && { err secret_field "the request contains a secret-bearing field"; return 1; }
@@ -361,6 +1117,14 @@ apply_config() {
 	if [ -n "$listen_url" ]; then
 		url_ok "$listen_url" listen_url || return 1
 		uci set "$CONFIG.main.listen_url=$listen_url" || { err apply_failed "listen_url"; return 1; }
+	fi
+
+	# The calibration endpoint. An ADDRESS ONLY, exactly like a destination --
+	# it reaches the relay that hosts the authenticated probe sink.
+	probe_endpoint=$(jget '@.probe_endpoint')
+	if [ -n "$probe_endpoint" ]; then
+		url_ok "$probe_endpoint" probe_endpoint || return 1
+		uci set "$CONFIG.main.probe_endpoint=$probe_endpoint" || { err apply_failed "probe_endpoint"; return 1; }
 	fi
 
 	profile=$(jget '@.profile')
@@ -483,7 +1247,7 @@ method_reload() {
 case "$1" in
 	list)
 		# rpcd requires this to enumerate the object's methods.
-		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "set_config": {}, "set_link_secret": {}, "reconcile": {}, "reload": {} }'
+		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "wan_status": {}, "set_config": {}, "set_link_secret": {}, "reconcile": {}, "calibrate": {}, "reload": {} }'
 		;;
 	call)
 		REQ_BODY=$(cat)
@@ -495,9 +1259,11 @@ case "$1" in
 			case "$2" in
 				status)     method_status ;;
 				get_config) method_get_config ;;
-				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address" ;;
+				wan_status) method_wan_status ;;
+				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery buffer_min buffer_max rtt_min rtt_max reorder_buffer probe_endpoint outputs address" ;;
 				set_link_secret) require_managed && method_set_link_secret ;;
 				reconcile)  require_managed && apply_config "listen_url outputs address" ;;
+				calibrate)  require_managed && method_calibrate ;;
 				reload)     method_reload ;;
 				release)    method_release ;;
 				*)          echo '{}' ;;

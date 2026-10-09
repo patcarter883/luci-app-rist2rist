@@ -49,20 +49,31 @@ if [ "$OBJ" != "rist2rist" ]; then
 	fail "$ID" -32601 '"unknown object"'
 	exit 0
 fi
-case "$METHOD" in
-	status|get_config|claim|set_config|set_link_secret|reconcile|reload|release) ;;
-	*)
-		fail "$ID" -32601 '"unknown method"'
-		exit 0
-		;;
-esac
+
+# ...but the METHOD list is not ours to keep. It is the object's registered
+# surface -- the plugin's own `list` output, which rpcd consumes to register the
+# object -- so ask ubus for it rather than duplicating it. A method can then never
+# be reachable over `ubus` yet refused here because a second list was edited in one
+# place and not the other, which is exactly what happened to `calibrate`.
+#
+# `ubus call rist2rist list` is NOT the way: rpcd consumes that output for
+# registration and does not expose it as a method (it answers "Method not found").
+# `ubus -v list` reports what was REGISTERED, which is the same thing.
+if ! ubus -v list rist2rist 2>/dev/null | grep -q "^[[:space:]]*\"$METHOD\":"; then
+	fail "$ID" -32601 '"unknown method"'
+	exit 0
+fi
 
 # params[3] is the method's own argument object and is passed through unchanged;
 # jsonfilter prints it back as JSON, which is exactly what `ubus call` wants.
 ARGS="$(printf '%s' "$BODY" | jsonfilter -e '@.params[3]' 2>/dev/null)"
 case "$ARGS" in ''|'null') ARGS='{}' ;; esac
 
-RESULT="$(ubus call rist2rist "$METHOD" "$ARGS" 2>&1)"
+# `ubus` gives a command 30 seconds by default, and a calibration measures every
+# leg and then confirms it -- about a minute. Without this the call was cut off at
+# 30s and the endpoint reported the bridge unreachable while the plugin was still
+# working, which is the failure mode that matters here: not wrong, just too early.
+RESULT="$(ubus -t 300 call rist2rist "$METHOD" "$ARGS" 2>&1)"
 
 # `ubus call` prints the result JSON, or a plain diagnostic line on failure. A
 # plugin-level refusal (token_required, already_claimed) is a SUCCESSFUL call

@@ -14,10 +14,21 @@ def main() -> int:
     expr = args[args.index("-e") + 1] if "-e" in args else None
 
     raw = sys.stdin.read()
-    try:
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception:
+    if not raw.strip():
+        # An empty body is an empty object, matching rpcd's convention when a
+        # caller sends no arguments.
         data = {}
+    else:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # Faithful to the real tool: unparseable input is a FAILURE, not an
+            # empty object. Coercing it to {} here made this double accept JSON
+            # the real jsonfilter rejects (it exits 126), so a test asserting that
+            # malformed output is refused passed against the WRONG behaviour --
+            # the harness was lying, not the code.
+            sys.stderr.write("Failed to parse JSON data\n")
+            return 1
 
     if expr is None:
         print(json.dumps(data))
