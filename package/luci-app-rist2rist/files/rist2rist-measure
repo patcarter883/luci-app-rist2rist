@@ -1,0 +1,258 @@
+#!/bin/sh
+##########################################################################
+# rist2rist-measure -- a one-shot PASSIVE snapshot of every WAN leg.
+#
+# Prints ONE JSON object on stdout and exits 0.
+#
+# PASSIVE BY CONSTRUCTION. This helper only reads: sysfs counters, the live
+# qdisc, ModemManager signal, and the local UCI uplinks. It never writes config,
+# never reconfigures anything, and never generates network traffic. Sending probe
+# traffic -- the only thing that can produce a real throughput figure -- belongs
+# to a separate tool.
+#
+# "Unknown" is a first-class state. A value that cannot be read is emitted as
+# null with a state of "unknown"; it is NEVER emitted as 0. A fabricated number
+# is worse than an honest null, because a consumer cannot tell a real 0 from a
+# placeholder. An absent interface is the ordinary bench state (no modem
+# attached), reported as present:false / state "absent" without aborting the run
+# and without logging on every invocation.
+#
+# Two layers, deliberately:
+#   * emit_measurement() is the PURE core. It takes already-gathered text and
+#     returns the JSON decision. It reads no files and runs no external command,
+#     so it is fully unit-testable off-device.
+#   * the shell below it gathers the inputs and calls the core. All the contact
+#     with the system lives here.
+##########################################################################
+
+# Test hook: lets the package's own test harness stub /lib/functions.sh, exactly
+# as the rpcd plugin does. NO `set -u`: /lib/functions.sh reads $IPKG_INSTROOT
+# unguarded, and under set -u that aborts the shell (exit 2) before any work runs.
+FUNCTIONS_SH=${FUNCTIONS_SH:-/lib/functions.sh}
+. "$FUNCTIONS_SH"
+
+CONFIG=rist2rist
+
+# ======================================================================
+# the pure core
+# ======================================================================
+
+# json_str <text> -- JSON string escaping. Pure shell, no external process, so
+# the core stays free of command execution. Same escaping as the rpcd plugin's
+# json_str (backslash and double-quote), applied here without sed.
+json_str() {
+    local in="$1" out="" ch
+    while [ -n "$in" ]; do
+        ch=${in%"${in#?}"}
+        case "$ch" in
+            '\') out="${out}\\\\" ;;
+            '"') out="${out}\\\"" ;;
+            *)   out="${out}${ch}" ;;
+        esac
+        in=${in#?}
+    done
+    printf '%s' "$out"
+}
+
+# jnum <text> -- render an integer as a bare JSON number, or null when it is
+# empty or not a plain integer. This is the ONE place unknown becomes null, so
+# no caller can accidentally emit a placeholder 0.
+jnum() {
+    local v="$1" neg=""
+    case "$v" in
+        -*) neg="-"; v=${v#-} ;;
+    esac
+    case "$v" in
+        ''|*[!0-9]*) printf 'null'; return ;;
+    esac
+    printf '%s%s' "$neg" "$v"
+}
+
+# emit_measurement <generated_at> <records>
+#
+# `records` is one line per configured uplink, fields '|'-separated (a
+# non-whitespace delimiter, so empty middle fields survive `read`):
+#   interface|present|shaped_kbps|tx_bytes|rx_bytes|tx_dropped|tx_overlimits|backlog_bytes|signal_dbm
+# An empty field means "could not be read" -> null. `present` is literal
+# true/false. The state rule: absent -> "absent"; present with a live shaper ->
+# "ok"; present with no shaper -> "unknown".
+emit_measurement() {
+    local generated_at="$1" records="$2"
+    local legs="" leg iface present shaped tx rx dropped overlimits backlog signal
+    local state pjson has_present=0 shaped_known=1 shaped_sum=0
+
+    # rtt_ms/jitter_ms/quality/measured_kbps/measured_at are always null: the
+    # per-leg RTT/quality live only in the running daemon's stats_json, which the
+    # init does NOT start it emitting (rist2rist needs `-S <statsinterval>`); that
+    # log line is the future source. measured_kbps likewise needs active probing,
+    # which this passive helper deliberately does not do.
+    while IFS='|' read -r iface present shaped tx rx dropped overlimits backlog signal; do
+        [ -z "$iface" ] && continue
+
+        if [ "$present" = "true" ]; then
+            pjson=true
+            has_present=$((has_present + 1))
+            if [ -n "$shaped" ]; then
+                state=ok
+                shaped_sum=$((shaped_sum + shaped))
+            else
+                state=unknown
+                shaped_known=0
+            fi
+        else
+            # An absent leg reports nothing. Force every field null rather than
+            # trust the caller -- a stray 0 here would be read as a measurement.
+            pjson=false
+            state=absent
+            shaped=""; tx=""; rx=""
+            dropped=""; overlimits=""; backlog=""; signal=""
+        fi
+
+        leg=$(printf '{"interface":"%s","present":%s,"state":"%s","shaped_kbps":%s,"tx_bytes":%s,"rx_bytes":%s,"tx_dropped":%s,"tx_overlimits":%s,"backlog_bytes":%s,"signal_dbm":%s,"rtt_ms":null,"jitter_ms":null,"quality":null,"measured_kbps":null,"measured_at":null}' \
+            "$(json_str "$iface")" "$pjson" "$state" \
+            "$(jnum "$shaped")" "$(jnum "$tx")" "$(jnum "$rx")" \
+            "$(jnum "$dropped")" "$(jnum "$overlimits")" "$(jnum "$backlog")" \
+            "$(jnum "$signal")")
+        legs="${legs:+$legs,}$leg"
+    done <<RECORDS_EOF
+$records
+RECORDS_EOF
+
+    # The aggregate is a total across PRESENT legs. If no leg is present it is
+    # null; and if any present leg's shaper is unknown the total would be a
+    # partial sum presented as a whole, so it is null too -- an incomplete total
+    # is a fabrication just like a placeholder 0.
+    local agg_shaped=null
+    if [ "$has_present" -gt 0 ] && [ "$shaped_known" -eq 1 ]; then
+        agg_shaped=$shaped_sum
+    fi
+    # measured_kbps is per-leg null, and a total is null when any input is null.
+    local agg_measured=null
+
+    printf '{"generated_at":"%s","legs":[%s],"aggregate":{"shaped_kbps":%s,"measured_kbps":%s}}\n' \
+        "$(json_str "$generated_at")" "$legs" "$agg_shaped" "$agg_measured"
+}
+
+# ======================================================================
+# the I/O shell
+# ======================================================================
+
+# Records accumulated by collect_leg, read back by main. A global because
+# config_foreach runs its callback in THIS shell, not a subshell (see the init
+# script): the callback appends, main reads back afterwards.
+RECORDS=""
+
+# append_leg <iface> <present> <shaped> <tx> <rx> <dropped> <over> <backlog> <signal>
+append_leg() {
+    RECORDS="${RECORDS}${1}|${2}|${3}|${4}|${5}|${6}|${7}|${8}|${9}
+"
+}
+
+# A cumulative sysfs counter, or nothing if it cannot be read.
+sysfs_counter() { # sysfs_counter <iface> <stat>
+    local f="/sys/class/net/$1/statistics/$2"
+    [ -r "$f" ] || return 0
+    cat "$f" 2>/dev/null
+}
+
+# scale <number> <kbit-factor> -- integer kbit/s. awk so a fractional value (a
+# CAKE bandwidth can be, e.g. 9.5Mbit) is handled without shell float math.
+scale_kbps() { # scale_kbps <number> <factor>
+    printf '%s\n' "$1" | awk -v f="$2" '{ printf "%d", $1 * f }'
+}
+
+# tc_fill <iface> -- set TC_SHAPED/TC_DROPPED/TC_OVERLIMITS/TC_BACKLOG from the
+# live qdisc. Empty means "could not be read".
+#
+# The configured rate is the `bandwidth <N><unit>bit` value on the qdisc line.
+# It is deliberately read from THAT line and not from the `capacity estimate:`
+# line: tc -s prints a capacity estimate that merely echoes CAKE's OWN configured
+# bandwidth back, and presenting it as a link measurement would be a lie.
+#
+# If there is no bandwidth token the qdisc is not our shaper (e.g. noqueue), so
+# the counters are not CAKE's either and stay unknown -- again, not 0.
+tc_fill() { # tc_fill <iface>
+    TC_SHAPED=""; TC_DROPPED=""; TC_OVERLIMITS=""; TC_BACKLOG=""
+    command -v tc >/dev/null 2>&1 || return 0
+
+    local out bw num unit
+    out=$(tc -s qdisc show dev "$1" 2>/dev/null) || return 0
+    [ -n "$out" ] || return 0
+
+    bw=$(printf '%s\n' "$out" \
+        | sed -n 's/.*[[:space:]]bandwidth[[:space:]]\([0-9][0-9.]*\)\([KMG]*\)bit.*/\1 \2/p' \
+        | head -n 1)
+    if [ -n "$bw" ]; then
+        num=${bw% *}
+        unit=${bw#* }
+        case "$unit" in
+            G) TC_SHAPED=$(scale_kbps "$num" 1000000) ;;
+            M) TC_SHAPED=$(scale_kbps "$num" 1000) ;;
+            K) TC_SHAPED=$(scale_kbps "$num" 1) ;;
+            *) TC_SHAPED=$(scale_kbps "$num" 0.001) ;;
+        esac
+    fi
+
+    if [ -z "$TC_SHAPED" ]; then
+        return 0
+    fi
+
+    TC_DROPPED=$(printf '%s\n' "$out" \
+        | sed -n 's/.*(dropped \([0-9][0-9]*\).*/\1/p' | head -n 1)
+    TC_OVERLIMITS=$(printf '%s\n' "$out" \
+        | sed -n 's/.*overlimits \([0-9][0-9]*\).*/\1/p' | head -n 1)
+    TC_BACKLOG=$(printf '%s\n' "$out" \
+        | sed -n 's/^[[:space:]]*backlog \([0-9][0-9]*\)b.*/\1/p' | head -n 1)
+}
+
+# modem_signal <iface> -- RSSI in dBm for the modem backing this WWAN leg, or
+# nothing.
+#
+# There is no passive iface->modem map in mmcli's output, so the modem index is
+# taken from the interface name (wwanN -> modem N), the provisioning convention
+# on this target. If no index can be derived, or mmcli is absent or reports no
+# such modem, the signal is left unknown rather than guessed.
+modem_signal() { # modem_signal <iface>
+    command -v mmcli >/dev/null 2>&1 || return 0
+    local n
+    n=$(printf '%s' "$1" | tr -cd '0-9')
+    [ -n "$n" ] || return 0
+    mmcli -m "$n" --signal-get 2>/dev/null \
+        | sed -n 's/.*RSSI:[[:space:]]*\(-\)\?\([0-9][0-9]*\)[[:space:]]*dBm.*/\1\2/p' \
+        | head -n 1
+}
+
+# config_foreach callback: gather one uplink leg.
+collect_leg() {
+    local cfg="$1" interface
+    config_get interface "$cfg" 'interface'
+    [ -z "$interface" ] && return 0
+
+    if [ ! -e "/sys/class/net/${interface}" ]; then
+        # The NORMAL bench state with no modem attached. Report it as absent and
+        # carry on. No logger call: a missing leg must not fill the log on every
+        # invocation.
+        append_leg "$interface" false "" "" "" "" "" "" ""
+        return 0
+    fi
+
+    tc_fill "$interface"
+    append_leg "$interface" true "$TC_SHAPED" \
+        "$(sysfs_counter "$interface" tx_bytes)" \
+        "$(sysfs_counter "$interface" rx_bytes)" \
+        "$TC_DROPPED" "$TC_OVERLIMITS" "$TC_BACKLOG" \
+        "$(modem_signal "$interface")"
+}
+
+main() {
+    config_load "$CONFIG"
+    RECORDS=""
+    config_foreach collect_leg 'uplink'
+    emit_measurement "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RECORDS"
+}
+
+# Run only when executed, not when sourced: the test harness sources this file to
+# reach emit_measurement directly, and must not trigger the I/O shell.
+case "$0" in
+    *rist2rist-measure) main "$@"; exit 0 ;;
+esac

@@ -86,6 +86,12 @@ define Package/luci-app-rist2rist/install
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) ./root/usr/libexec/rpcd/rist2rist $(1)/usr/libexec/rpcd/rist2rist
 
+	# Passive per-WAN measurement snapshot: a one-shot admin tool. It only reads
+	# (sysfs, tc, mmcli, uci) -- it is never a service. /usr/sbin matches the sbin
+	# convention for admin tools.
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_BIN) ./files/rist2rist-measure $(1)/usr/sbin/rist2rist-measure
+
 	# The HTTP face of that same API. LuCI's uhttpd cannot serve it (its ubus
 	# plugin denies every call on this image) and uhttpd's -a would expose every
 	# ubus object on the LAN to reach this one, so the endpoint gets its own

@@ -1,0 +1,25 @@
+#!/bin/sh
+# Test double for `mmcli`, for measure-selftest.sh.
+#
+# Reports an RSSI only when MMCLI_STUB_RSSI is set. Without it the stub fails the
+# way the real mmcli does on a box with no modem ("couldn't find the ModemManager
+# process"), so the helper's unknown path is exercised rather than assumed.
+#
+# The helper only calls `mmcli -m <n> --signal-get`; anything else fails loudly.
+case "$*" in
+    "-m "*" --signal-get") ;;
+    *) echo "mmcli stub: unsupported call: $*" >&2; exit 1 ;;
+esac
+
+if [ -n "${MMCLI_STUB_RSSI:-}" ]; then
+    printf '  -------------------------\n'
+    printf '  Signal quality: 71%% (good)\n'
+    printf '  -------------------------\n'
+    printf '  RSSI: %s dBm\n' "$MMCLI_STUB_RSSI"
+    printf '  RSRQ: -11 dBm\n'
+    printf '  RSRP: -78 dBm\n'
+    exit 0
+fi
+
+echo "error: couldn't find the ModemManager process in the bus" >&2
+exit 1
