@@ -537,7 +537,7 @@ shape_configure() { # shape_configure <iface> <kbps> -> echoes the kbps written
 # wrong reading for a leg that carried its rate and merely bloated. <best> empty
 # means no leg measured, so no weight is derivable and every weight is null.
 legs_json() { # legs_json <best-kbps|empty>
-	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj sh sq sl s_if s_v c_if c_q c_h b_if b_v budget
+	local best="$1" first=1 out="" iface state kbps at fak q lr fr w wj sh sc sq sl s_if s_v c_if c_k b_if b_v budget
 
 	while IFS='|' read -r iface state kbps at fak q lr fr; do
 		[ -n "$iface" ] || continue
@@ -547,23 +547,23 @@ legs_json() { # legs_json <best-kbps|empty>
 			[ "$w" -lt 1 ] && w=1
 		fi
 		[ -n "$w" ] && wj="$w" || wj=null
-		sh=""; sq=""; sl=""
+		sh=""; sc=""; sq=""; sl=""
 		while read -r s_if s_v; do
 			[ "$s_if" = "$iface" ] && { sh="$s_v"; break; }
 		done <<SHAPER_EOF
 $SHAPER_SET
 SHAPER_EOF
-		while IFS='|' read -r c_if c_q c_h; do
-			[ "$c_if" = "$iface" ] && { sq="$c_q"; sl="$c_h"; break; }
+		while IFS='|' read -r c_if c_k sq sl; do
+			[ "$c_if" = "$iface" ] && { sc="$c_k"; break; }
 		done <<CONFIRM_EOF
 $CONFIRMED
 CONFIRM_EOF
 		[ "$first" -eq 1 ] || out="$out,"
 		first=0
-		out="$out$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"shaper_kbps":%s,"measured_at":%s,"failed_at_kbps":%s,"failed_on_rtt":%s,"quality":%s,"loaded_rtt_ms":%s,"shaped_quality":%s,"shaped_held":%s}' \
+		out="$out$(printf '{"interface":"%s","state":"%s","weight":%s,"measured_kbps":%s,"shaper_kbps":%s,"measured_at":%s,"failed_at_kbps":%s,"failed_on_rtt":%s,"quality":%s,"loaded_rtt_ms":%s,"shaped_measured_kbps":%s,"shaped_quality":%s,"shaped_held":%s}' \
 			"$(json_str "$iface")" "$state" "$wj" "${kbps:-null}" "${sh:-null}" \
 			"$(measure_json_str "$at")" "${fak:-null}" "${fr:-null}" \
-			"${q:-null}" "${lr:-null}" "${sq:-null}" \
+			"${q:-null}" "${lr:-null}" "${sc:-null}" "${sq:-null}" \
 			"${sl:-null}")"
 	done <<LEGS_EOF
 $measured
@@ -820,15 +820,23 @@ SHAPER_EOF
 	if [ -n "$SHAPER_SET" ]; then
 		while read -r c_if c_kbps; do
 			[ -n "$c_if" ] || continue
-			# --budget-kbps: this leg's shaper IS the link, so it is the budget.
-			# Without it the tool announces 1.5x the rate, which is ABOVE the
-			# shaper, and the qdisc then polices the probe's own traffic.
+			# The STANDARD test, re-run with the shaper up -- that IS the
+			# confirmation. Deliberately NOT a held rate: a held rate puts the
+			# payload onto the shaper's own limit, where the qdisc is obliged to
+			# police it, and reports a failure that is an artefact of the test
+			# (observed: quality 63.47 holding 450 kbit/s of payload under a 450
+			# shaper that was set exactly right). The ramp asks the link what it
+			# carries, and with the shaper configured the answer IS the shaper:
+			# stopping at the shaper's rate confirms it, climbing past it says
+			# it is not engaging, stopping well below says it is too tight. The
+			# budget is left alone so the ramp can climb and find where it bites.
 			j=$("$PROBE_CMD" "$c_if" -u "$endpoint" --psk-file "$pskfile" \
 				--state-file "${PROBE_STATE_DIR}/shaped-${c_if}.json" \
-				-r "$c_kbps" --budget-kbps "$c_kbps" -j 2>/dev/null)
+				-j 2>/dev/null)
+			ck=$(printf '%s' "$j" | jsonfilter -e '@.measured_kbps' 2>/dev/null)
 			cq=$(printf '%s' "$j" | jsonfilter -e '@.quality' 2>/dev/null)
 			ch=$(printf '%s' "$j" | jsonfilter -e '@.rtt_held' 2>/dev/null)
-			CONFIRMED="${CONFIRMED}${c_if}|${cq:-}|${ch:-}
+			CONFIRMED="${CONFIRMED}${c_if}|${ck:-}|${cq:-}|${ch:-}
 "
 		done <<SHAPER_EOF
 $SHAPER_SET

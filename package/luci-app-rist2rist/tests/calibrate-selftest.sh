@@ -422,12 +422,14 @@ assert "the report says what each leg was shaped to" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaper_kbps\"]')\" = 1800 ]"
 assert "and the other leg's, from its own measurement" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][1][\"shaper_kbps\"]')\" = 450 ]"
-assert "the confirmation runs WITH the shaper up, at the rate just set" \
-	"printf '%s' \"\$argvlog\" | grep -q -- '-r 450'"
+assert "the confirmation re-runs the test WITH the shaper up" \
+	"printf '%s' \"\$argvlog\" | grep -q 'shaped-lo.json'"
 assert "and it runs after the shaper is put back, never before" \
-	"[ \"\$(printf '%s' \"\$argvlog\" | grep -n -- '-r 450' | cut -d: -f1)\" -gt \"\$(printf '%s' \"\$argvlog\" | grep -n 'sqm start' | cut -d: -f1)\" ]"
-assert "the confirmation announces the SHAPER as its budget, not 1.5x the rate" \
-	"printf '%s' \"\$argvlog\" | grep -q -- '-r 450 --budget-kbps 450'"
+	"[ \"\$(printf '%s' \"\$argvlog\" | grep -n 'shaped-lo.json' | cut -d: -f1)\" -gt \"\$(printf '%s' \"\$argvlog\" | grep -n 'sqm start' | cut -d: -f1)\" ]"
+assert "it is the STANDARD test -- a ramp, not a held rate" \
+	"[ \"\$(printf '%s' \"\$argvlog\" | grep 'shaped-' | grep -c -- '-r ')\" = 0 ]"
+assert "and the report says what the shaped leg then measured" \
+	"[ \"\$(field \"\$out\" 'd[\"legs\"][0][\"shaped_measured_kbps\"]')\" = 2000 ]"
 assert "the budget the bridge will SEND with is the sum of the shapers" \
 	"printf '%s' \"\$log\" | grep -q 'set rist2rist.main.measured_budget_kbps=2250'"
 

@@ -24,7 +24,7 @@ diff -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
 diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-probe.c
 --- a/tools/rist2rist-probe.c	1970-01-01 10:00:00.000000000 +1000
 +++ b/tools/rist2rist-probe.c	2026-10-09 18:52:00.000000000 +1100
-@@ -0,0 +1,1217 @@
+@@ -0,0 +1,1205 @@
 +/*
 + * rist2rist-probe -- a standalone, operator-runnable ACTIVE probe of ONE WAN leg.
 + * SPDX-License-Identifier: AGPL-3.0-or-later
@@ -689,7 +689,6 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +		"      --guard-window N     seconds to sample the leg before probing (default 2)\n"
 +		"      --guard-kbps N       egress above this means a stream is running (default 1000)\n"
 +		"      --max-bytes-per-day N  probe budget (default 2000000000)\n"
-+		"      --budget-kbps N      announce this as bandwidth= instead of 1.5x\n"
 +		"      --budget-file FILE   budget counter (default %s)\n"
 +		"      --state-file FILE    result JSON for the read-only surface (default %s)\n"
 +		"      --no-bind            bench mode: do NOT bind to the leg\n"
@@ -718,7 +717,6 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +		{ "guard-window", required_argument, NULL, 9 },
 +		{ "guard-kbps", required_argument, NULL, 10 },
 +		{ "max-bytes-per-day", required_argument, NULL, 11 },
-+		{ "budget-kbps", required_argument, NULL, 16 },
 +		{ "budget-file", required_argument, NULL, 12 },
 +		{ "state-file", required_argument, NULL, 13 },
 +		{ "no-bind", no_argument, NULL, 14 },
@@ -739,7 +737,6 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +	int allow_busy = 0;
 +	unsigned long long fixed_rate = 0;
 +	unsigned long long floor_kbps = 500, max_kbps = 50000, guard_kbps = 1000;
-+	unsigned long long budget_kbps = 0;
 +	unsigned long long max_bytes_per_day = 2000000000ULL;
 +	double seconds = 4.0, baseline_seconds = 2.0, guard_window = 2.0;
 +	double step_growth = 1.5, rise_pct = 50.0, quality_floor = 99.0;
@@ -784,7 +781,6 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +		case 9: guard_window = atof(optarg); break;
 +		case 10: guard_kbps = strtoull(optarg, NULL, 10); break;
 +		case 11: max_bytes_per_day = strtoull(optarg, NULL, 10); break;
-+		case 16: budget_kbps = strtoull(optarg, NULL, 10); break;
 +		case 12: budgetfile = optarg; break;
 +		case 13: statefile = optarg; break;
 +		case 14: bound = 0; break;
@@ -944,15 +940,7 @@ diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-prob
 +			 * is refused (observed: quality 28.43 and 435 kB of
 +			 * unrepaired loss at bandwidth=2000 for a 2000 kbps send
 +			 * -- the leg was made to look worse than it is). */
-+			/* The link determines the budget, so when the caller knows it, it
-+			 * WINS over the 1.5x guess below. On a leg behind a configured
-+			 * shaper the shaper IS the link, and a budget above it -- this
-+			 * tool's own 1.5x at a held rate, so 675 for -r 450 -- puts the
-+			 * probe's traffic over the qdisc, which then polices it. Observed:
-+			 * quality 82.51 and a failed confirmation for a shaper that was set
-+			 * exactly right. A budget is only honest if it is the link's. */
-+			unsigned long long bw = budget_kbps > 0 ? budget_kbps
-+						      : ceiling + ceiling / 2;
++			unsigned long long bw = ceiling + ceiling / 2;
 +
 +			n += snprintf(fullurl + n, sizeof(fullurl) - (size_t)n,
 +				      "%cbandwidth=%llu", sep, bw);
