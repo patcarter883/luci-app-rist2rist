@@ -1,0 +1,37 @@
+#!/bin/sh
+# Test double for `ubus`, for rpcd-selftest.sh.
+#
+# method_status asks ubus for the service's instances and takes the first pid, so
+# the argv-redaction path needs a pid to look up. This reports a FIXED pid; the
+# test creates $PROC_ROOT/<pid>/cmdline to match it.
+#
+# Deliberately narrow: the only call the plugin makes is
+#   ubus call service list '{"name":"rist2rist"}'
+# Anything else exits non-zero, so a future call the plugin grows fails loudly
+# here instead of silently getting the wrong shape.
+# Report a pid ONLY when a matching command line exists under PROC_ROOT, so both
+# real cases are reachable: nothing running (running=false), and running (a pid
+# whose argv is then redacted).
+pid=""
+if [ -n "${PROC_ROOT:-}" ]; then
+	for d in "$PROC_ROOT"/*; do
+		if [ -d "$d" ] && [ -f "$d/cmdline" ]; then
+			pid=$(basename "$d")
+			break
+		fi
+	done
+fi
+
+case "$1 $2" in
+	"call service")
+		if [ -n "$pid" ]; then
+			printf '{"rist2rist":{"instances":{"instance1":{"pid":%s,"running":true}}}}\n' "$pid"
+		else
+			printf '{"rist2rist":{"instances":{}}}\n'
+		fi
+		;;
+	*)
+		echo "ubus stub: unsupported call: $*" >&2
+		exit 1
+		;;
+esac

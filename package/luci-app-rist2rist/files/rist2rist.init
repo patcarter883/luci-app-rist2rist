@@ -46,13 +46,16 @@ bridge_uid() {
     echo "rist2rist-${mac}"
 }
 
-# The port the encoder reaches rpcd on -- the WEB port, NOT the RIST listen port.
-# The encoder builds its ubus endpoint from the address plus this value.
+# The port the encoder reaches the bridge API on -- NOT the RIST listen port. The
+# encoder builds its ubus endpoint from the address plus this value, so it must
+# name the port that ACTUALLY ANSWERS: the bridge's own control endpoint
+# (init.d/obr-bridge-api), not LuCI's listener, whose /ubus mapping cannot serve
+# these calls on this image.
 web_port() {
     local port
-    port="$(uci -q get uhttpd.main.listen_http 2>/dev/null | sed 's/.*://')"
+    port="$(uci -q get rist2rist.main.api_port 2>/dev/null)"
     case "$port" in
-        ''|*[!0-9]*) port=80 ;;
+        ''|*[!0-9]*) port=8080 ;;
     esac
     echo "$port"
 }
@@ -112,6 +115,11 @@ write_mdns_service() {
 EOF
     if [ -x /etc/init.d/umdns ]; then
         /etc/init.d/umdns reload 2>/dev/null || true
+    else
+        # Failing silently here once cost a whole debugging session: the bridge
+        # looked healthy, advertised nothing, and the encoder's Find discovered
+        # no bridge. umdns is a declared dependency now, so this should never fire.
+        logger -t rist2rist "umdns is absent; the bridge cannot advertise itself for discovery"
     fi
     return 0
 }
@@ -121,6 +129,11 @@ remove_mdns_service() {
     rm -f "$MDNS_SERVICE_FILE"
     if [ -x /etc/init.d/umdns ]; then
         /etc/init.d/umdns reload 2>/dev/null || true
+    else
+        # Failing silently here once cost a whole debugging session: the bridge
+        # looked healthy, advertised nothing, and the encoder's Find discovered
+        # no bridge. umdns is a declared dependency now, so this should never fire.
+        logger -t rist2rist "umdns is absent; the bridge cannot advertise itself for discovery"
     fi
     return 0
 }
@@ -203,6 +216,29 @@ append_output_url() {
     query="timing-mode=0"
     [ -n "$OUTPUT_RECOVERY" ] && query="${query}&${OUTPUT_RECOVERY}"
 
+    # The session's RIST passphrase, installed write-only through the control API
+    # (set_link_secret) and stored 0600. It goes on the OUTPUT leg ONLY: the
+    # encoder->bridge hop is a LAN link, and putting the key on the listen leg
+    # would require every sender on that LAN -- the rig, the portal's own tests --
+    # to carry the session's key as well.
+    #
+    # aes-type is not a secret, so it is a plain uci option that LuCI can show.
+    # libRIST takes 128 or 256 here, matching its -e / aes-type.
+    #
+    # The value must never reach a log: the plugin redacts it in `status`, and
+    # 003-rist2rist-redact-secret-in-url-log.patch redacts it in the daemon's own
+    # Outurl line. Only argv carries it in the clear, and argv is root-readable --
+    # libRIST offers no file-based passphrase.
+    local psk secret_file aes
+    secret_file=/etc/rist2rist.link_secret
+    if [ -s "$secret_file" ] && [ -r "$secret_file" ]; then
+        psk=$(head -n 1 "$secret_file")
+        if [ -n "$psk" ]; then
+            config_get aes 'main' 'psk_aes' 256
+            query="${query}&secret=${psk}&aes-type=${aes}"
+        fi
+    fi
+
     if [ "$UPLINK_CONFIGURED" -eq 0 ]; then
         # No uplinks declared: this bridge is not bonding, so send over the default
         # route. A single-WAN box needs no uplink list, and requiring one would be
@@ -233,7 +269,7 @@ UPLINK_LEGS_EOF
 start_service() {
     config_load 'rist2rist'
     local enabled listen_url verbose_log loglevel profile out_profile
-    local buffer_min buffer_max rtt_min rtt_max reorder_buffer rq
+    local buffer_min buffer_max rtt_min rtt_max reorder_buffer maxbitrate rq
     config_get_bool enabled 'main' 'enabled' 0
     config_get listen_url 'main' 'listen_url'
     config_get_bool verbose_log 'main' 'verbose_log' 0
@@ -252,6 +288,16 @@ start_service() {
     config_get rtt_min 'main' 'rtt_min' 40
     config_get rtt_max 'main' 'rtt_max' 500
     config_get reorder_buffer 'main' 'reorder_buffer' 30
+    # The peak the recovery ring must cover, in kbit/s, appended to the URLs as
+    # `bandwidth` -- that is the URL-level name the tool documents for it
+    # (`rist2rist --help-url`); `recovery-maxbitrate` is only the library-level
+    # name and the URL parser REJECTS it, which breaks the listen leg outright.
+    # libRIST defaults to 100000 kbit/s, nonsense for this link: the ingest is
+    # <=10 Mbit/s, so a 5000 ms buffer at 100 Mbit/s needs ~47492 packets while the
+    # Advanced-profile NACK window addresses only 32768, leaving the tail
+    # unrecoverable and warning on every start. At 20000 kbit/s the same buffer is
+    # ~9500 packets, comfortably inside the window.
+    config_get maxbitrate 'main' 'maxbitrate' 20000
     if [ "$enabled" -eq 0 ]; then
         # A disabled bridge must stop advertising itself, or encoders keep
         # discovering a box that will never relay.
@@ -267,15 +313,17 @@ start_service() {
     mdns_port="$(listen_port "$listen_url")" && write_mdns_service "$mdns_port"
 
     # Append recovery params to the listen (-i) URL (handles an existing '?').
-    rq="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}&timing-mode=0"
+    rq="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}&bandwidth=${maxbitrate}&timing-mode=0"
     case "$listen_url" in
         *\?*) listen_url="${listen_url}&${rq}" ;;
         *)    listen_url="${listen_url}?${rq}" ;;
     esac
 
     # Same recovery params for the OUTPUT (-o) leg, consumed by append_output_url
-    # (it adds timing-mode itself, so it is omitted here).
-    OUTPUT_RECOVERY="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}"
+    # (it adds timing-mode itself, so it is omitted here). bandwidth must be here
+    # as well as on the listen leg: it is the SENDER-side window that warns, and
+    # this string is what the output URL is built from.
+    OUTPUT_RECOVERY="buffer-min=${buffer_min}&buffer-max=${buffer_max}&rtt-min=${rtt_min}&rtt-max=${rtt_max}&reorder-buffer=${reorder_buffer}&bandwidth=${maxbitrate}"
 
     # Resolve the local uplink list BEFORE the destinations: each destination is
     # emitted once per PRESENT uplink, so the legs must be known first.

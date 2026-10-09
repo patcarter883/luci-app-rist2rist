@@ -37,6 +37,25 @@ def main() -> int:
                     return 1
                 cur = list(cur.values())
                 continue
+
+            # A wildcard leaves a LIST, and jsonfilter maps the rest of the path
+            # over it: @.a.*.b is the list of b's. Without this, the next token
+            # was matched against that list as though it were a dict, so any path
+            # with a wildcard NOT in final position silently produced nothing --
+            # which is exactly what @.rist2rist.instances.*.pid needs, and why
+            # this gap went unnoticed until the status path was first tested.
+            if isinstance(cur, list):
+                mapped = []
+                for item in cur:
+                    if isinstance(item, dict) and name in item:
+                        mapped.append(item[name])
+                cur = mapped
+                if idx is not None:
+                    if not isinstance(cur, list) or idx >= len(cur):
+                        return 1
+                    cur = cur[idx]
+                continue
+
             if name:
                 if not isinstance(cur, dict) or name not in cur:
                     return 1
@@ -46,7 +65,11 @@ def main() -> int:
                     return 1
                 cur = cur[idx]
 
-    if isinstance(cur, (dict, list)):
+    if isinstance(cur, list):
+        # One JSON value per line, as the real jsonfilter prints them.
+        for item in cur:
+            print(json.dumps(item))
+    elif isinstance(cur, dict):
         print(json.dumps(cur))
     elif cur is True:
         print("true")

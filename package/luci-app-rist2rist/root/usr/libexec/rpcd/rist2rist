@@ -32,7 +32,13 @@
 #     caller cannot believe it applied something the bridge dropped;
 #   * no URL value may carry a secret parameter (secret=/aes-type=/psk=/token=).
 #     URLs are loggable by definition (H2), and a config report is exactly where
-#     a link key would otherwise leak.
+#     a link key would otherwise leak;
+#   * a link secret is therefore NOT a config field and never travels inside a
+#     config document. It has its own write-only method (set_link_secret), it is
+#     stored in a 0600 root-owned FILE rather than in /etc/config (which is
+#     world-readable by design), no read method ever echoes it, and it is
+#     redacted wherever an effective URL or argv could carry it into a log or a
+#     report.
 #
 # Access is governed by /usr/share/rpcd/acl.d/luci-app-rist2rist.json. A LAN client
 # reaches this as JSON-RPC over HTTP at the router's /ubus endpoint.
@@ -51,6 +57,22 @@ CONFIG=rist2rist
 # Minimal JSON string escaping for values (URLs/paths) that can contain quotes.
 json_str() {
 	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# The link secret is a FILE, not a uci option. /etc/config is world-readable by
+# design, and a passphrase any local process can read is not a secret. 0600,
+# root-owned, one line. Test hook, like FUNCTIONS_SH above.
+LINK_SECRET_FILE=${LINK_SECRET_FILE:-/etc/rist2rist.link_secret}
+
+# Where a running process's command line is read from. A test hook, because the
+# argv redaction in method_status can only be exercised against a crafted
+# cmdline -- there is no daemon to inspect off-device.
+PROC_ROOT=${PROC_ROOT:-/proc}
+
+# Mask the VALUE of a secret parameter, keeping the parameter visible, so a
+# redacted URL still shows that the leg is encrypted and at what strength.
+redact_url() { # redact_url <text>
+	printf '%s' "$1" | sed -E 's/(secret=)[^&"[:space:]]*/\1REDACTED/g'
 }
 
 err() { # err <code> <message>
@@ -136,6 +158,13 @@ method_get_config() {
 		"$(json_str "$buffer_min")" "$(json_str "$buffer_max")" \
 		"$(json_str "$rtt_min")" "$(json_str "$rtt_max")" "$(json_str "$reorder_buffer")"
 	printf '"outputs":[%s],' "${outputs%,}"
+	# Whether a link secret is installed -- never the secret itself. A read
+	# method must not hand back what only a write method may set.
+	if [ -f "$LINK_SECRET_FILE" ]; then
+		printf '"link_secret_set":true,'
+	else
+		printf '"link_secret_set":false,'
+	fi
 	printf '"uplinks":[%s]' "${uplinks%,}"
 	printf '}'
 	printf '\n'
@@ -155,9 +184,14 @@ method_status() {
 
 	# The real effective argv comes from the kernel, not from a second copy of the
 	# init script's URL assembly: one definition, and it cannot drift.
+	#
+	# It can now carry the output URL's secret parameter, and status is a READ
+	# method that any token holder may call -- so the value is redacted here.
+	# Redacting in the kernel-source copy is what keeps the report honest about
+	# the rest of the command line.
 	if [ -n "$pid" ]; then
 		running=true
-		[ -r "/proc/$pid/cmdline" ] && argv=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+		[ -r "$PROC_ROOT/$pid/cmdline" ] && argv=$(redact_url "$(tr '\0' ' ' < "$PROC_ROOT/$pid/cmdline")")
 	fi
 
 	printf '{"ok":true,"running":%s,"pid":"%s","argv":"%s"}\n' \
@@ -235,7 +269,13 @@ method_claim() {
 		return 0
 	fi
 
-	token=$(head -c 64 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | cut -c1-32)
+	# /dev/urandom is the entropy source; hexdump renders it ALNUM with no extra
+	# package. The image's busybox has NO base64 applet (and no od), so the old
+	# `base64 | tr -dc` pipeline returned an empty token on a correctly-built
+	# bridge and claim failed with rng_failed. hexdump is a busybox default and
+	# needs no DEPENDS; 32 bytes of CSPRNG output, hex-encoded and truncated to
+	# 32 chars, is 128 bits of entropy -- ample for a pairing token.
+	token=$(head -c 32 /dev/urandom | hexdump -v -e '/1 "%02x"' | cut -c1-32)
 	if [ -z "$token" ]; then
 		err rng_failed "could not generate a token"
 		return 0
@@ -368,6 +408,67 @@ apply_config() {
 	printf '{"ok":true,"saved":true,"reloaded":false}\n'
 }
 
+# The OUTPUT legs' link secret -- write-only by construction.
+#
+# It exists because the session's RIST passphrase has to reach the relay, and a
+# passphrase is precisely what set_config's whitelist refuses: it is not config,
+# it is a credential for one session. Accepting it here keeps three properties:
+#   * it is never part of a config document, so no config report can contain it;
+#   * it is stored 0600 outside /etc/config (which is world-readable);
+#   * the only way to read it back is to read the file as root -- no ubus method
+#     returns it, and get_config reports only whether it is set.
+#
+# An empty link_secret CLEARS it: a session expires, and its key must not outlive
+# it.
+method_set_link_secret() {
+	local psk aes
+	check_fields "link_secret link_secret_aes" || return 1
+
+	psk=$(jget '@.link_secret')
+
+	if [ -z "$psk" ]; then
+		rm -f "$LINK_SECRET_FILE"
+		uci -q delete "$CONFIG.main.psk_aes"
+		uci commit "$CONFIG" >/dev/null 2>&1
+		printf '{"ok":true,"link_secret_set":false}\n'
+		return 0
+	fi
+
+	# The value is interpolated into a RIST URL and written to a file, so anything
+	# that could break either is REFUSED rather than escaped: an escaping bug here
+	# would be a silently mis-encrypted link, which is worse than a refusal.
+	case "$psk" in
+		*[!A-Za-z0-9+/=_.-]*)
+			err bad_link_secret "link_secret must be base64/hex-ish: A-Za-z0-9+/=_.- only"
+			return 0;;
+	esac
+	if [ "${#psk}" -lt 8 ]; then
+		err bad_link_secret "link_secret is implausibly short"
+		return 0
+	fi
+
+	# AES strength is not secret, so it lives in uci where LuCI can show it. The
+	# URL parameter takes 128 or 256, matching libRIST's aes-type.
+	aes=$(jget '@.link_secret_aes')
+	case "$aes" in
+		"") aes=256;;
+		128|256) ;;
+		*) err bad_link_secret "link_secret_aes must be 128 or 256"; return 0;;
+	esac
+
+	( umask 077; printf '%s\n' "$psk" > "$LINK_SECRET_FILE" ) || {
+		err apply_failed "could not write $LINK_SECRET_FILE"
+		return 0
+	}
+	chmod 600 "$LINK_SECRET_FILE" 2>/dev/null || true
+
+	uci set "$CONFIG.main.psk_aes=$aes" || { err apply_failed "psk_aes"; return 0; }
+	uci commit "$CONFIG" || { err commit_failed "uci commit failed"; return 0; }
+
+	# Never echo the secret, not even in the acknowledgement.
+	printf '{"ok":true,"link_secret_set":true,"link_secret_aes":%s}\n' "$aes"
+}
+
 method_reload() {
 	if [ -x "$RELOAD_CMD" ]; then
 		"$RELOAD_CMD" reload >/dev/null 2>&1
@@ -382,7 +483,7 @@ method_reload() {
 case "$1" in
 	list)
 		# rpcd requires this to enumerate the object's methods.
-		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "set_config": {}, "reconcile": {}, "reload": {} }'
+		echo '{ "claim": {}, "release": {}, "status": {}, "get_config": {}, "set_config": {}, "set_link_secret": {}, "reconcile": {}, "reload": {} }'
 		;;
 	call)
 		REQ_BODY=$(cat)
@@ -395,6 +496,7 @@ case "$1" in
 				status)     method_status ;;
 				get_config) method_get_config ;;
 				set_config) require_managed && apply_config "listen_url profile out_profile enabled recovery buffer_min buffer_max rtt_min rtt_max reorder_buffer outputs address" ;;
+				set_link_secret) require_managed && method_set_link_secret ;;
 				reconcile)  require_managed && apply_config "listen_url outputs address" ;;
 				reload)     method_reload ;;
 				release)    method_release ;;

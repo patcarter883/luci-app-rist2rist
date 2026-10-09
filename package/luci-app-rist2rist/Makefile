@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-rist2rist
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=8
+PKG_RELEASE:=15
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 include $(INCLUDE_DIR)/package.mk
@@ -24,7 +24,11 @@ define Package/luci-app-rist2rist
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=LuCI support for Custom Reactive RIST Proxy
-  DEPENDS:=+libopenssl +cJSON +luci-base
+  # +umdns is a real dependency, not a nicety: the bridge advertises itself over
+  # mDNS so the encoder's Find can discover it, and a missing umdns used to fail
+  # silently -- the bridge looked healthy, advertised nothing, and Find found no
+  # bridge at all.
+  DEPENDS:=+libopenssl +cJSON +luci-base +umdns
 endef
 
 # Step 1: materialise the source. ./src is PRISTINE upstream librist (pinned at the commit
@@ -76,11 +80,22 @@ define Package/luci-app-rist2rist/install
 	# something an operator has to notice and fix by hand.
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
 	$(INSTALL_BIN) ./files/99-rist2rist $(1)/etc/hotplug.d/iface/99-rist2rist
-	# rpcd exec plugin: the read-only bridge API (milestone M-B1) that the encoder
-	# calls as JSON-RPC over HTTP at /ubus. LuCI remains another client of the same
+	# rpcd exec plugin: the bridge API (milestone M-B1) that the encoder calls as
+	# JSON-RPC over HTTP at /ubus. LuCI remains another client of the same
 	# methods, so there is one API rather than two.
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) ./root/usr/libexec/rpcd/rist2rist $(1)/usr/libexec/rpcd/rist2rist
+
+	# The HTTP face of that same API. LuCI's uhttpd cannot serve it (its ubus
+	# plugin denies every call on this image) and uhttpd's -a would expose every
+	# ubus object on the LAN to reach this one, so the endpoint gets its own
+	# docroot holding exactly one file -- a shim narrowed to rist2rist -- and its
+	# own procd service, so it survives an upgrade instead of being a hand-run
+	# listener.
+	$(INSTALL_DIR) $(1)/www-bridge
+	$(INSTALL_BIN) ./files/www-bridge/ubus $(1)/www-bridge/ubus
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/obr-bridge-api.init $(1)/etc/init.d/obr-bridge-api
 endef
 
 define Package/luci-app-rist2rist/postinst
@@ -88,6 +103,15 @@ define Package/luci-app-rist2rist/postinst
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 /etc/init.d/rpcd restart 2>/dev/null || true
 /etc/init.d/uhttpd reload 2>/dev/null || true
+# The control endpoint must be ENABLED, not merely installed: without this the
+# advertised api_port would name a port nothing listens on.
+/etc/init.d/obr-bridge-api enable 2>/dev/null || true
+/etc/init.d/obr-bridge-api restart 2>/dev/null || true
+# An upgrade restarts rpcd/uhttpd but would leave the RELAY itself stopped, so a
+# box that was relaying comes back up silent. Restart it if it is enabled.
+if /etc/init.d/rist2rist enabled 2>/dev/null; then
+	/etc/init.d/rist2rist restart 2>/dev/null || true
+fi
 exit 0
 endef
 
