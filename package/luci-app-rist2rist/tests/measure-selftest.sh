@@ -57,6 +57,10 @@ check() { # check <label> <json> <expression>
 # never calls it; the I/O shell does, in the subprocess.
 FUNCTIONS_SH="$stub"
 export FUNCTIONS_SH
+# Opt OUT of the run: the helper runs main by default (so a piped `sh -s` cannot
+# silently do nothing), and the harness must source it only to reach the core.
+RIST2RIST_MEASURE_LIB_ONLY=1
+export RIST2RIST_MEASURE_LIB_ONLY
 # shellcheck source=/dev/null
 . "$measure"
 
@@ -85,6 +89,8 @@ check "core: an absent leg reports null, not 0" "$out" \
     "d['legs'][1]['shaped_kbps'] is None and d['legs'][1]['tx_bytes'] is None"
 check "core: aggregate shapes only the present legs" "$out" \
     "d['aggregate']['shaped_kbps'] == 8000"
+check "core: all present legs shaped -> aggregate state ok" "$out" \
+    "d['aggregate']['state'] == 'ok'"
 check "core: aggregate measured is null (nothing measured yet)" "$out" \
     "d['aggregate']['measured_kbps'] is None"
 
@@ -99,6 +105,17 @@ check "core: no shaper -> shaped_kbps null, NOT 0" "$out" \
     "d['legs'][0]['shaped_kbps'] is None"
 check "core: an unshaped present leg leaves the aggregate null" "$out" \
     "d['aggregate']['shaped_kbps'] is None"
+check "core: a present leg with no shaper -> aggregate state partial" "$out" \
+    "d['aggregate']['state'] == 'partial'"
+
+# One shaped present leg and one unshaped present leg: not all legs are shaped,
+# so the sum is INCOMPLETE and must not be presented as a whole.
+rec=$(printf 'wwan1|true|8000|1|2|0|0|0|-70\nwwan2|true|||||||\n')
+out=$(emit_measurement '2026-01-01T00:00:00Z' "$rec")
+check "core: mixed shaped/unshaped present legs -> aggregate state partial" "$out" \
+    "d['aggregate']['state'] == 'partial'"
+check "core: a partial total leaves shaped_kbps null, NOT a partial sum" "$out" \
+    "d['aggregate']['shaped_kbps'] is None"
 
 rec=$(printf 'wwan0|false|0|0|0|0|0|0|0\n')
 out=$(emit_measurement '2026-01-01T00:00:00Z' "$rec")
@@ -106,15 +123,21 @@ check "core: an absent leg cannot smuggle a 0 through" "$out" \
     "d['legs'][0]['shaped_kbps'] is None and d['legs'][0]['tx_bytes'] is None and d['legs'][0]['signal_dbm'] is None"
 check "core: no present leg -> aggregate shaped null" "$out" \
     "d['aggregate']['shaped_kbps'] is None"
+check "core: no present leg -> aggregate state unknown" "$out" \
+    "d['aggregate']['state'] == 'unknown'"
 
 rec=$(printf 'wwan1|true|8000|||||||\nwwan2|true|2000|||||||\n')
 out=$(emit_measurement '2026-01-01T00:00:00Z' "$rec")
 check "core: aggregate sums the present shaped legs" "$out" \
     "d['aggregate']['shaped_kbps'] == 10000"
+check "core: all present shaped -> aggregate state ok" "$out" \
+    "d['aggregate']['state'] == 'ok'"
 
 out=$(emit_measurement '2026-01-01T00:00:00Z' "")
 check "core: no legs -> empty array and null aggregate" "$out" \
     "d['legs'] == [] and d['aggregate']['shaped_kbps'] is None"
+check "core: no legs -> aggregate state unknown" "$out" \
+    "d['aggregate']['state'] == 'unknown'"
 
 # ======================================================================
 # the I/O shell
@@ -124,9 +147,10 @@ echo
 echo "rist2rist-measure: I/O shell (real /sys/class/net, stubbed tc/mmcli)"
 
 # The stub uplinks are lo (present) and wwan1 (absent) -- the same fixtures the
-# other suites use.
+# other suites use. LIB_ONLY is cleared in the child: the helper must RUN here,
+# proving the default (run unless a test opts out) is what the harness relies on.
 run_measure() { # run_measure <TC_STUB_MODE>
-    env FUNCTIONS_SH="$stub" TC_STUB_MODE="$1" sh "$measure"
+    env FUNCTIONS_SH="$stub" TC_STUB_MODE="$1" RIST2RIST_MEASURE_LIB_ONLY= sh "$measure"
 }
 
 out=$(run_measure cake); rc=$?
@@ -141,6 +165,8 @@ check "e2e: wwan1 is absent, and the run still emitted" "$out" \
     "d['legs'][1]['interface']=='wwan1' and d['legs'][1]['present'] is False and d['legs'][1]['state']=='absent' and d['legs'][1]['shaped_kbps'] is None"
 check "e2e: aggregate shaped is the present leg's rate" "$out" \
     "d['aggregate']['shaped_kbps'] == 8000"
+check "e2e: all present legs shaped -> aggregate state ok" "$out" \
+    "d['aggregate']['state'] == 'ok'"
 
 out=$(run_measure noqueue); rc=$?
 if [ "$rc" -eq 0 ]; then pass "e2e noqueue: exits 0"; else fail "e2e noqueue: exit $rc"; fi
@@ -150,9 +176,42 @@ check "e2e noqueue: shaped_kbps is null, NOT 0" "$out" \
     "d['legs'][0]['shaped_kbps'] is None"
 check "e2e noqueue: aggregate shaped is null" "$out" \
     "d['aggregate']['shaped_kbps'] is None"
+check "e2e noqueue: a present unshaped leg -> aggregate state partial" "$out" \
+    "d['aggregate']['state'] == 'partial'"
 
 echo
 echo "-- modem signal (mmcli) --"
+
+# Production fact: ONE modem at ModemManager index 0 owning wwan1. The index
+# must be RESOLVED from the modem's ports line, NOT assumed from the interface
+# number (wwan1 -> -m 1 is the bug: the stub, like the live box, has no modem 1).
+idx=$(modem_index_for_iface wwan1)
+if [ "$idx" = "0" ]; then
+    pass "modem: wwan1 resolves to modem 0 (not the interface number)"
+else
+    fail "modem: wwan1 resolved to '$idx', expected 0"
+fi
+
+# An interface whose number differs from its modem's index still resolves to the
+# real owner -- this is the assertion that fails under a name-derived guess.
+MMCLI_STUB_MODEM=0
+MMCLI_STUB_IFACE=wwan3
+export MMCLI_STUB_MODEM MMCLI_STUB_IFACE
+idx=$(modem_index_for_iface wwan3)
+if [ "$idx" = "0" ]; then
+    pass "modem: wwan3 resolves to modem 0 (number != index)"
+else
+    fail "modem: wwan3 resolved to '$idx', expected 0"
+fi
+unset MMCLI_STUB_MODEM MMCLI_STUB_IFACE
+
+# An interface no modem owns must resolve to nothing -- never a guessed index.
+idx=$(modem_index_for_iface wwan9)
+if [ -z "$idx" ]; then
+    pass "modem: an unowned interface resolves to empty, not a guess"
+else
+    fail "modem: wwan9 resolved to '$idx', expected empty"
+fi
 
 MMCLI_STUB_RSSI=-71
 export MMCLI_STUB_RSSI
@@ -163,9 +222,10 @@ else
     fail "modem: got '$sig', expected -71"
 fi
 unset MMCLI_STUB_RSSI
+# No RSSI line (production state: refresh rate 0) -> empty (unknown), not 0.
 sig=$(modem_signal wwan1)
 if [ -z "$sig" ]; then
-    pass "modem: no modem -> empty (unknown), not 0"
+    pass "modem: no RSSI line -> empty (unknown), not 0"
 else
     fail "modem: got '$sig', expected empty"
 fi

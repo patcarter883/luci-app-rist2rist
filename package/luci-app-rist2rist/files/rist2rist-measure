@@ -118,19 +118,29 @@ emit_measurement() {
 $records
 RECORDS_EOF
 
-    # The aggregate is a total across PRESENT legs. If no leg is present it is
-    # null; and if any present leg's shaper is unknown the total would be a
-    # partial sum presented as a whole, so it is null too -- an incomplete total
-    # is a fabrication just like a placeholder 0.
-    local agg_shaped=null
-    if [ "$has_present" -gt 0 ] && [ "$shaped_known" -eq 1 ]; then
-        agg_shaped=$shaped_sum
+    # The aggregate carries a STATE so a consumer can tell the two kinds of
+    # "no usable total" apart: no leg is present at all ("unknown"), versus a
+    # present leg whose shaper could not be read ("partial"). The state also
+    # gates the sum, keeping the total honest:
+    #   no present legs                 -> "unknown", shaped_kbps null
+    #   every present leg shaped        -> "ok",      shaped_kbps = the total
+    #   some present legs shaped        -> "partial", shaped_kbps null
+    # A partial sum presented as a whole is a fabrication just like a placeholder
+    # 0, so shaped_kbps stays null unless the total is COMPLETE.
+    local agg_state=unknown agg_shaped=null
+    if [ "$has_present" -gt 0 ]; then
+        if [ "$shaped_known" -eq 1 ]; then
+            agg_state=ok
+            agg_shaped=$shaped_sum
+        else
+            agg_state=partial
+        fi
     fi
     # measured_kbps is per-leg null, and a total is null when any input is null.
     local agg_measured=null
 
-    printf '{"generated_at":"%s","legs":[%s],"aggregate":{"shaped_kbps":%s,"measured_kbps":%s}}\n' \
-        "$(json_str "$generated_at")" "$legs" "$agg_shaped" "$agg_measured"
+    printf '{"generated_at":"%s","legs":[%s],"aggregate":{"state":"%s","shaped_kbps":%s,"measured_kbps":%s}}\n' \
+        "$(json_str "$generated_at")" "$legs" "$agg_state" "$agg_shaped" "$agg_measured"
 }
 
 # ======================================================================
@@ -205,17 +215,44 @@ tc_fill() { # tc_fill <iface>
         | sed -n 's/^[[:space:]]*backlog \([0-9][0-9]*\)b.*/\1/p' | head -n 1)
 }
 
+# modem_index_for_iface <iface> -- the ModemManager index whose modem owns this
+# net interface, or nothing.
+#
+# The interface number is NOT the modem index: on the target wwan1 belongs to
+# ModemManager Modem/0, so `wwanN -> N` is wrong and `mmcli -m N` fails. There
+# is no mapping in `mmcli -L`; the owner is only in the per-modem detail, whose
+# `ports:` line names every interface the modem exposes, e.g.
+#   ports: cdc-wdm0 (mbim), wwan1 (net)
+# so we enumerate the modems `mmcli -L` lists and ask each one. If no modem
+# claims the interface, the result is empty -- never a numeric guess.
+modem_index_for_iface() { # modem_index_for_iface <iface>
+    local iface="$1" n
+    [ -n "$iface" ] || return 0
+    mmcli -L 2>/dev/null \
+        | sed -n 's#.*/Modem/\([0-9][0-9]*\).*#\1#p' \
+        | while IFS= read -r n; do
+            [ -n "$n" ] || continue
+            if mmcli -m "$n" 2>/dev/null | grep -q "[[:space:]]${iface} (net)"; then
+                printf '%s\n' "$n"
+                break
+            fi
+        done
+}
+
 # modem_signal <iface> -- RSSI in dBm for the modem backing this WWAN leg, or
 # nothing.
 #
-# There is no passive iface->modem map in mmcli's output, so the modem index is
-# taken from the interface name (wwanN -> modem N), the provisioning convention
-# on this target. If no index can be derived, or mmcli is absent or reports no
-# such modem, the signal is left unknown rather than guessed.
+# The modem index is RESOLVED from the interface (see modem_index_for_iface); if
+# no modem owns the interface, or mmcli is absent or reports no such modem, the
+# signal is left unknown rather than guessed. The value is only present when
+# ModemManager is actually polling the signal: with a 0-second refresh rate the
+# `-m <n> --signal-get` output carries config only and no RSSI line, in which
+# case the result is legitimately empty and stays null. We never trigger a
+# refresh -- this helper changes nothing.
 modem_signal() { # modem_signal <iface>
     command -v mmcli >/dev/null 2>&1 || return 0
     local n
-    n=$(printf '%s' "$1" | tr -cd '0-9')
+    n=$(modem_index_for_iface "$1")
     [ -n "$n" ] || return 0
     mmcli -m "$n" --signal-get 2>/dev/null \
         | sed -n 's/.*RSSI:[[:space:]]*\(-\)\?\([0-9][0-9]*\)[[:space:]]*dBm.*/\1\2/p' \
@@ -251,8 +288,16 @@ main() {
     emit_measurement "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RECORDS"
 }
 
-# Run only when executed, not when sourced: the test harness sources this file to
-# reach emit_measurement directly, and must not trigger the I/O shell.
-case "$0" in
-    *rist2rist-measure) main "$@"; exit 0 ;;
-esac
+# Run by default -- when executed as a file, and equally when piped in as
+# `sh -s`, where $0 is just "sh" and no filename can be matched. Sourcing must
+# therefore OPT OUT explicitly rather than opt in: a run that silently prints
+# nothing and exits 0 is the worst failure mode, because a consumer parses an
+# empty string as "nothing to report" instead of "the tool did not run". Tests
+# set RIST2RIST_MEASURE_LIB_ONLY=1 to reach the pure core.
+#
+# Reaching EOF already exits, so there is deliberately no `exit` here: an `exit`
+# would terminate the CALLER when this file is sourced without the opt-out,
+# turning a forgotten env var into a killed shell instead of stray output.
+if [ -z "${RIST2RIST_MEASURE_LIB_ONLY:-}" ]; then
+    main "$@"
+fi
