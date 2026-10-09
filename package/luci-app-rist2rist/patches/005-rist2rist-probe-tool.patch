@@ -1,6 +1,6 @@
-diff --color -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
+diff -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
 --- a/tools/meson.build	2026-07-30 13:39:06.000000000 +1000
-+++ b/tools/meson.build	2026-10-09 17:40:21.128075291 +1100
++++ b/tools/meson.build	2026-10-09 18:01:43.359382401 +1100
 @@ -80,6 +80,19 @@
  	include_directories: inc,
  	install: should_install)
@@ -21,10 +21,10 @@ diff --color -Naur -x .git src_orig/tools/meson.build src_new/tools/meson.build
  executable('udp2udp',
  	['udp2udp.c', 'yamlparse.c', 'oob_shared.c', srp_shared, tools_deps, rev_target],
  	dependencies: [
-diff --color -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-probe.c
+diff -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2rist-probe.c
 --- a/tools/rist2rist-probe.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/tools/rist2rist-probe.c	2026-10-09 17:40:21.119199409 +1100
-@@ -0,0 +1,902 @@
++++ b/tools/rist2rist-probe.c	2026-10-09 18:01:43.339324530 +1100
+@@ -0,0 +1,997 @@
 +/*
 + * rist2rist-probe -- a standalone, operator-runnable ACTIVE probe of ONE WAN leg.
 + * SPDX-License-Identifier: AGPL-3.0-or-later
@@ -111,6 +111,29 @@ diff --color -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2r
 +#define EXIT_ERROR     1
 +#define EXIT_USAGE     2
 +#define EXIT_REFUSED   3
++
++/* The bridge's own output-URL recovery parameters. librist's defaults are sized
++ * for a LAN: on a WAN leg with a long RTT, retransmissions cannot complete
++ * inside the default window, the receiver declares the packets lost, and a
++ * perfectly healthy leg then measures WORSE than a bad one (observed: quality
++ * 0.00 at 500 kbit/s with defaults, 61.81 with these). The probe must measure
++ * the transport the product actually runs, so it sends these unless the
++ * operator's URL already sets them. */
++#define WAN_BUFFER_MIN     "1000"
++/* 3000 ms, not the bridge's 5000: `bandwidth=` below is the ceiling for payload
++ * PLUS retransmissions, and the recovery window holds buffer_ms x bandwidth
++ * packets. At bandwidth = 1.5x a 50000 kbps ceiling, a 5000 ms buffer needs
++ * ~47k packets -- past the Main-profile retransmit window of 32768, after which
++ * packets "cannot be retransmitted". 3000 ms holds ~21k and still dwarfs the
++ * 2x-RTT a WAN leg needs. */
++#define WAN_BUFFER_MAX     "3000"
++#define WAN_RTT_MIN        "40"
++#define WAN_RTT_MAX        "500"
++#define WAN_REORDER_BUFFER "240"
++
++/* A BOUND run that moves less than this never left the leg; see the check at the
++ * metered total. A failed measurement, not a policy refusal. */
++#define MIN_LEG_BYTES 4096ULL
 +
 +static volatile sig_atomic_t g_stop = 0;
 +
@@ -692,12 +715,60 @@ diff --color -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2r
 +	/* Bind the leg with miface, exactly as the bridge's output leg does: CAKE is
 +	 * applied per interface, so an unbound probe would not traverse the leg the
 +	 * shaper controls and would measure something else entirely. */
-+	if (bound) {
++	{
++		static const struct { const char *k, *v; } wan[] = {
++			{ "buffer-min",     WAN_BUFFER_MIN },
++			{ "buffer-max",     WAN_BUFFER_MAX },
++			{ "rtt-min",        WAN_RTT_MIN },
++			{ "rtt-max",        WAN_RTT_MAX },
++			{ "reorder-buffer", WAN_REORDER_BUFFER },
++		};
 +		char sep = (strchr(url, '?') != NULL) ? '&' : '?';
++		size_t i;
++		int n = snprintf(fullurl, sizeof(fullurl), "%s", url);
 +
-+		snprintf(fullurl, sizeof(fullurl), "%s%cmiface=%s", url, sep, iface);
-+	} else {
-+		snprintf(fullurl, sizeof(fullurl), "%s", url);
++		if (n < 0 || n >= (int)sizeof(fullurl))
++			n = (int)sizeof(fullurl) - 1;
++		if (bound)
++			n += snprintf(fullurl + n, sizeof(fullurl) - (size_t)n,
++				      "%cmiface=%s", sep, iface);
++		sep = (strchr(fullurl, '?') != NULL) ? '&' : '?';
++		for (i = 0; i < sizeof(wan) / sizeof(wan[0]); i++) {
++			/* An explicit parameter in the operator's URL wins. */
++			if (strstr(url, wan[i].k) != NULL)
++				continue;
++			if (n < 0 || n >= (int)sizeof(fullurl))
++				break;
++			n += snprintf(fullurl + n, sizeof(fullurl) - (size_t)n,
++				      "%c%s=%s", sep, wan[i].k, wan[i].v);
++			/* Only the FIRST appended parameter may use '?'; every one
++			 * after it must use '&'. A bare URL in bench mode
++			 * (--no-bind) is the case that catches this. */
++			sep = '&';
++		}
++		/* Declare the ceiling as the sender's bandwidth, exactly as the
++		 * bridge's own output URL does. Without it librist sizes the recovery
++		 * window against an assumed 100 Mbit/s and warns that the Main-profile
++		 * retransmit window (32768 packets) is exceeded -- so packets beyond it
++		 * "cannot be retransmitted", under-reporting precisely the high-rate
++		 * steps this tool exists to find. The probe never intends to exceed
++		 * its ceiling, so that is the honest declaration. */
++		if (strstr(url, "bandwidth") == NULL && n >= 0 &&
++		    n < (int)sizeof(fullurl)) {
++			unsigned long long ceiling =
++				fixed_rate > 0 ? (unsigned long long)fixed_rate
++					       : (unsigned long long)max_kbps;
++			/* 1.5x the payload ceiling: bandwidth deliberately covers
++			 * payload PLUS retransmissions, so setting it equal to the
++			 * payload rate leaves no repair budget at all and every NACK
++			 * is refused (observed: quality 28.43 and 435 kB of
++			 * unrepaired loss at bandwidth=2000 for a 2000 kbps send
++			 * -- the leg was made to look worse than it is). */
++			unsigned long long bw = ceiling + ceiling / 2;
++
++			n += snprintf(fullurl + n, sizeof(fullurl) - (size_t)n,
++				      "%cbandwidth=%llu", sep, bw);
++		}
 +	}
 +
 +	/* The URL is deliberately secret-free, so printing it is safe (rule 3). */
@@ -900,6 +971,30 @@ diff --color -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2r
 +		res.retrans_bytes = retrans;
 +		budget_add(budgetfile, sent);
 +		res.budget_spent = spent_before + sent;
++
++		/* A bound probe whose leg does not move is NOT a clean result. Bind
++		 * to a leg with no route -- the ordinary case when the DEFAULT route
++		 * is the other WAN -- and every send fails: nothing leaves, so no
++		 * packet is ever lost, librist's quality stays at 100, and the run
++		 * reports a perfect pass at whatever rate was asked for. That is the
++		 * one answer this tool must never give: it certifies a dead leg as
++		 * the ceiling, and the operator shapes for a link that carried
++		 * nothing. Demand evidence that the traffic left. */
++		if (bound && sent < MIN_LEG_BYTES) {
++			fprintf(stderr,
++				"rist2rist-probe: %s moved only %llu bytes -- nothing "
++				"left the leg (no route on this interface?). "
++				"Refusing to report a result.\n",
++				iface, sent);
++			/* Do not leave a "measurement" a consumer could believe. */
++			if (res.carried_kbps > 0 && res.failed_kbps == 0)
++				res.failed_kbps = res.carried_kbps;
++			res.carried_kbps = 0;
++			res.quality = 0.0;
++			res.loaded_rtt_ms = -1.0;
++			res.clean_to_ceiling = 0;
++			rc = EXIT_ERROR;
++		}
 +	}
 +	res.duration_s = now_s() - t_start;
 +
@@ -913,7 +1008,7 @@ diff --color -Naur -x .git src_orig/tools/rist2rist-probe.c src_new/tools/rist2r
 +	/* The state file is what the bridge's read-only surface (wan_status) reads,
 +	 * so the pre-flight advisory can show the last PRE-START measurement with its
 +	 * age, rather than implying it is live. */
-+	{
++	if (rc == EXIT_OK) {
 +		FILE *f = fopen(statefile, "w");
 +
 +		if (f != NULL) {
