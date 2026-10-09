@@ -40,26 +40,29 @@ iface="$1"
 eval "kbps=\${PROBE_${iface}_KBPS:-0}"
 eval "rc=\${PROBE_${iface}_RC:-0}"
 [ "$rc" -ne 0 ] && exit "$rc"
+printf '%s\n' "$*" >> "${PROBE_ARGV_LOG:-/dev/null}"
 printf '{"interface":"%s","measured_kbps":%s,"measured_at":"2026-10-09T00:00:00Z","quality":90}\n' \
 	"$iface" "$kbps"
 PROBE
 chmod +x "$tmp/probe"
 
 UCI_STUB_LOG="$tmp/uci.log"
-export UCI_STUB_LOG
+PROBE_ARGV_LOG="$tmp/probe.argv"
+STUB_main_probe_psk_file="$tmp/psk"
+export UCI_STUB_LOG PROBE_ARGV_LOG STUB_main_probe_psk_file
 
 # Drive the plugin's calibrate method. The uci double logs every command, so the
 # writes can be asserted; PROC_ROOT is deliberately UNSET so the ubus double
 # reports no running instance and the pre-start guard lets the run through.
 run_cal() {
 	: > "$UCI_STUB_LOG"
+	: > "$PROBE_ARGV_LOG"
 	rm -f "$UCI_STUB_LOG.add" "$UCI_STUB_LOG.del"
 	printf '{"token":"%s"}' "$TOKEN" | env \
 		FUNCTIONS_SH="$here/stub-functions.sh" \
 		STUB_MAIN_TOKEN_HASH="$TOKEN_HASH" \
 		STUB_MAIN_MANAGED=1 \
 		STUB_main_probe_endpoint='rist://198.51.100.9:20001' \
-		STUB_main_probe_psk_file="$tmp/psk" \
 		PROBE_CMD="$tmp/probe" \
 		RIST2RIST_WAN_LIB="$tmp/wan.sh" \
 		PROBE_STATE_DIR="$tmp/state" \
@@ -160,6 +163,24 @@ assert "the slow leg is floored at 1, not rounded to 0" \
 	"[ \"\$(field \"\$out\" 'd[\"legs\"][1][\"weight\"]')\" = 1 ]"
 assert "NO leg is ever weighted 0 (weight 0 means DUPLICATE, not unused)" \
 	"! printf '%s' \"\$(cat \"\$UCI_STUB_LOG\")\" | grep -qE 'weight=0( |$)'"
+
+# ---------------------------------------------------------------------------
+echo
+echo "-- the credential path: an upgraded bridge may have no such option at all --"
+# A package upgrade does NOT overwrite an existing /etc/config, so probe_psk_file
+# can be ABSENT on a real bridge. config_get would then return "" and the probe
+# would be handed `--psk-file ""`, which is not a path.
+STUB_main_probe_psk_file=""
+export STUB_main_probe_psk_file
+PROBE_lo_KBPS=2000
+PROBE_wwan1_KBPS=500
+out=$(run_cal)
+argv=$(cat "$PROBE_ARGV_LOG")
+
+assert "an absent probe_psk_file falls back to the built-in path" \
+	"printf '%s' \"\$argv\" | grep -q -- '--psk-file /etc/rist2rist-probe/psk'"
+assert "the credential path is never the empty string" \
+	"! printf '%s' \"\$argv\" | grep -q -- '--psk-file  '"
 
 # ---------------------------------------------------------------------------
 echo

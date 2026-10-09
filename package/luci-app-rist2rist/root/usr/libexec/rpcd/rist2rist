@@ -86,6 +86,13 @@ CAPACITY_WEIGHT_SCALE=${CAPACITY_WEIGHT_SCALE:-100}
 # most wants.
 PROBE_STATE_DIR=${PROBE_STATE_DIR:-/var/run/rist2rist}
 
+# The probe's own credential, where the deployment puts it. This IS the default:
+# it lives here rather than only in /etc/config because a package upgrade does not
+# overwrite an existing config, so a bridge installed before `probe_psk_file`
+# existed has no such option and config_get would hand the tool an empty
+# `--psk-file ""`. The UCI option is the operator's override.
+DEFAULT_PROBE_PSK=${DEFAULT_PROBE_PSK:-/etc/rist2rist-probe/psk}
+
 # The shared WAN-link resolver (DT-27.3) -- the ONE definition of this box's WAN
 # links, also sourced by the init script and the measurement helper. An absolute
 # path with an override, like MEASURE_CMD, because it is a TEST hook too.
@@ -439,7 +446,7 @@ method_calibrate() {
 
 	config_load "$CONFIG"
 	config_get endpoint main probe_endpoint
-	config_get pskfile  main probe_psk_file
+	config_get pskfile  main probe_psk_file "$DEFAULT_PROBE_PSK"
 
 	if [ -z "$endpoint" ]; then
 		err probe_unconfigured "no probe_endpoint is configured on this bridge; calibration is unavailable"
